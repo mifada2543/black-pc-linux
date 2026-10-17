@@ -2,6 +2,7 @@
 
 #include "kernel/k_memory_posix.h"
 #include "kernel/k_file_posix.h"
+#include "kernel/k_dpc_posix.h"
 #include "kernel/k_misc_posix.h"
 #include "kernel/k_thread_posix.h"
 #include "platform/posix/fs_patch.h"
@@ -179,6 +180,10 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     }
     rep.thunks = kernel_thunk_stats();
 
+    // The DPC worker, before the game's first instruction. A game arms a timer in its start-up and waits on
+    // it; without this thread that wait never ends, so it belongs here rather than later.
+    rep.dpc_started = kdpc_init();
+
     // Kernel memory before anything can allocate: the game allocates in its first instructions, and the
     // contiguous block is also what MmGetPhysicalAddress's arithmetic is defined against.
     uint32_t contig_free = 0, contig_used = 0, contig_reserved = 0;
@@ -206,6 +211,8 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     // game's own handlers get to see, instead of a process that dies where it stands.
     seh_install_signal_bridge();
 
+    if (!rep.dpc_started)
+        logc("dpc: the DPC/timer thread did not start -- timers will not fire");
     logc("memory: contiguous RAM at 0x%08x, %u MB, %u MB free after the reserved ends", contiguous_base(),
          contiguous_size() >> 20, free_mb);
     logc("xbe: '%s' %s build, base 0x%08x size 0x%x, entry 0x%08x, %zu sections, %zu kernel imports", rep.title.c_str(),

@@ -142,7 +142,9 @@ int run(const Options &o)
     kernel_set_strict(o.strict);
     boot_print_report(rep);
 
-    logc("not yet implemented: the DPC/timer thread, and graphics");
+    // The kernel side is complete: every one of the 115 ordinals is an implementation or a data export. What
+    // is left is the game above it -- the D3D8 layer and the host window.
+    logc("kernel: complete -- the 115 ordinals are implemented; what is missing is the D3D8 layer above it");
     logc("starting XBE entry point 0x%08x", rep.entry);
 
     uint32_t stack_top = 0;

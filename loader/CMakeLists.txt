@@ -36,6 +36,7 @@ if(UNIX)
     src/kernel/k_rtl_posix.cpp
     src/kernel/k_file_posix.cpp
     src/kernel/k_thread_posix.cpp
+    src/kernel/k_dpc_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.

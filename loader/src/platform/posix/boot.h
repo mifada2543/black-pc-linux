@@ -9,7 +9,8 @@
 //   settings_load          not yet -- black.ini comes with the settings port
 //   xbe.load               done (xbe.cpp)
 //   kmem_init              done (k_memory_posix.cpp; the contiguous block was already mapped by image.cpp)
-//   xthread_init_slots     NOT YET -- TLS slots for the boot thread
+//   xthread_init_slots     done (teb.cpp: the block carries the TLS slot array at 0xE10, and the
+//                          patcher remaps every displacement inside the block, not only named ones)
 //   image_map              done (image.cpp)
 //   patch_fs_accesses      done (fs_patch.cpp, via XbeImage::patch_fs)
 //   kernel_resolve_thunks  done (ktable_posix.cpp)
@@ -17,8 +18,9 @@
 //                          folder the XBE came from plus the writable hard-disk folder
 //   install_crash_handlers done (seh.cpp: seh_install_signal_bridge)
 //   install_probes         not needed -- those patch Windows-only call sites
-//   install_d3d_hooks      NOT YET (Vulkan phase)
-//   kdpc_init              NOT YET
+//   install_d3d_hooks      NOT YET (the Vulkan device exists; the D3D8 layer above it does not yet)
+//   kdpc_init              done (k_dpc_posix.cpp: the DPC worker runs on a thread from kthread_create,
+//                          so a DPC that calls game code sees that thread's KPCR)
 //   kthread_create         done here: a real thread that enters the image's entry point
 #pragma once
 
@@ -67,6 +69,10 @@ struct BootReport {
     uint32_t mem_contiguous_base = 0;
     uint32_t mem_contiguous_free = 0;
     uint32_t mem_virtual_regions = 0;
+
+    // Whether the DPC/timer thread started. False means the console is a machine whose timers never fire, and
+    // the boot report says so rather than letting the game hang on a timer with nothing to ring it.
+    bool dpc_started = false;
 };
 
 // Parse only. Fills `rep` and prints the header/section/import summary through logc. Safe to call on

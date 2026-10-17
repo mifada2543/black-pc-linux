@@ -32,6 +32,7 @@
 #include "kernel/k_misc_posix.h"
 #include "kernel/k_rtl_posix.h"
 #include "kernel/k_sync_posix.h"
+#include "kernel/k_dpc_posix.h"
 #include "kernel/k_thread_posix.h"
 #include "platform/posix/boot.h"
 #include "platform/posix/seh.h"
@@ -307,6 +308,16 @@ void kernel_bind_implemented()
         {250, (void *)&ObfDereferenceObject},
         {255, (void *)&PsCreateSystemThreadEx},
         {258, (void *)&PsTerminateSystemThread},
+
+        // k_dpc_posix.cpp: the DPC worker thread, kernel timers, and the six ordinals that were the last
+        // logging stubs. With these bound there is nothing left unimplemented in the 115: every ordinal is
+        // either an implementation or a data export with real storage.
+        {97, (void *)&KeCancelTimer},
+        {107, (void *)&KeInitializeDpc},
+        {113, (void *)&KeInitializeTimerEx},
+        {119, (void *)&KeInsertQueueDpc},
+        {137, (void *)&KeRemoveQueueDpc},
+        {149, (void *)&KeSetTimer},
 
         // k_sync_posix.cpp: events, semaphores, waits, IRQL, critical sections, and NtClose's dispatch.
         {99, (void *)&KeDelayExecutionThread},

@@ -28,7 +28,10 @@
 
 #include "platform/posix/image.h"
 #include "kernel/k_memory_posix.h"
+#include "kernel/k_file_posix.h"
 #include "kernel/k_misc_posix.h"
+#include "kernel/k_rtl_posix.h"
+#include "kernel/k_sync_posix.h"
 #include "platform/posix/seh.h"
 
 #include <stdio.h>
@@ -280,7 +283,6 @@ void kernel_bind_implemented()
         {128, (void *)&KeQuerySystemTime},
         {139, (void *)&KeRestoreFloatingPointState},
         {142, (void *)&KeSaveFloatingPointState},
-        {153, (void *)&KeSynchronizeExecution},
         {327, (void *)&XeLoadSection},
         {328, (void *)&XeUnloadSection},
         {335, (void *)&XcSHAInit},
@@ -288,6 +290,56 @@ void kernel_bind_implemented()
         {337, (void *)&XcSHAFinal},
         {340, (void *)&XcHMAC},
         {360, (void *)&HalInitiateShutdown},
+
+        // k_sync_posix.cpp: events, semaphores, waits, IRQL, critical sections, and NtClose's dispatch.
+        {99, (void *)&KeDelayExecutionThread},
+        {129, (void *)&KeRaiseIrqlToDpcLevel},
+        {145, (void *)&KeSetEvent},
+        {151, (void *)&KeStallExecutionProcessor},
+        {153, (void *)&KeSynchronizeExecution},
+        {159, (void *)&KeWaitForSingleObject},
+        {160, (void *)&KfRaiseIrql},
+        {161, (void *)&KfLowerIrql},
+        {187, (void *)&NtClose},
+        {189, (void *)&NtCreateEvent},
+        {193, (void *)&NtCreateSemaphore},
+        {197, (void *)&NtDuplicateObject},
+        {222, (void *)&NtReleaseSemaphore},
+        {225, (void *)&NtSetEvent},
+        {233, (void *)&NtWaitForSingleObject},
+        {234, (void *)&NtWaitForSingleObjectEx},
+        {238, (void *)&NtYieldExecution},
+
+        // k_rtl_posix.cpp: strings, time, critical sections, and the status-to-Win32 mapping.
+        {260, (void *)&RtlAnsiStringToUnicodeString},
+        {269, (void *)&RtlCompareMemoryUlong},
+        {277, (void *)&RtlEnterCriticalSection},
+        {279, (void *)&RtlEqualString},
+        {289, (void *)&RtlInitAnsiString},
+        {291, (void *)&RtlInitializeCriticalSection},
+        {294, (void *)&RtlLeaveCriticalSection},
+        {301, (void *)&RtlNtStatusToDosError},
+        {304, (void *)&RtlTimeFieldsToTime},
+        {305, (void *)&RtlTimeToTimeFields},
+        {308, (void *)&RtlUnicodeStringToAnsiString},
+
+        // k_file_posix.cpp: the Nt* file surface, over xfile.cpp.
+        {67, (void *)&IoCreateSymbolicLink},
+        {69, (void *)&IoDeleteSymbolicLink},
+        {190, (void *)&NtCreateFile},
+        {196, (void *)&NtDeviceIoControlFile},
+        {198, (void *)&NtFlushBuffersFile},
+        {200, (void *)&NtFsControlFile},
+        {202, (void *)&NtOpenFile},
+        {203, (void *)&NtOpenSymbolicLinkObject},
+        {207, (void *)&NtQueryDirectoryFile},
+        {210, (void *)&NtQueryFullAttributesFile},
+        {211, (void *)&NtQueryInformationFile},
+        {215, (void *)&NtQuerySymbolicLinkObject},
+        {218, (void *)&NtQueryVolumeInformationFile},
+        {219, (void *)&NtReadFile},
+        {226, (void *)&NtSetInformationFile},
+        {236, (void *)&NtWriteFile},
 
         // The data exports are not calls: the game reads the slot and dereferences it, so each slot gets
         // the address of real storage instead of the null cell a bound-nothing export would leave.

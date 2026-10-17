@@ -172,12 +172,12 @@ static void test_resolve()
             return;
         }
         const uint8_t *code = b.img.at(TEXT_VA);
-        check(code[0x1B] == 0x65 && code[0x22] == 0x65 && code[0x3A] == 0x65,
+        check(code[0x1D] == 0x65 && code[0x24] == 0x65 && code[0x3C] == 0x65,
               "push dword [fs:0], mov [fs:0], esp and mov eax, [fs:0] all became gs:");
-        // 65 FF 35 disp32 and 65 89 25 disp32: the displacement is the fourth byte of each.
+        // 65 FF 35 disp32 and 65 89 25 disp32: the displacement starts three bytes into each instruction.
         uint32_t disp_push, disp_store;
-        memcpy(&disp_push, code + 0x1E, 4);
-        memcpy(&disp_store, code + 0x25, 4);
+        memcpy(&disp_push, code + 0x20, 4);
+        memcpy(&disp_store, code + 0x27, 4);
         check(disp_push == teb_patch_offset(0) && disp_store == teb_patch_offset(0),
               "the chain-head displacement landed on this thread's TEB field");
     }
@@ -223,7 +223,7 @@ static void test_boot_execution()
 
     // Ordinals 129 and 149 are the two the fixture calls on purpose and that the HLE layers deliberately
     // do not implement: one stdcall with no arguments, one with four. Each stub must drop exactly its own.
-    check(kernel_stub_calls(129) == 1 && kernel_stub_calls(149) == 1,
+    check(kernel_stub_calls(137) == 1 && kernel_stub_calls(149) == 1,
           "both stubbed kernel calls arrived from game code, with the stack left balanced");
     check(g_head_after == EXCEPTION_CHAIN_END,
           "the game's epilogue restored the chain (head 0x" + std::to_string(g_head_after) + ")");
@@ -292,8 +292,8 @@ static void test_boot_from_file()
         check(stack_top != 0, "the boot thread recorded its stack top for the crash report");
         check(read_va(HANDLER_RAN_VA) == 0xC0DE, "the same SEH round trip happened through the file path");
         check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "and the unwind returned the running ReturnValue");
-        check(kernel_stub_calls(129) == 2 && kernel_stub_calls(149) == 2,
-              "the stub call counters accumulated across both runs (" + std::to_string(kernel_stub_calls(129)) +
+        check(kernel_stub_calls(137) == 2 && kernel_stub_calls(149) == 2,
+              "the stub call counters accumulated across both runs (" + std::to_string(kernel_stub_calls(137)) +
                   " and " + std::to_string(kernel_stub_calls(149)) + ")");
     }
 

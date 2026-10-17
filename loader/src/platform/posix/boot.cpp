@@ -1,12 +1,14 @@
 #include "platform/posix/boot.h"
 
 #include "kernel/k_memory_posix.h"
+#include "kernel/k_file_posix.h"
 #include "kernel/k_misc_posix.h"
 #include "platform/posix/fs_patch.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -100,6 +102,17 @@ bool boot_exit_requested() { return g_exit_code.load() >= 0; }
 int boot_exit_code() { return g_exit_code.load(); }
 const char *boot_exit_reason() { return g_exit_why; }
 
+std::string boot_default_hdd_dir()
+{
+    const char *xdg = getenv("XDG_DATA_HOME");
+    std::string base = xdg && xdg[0] ? std::string(xdg) : std::string();
+    if (base.empty()) {
+        const char *home = getenv("HOME");
+        base = home && home[0] ? std::string(home) + "/.local/share" : std::string(".");
+    }
+    return base + "/blacklinux";
+}
+
 void boot_print_report(const BootReport &rep)
 {
     fprintf(stderr, "xbe: %s\n", rep.path.c_str());
@@ -180,6 +193,15 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     rep.mem_contiguous_free = contig_free;
     rep.mem_virtual_regions = kmem_virtual_regions();
     const uint32_t free_mb = contig_free >> 20;
+
+    // The filesystem comes up before the game's first file call. The DVD is the folder this XBE came
+    // from; the hard disk is a writable folder of its own, because a mounted DVD is read-only and the
+    // game writes saves.
+    {
+        const size_t slash = path.find_last_of('/');
+        const std::string game_dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+        kfile_init(game_dir.empty() ? std::string(".") : game_dir, boot_default_hdd_dir());
+    }
 
     // The section loader is told which image is running, so XeLoadSection can recognise the section
     // header the game hands it and copy the section where it belongs.

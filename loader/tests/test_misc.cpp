@@ -228,13 +228,9 @@ static void test_av_hal()
 // interrupts
 // ----------------------------------------------------------------------------------------------------------
 
-static uint8_t sync_calls;
-static uint8_t __attribute__((stdcall)) sync_routine(void *context)
-{
-    sync_calls++;
-    *(int *)context += 41;
-    return 1;
-}
+// Stands in for an ISR: the graphics stack hands one to KeInitializeInterrupt and the loader records it
+// without ever calling it (see test_ksync.cpp for the synchronised path).
+static uint8_t __attribute__((stdcall)) sync_routine(void *) { return 1; }
 
 static void test_interrupts()
 {
@@ -243,9 +239,10 @@ static void test_interrupts()
     XKInterrupt in;
     memset(&in, 0xCC, sizeof in); // as if the game had not initialised it
 
-    KeInitializeInterrupt(&in, (void *)sync_routine, &sync_calls, 0x30 + 11, 11, 2, 0);
+    int service_context = 0;
+    KeInitializeInterrupt(&in, (void *)sync_routine, &service_context, 0x30 + 11, 11, 2, 0);
     check(in.ServiceRoutine == (void *)sync_routine, "the service routine is recorded");
-    check(in.ServiceContext == (void *)&sync_calls, "the service context is recorded");
+    check(in.ServiceContext == (void *)&service_context, "the service context is recorded");
     check_u32(in.BusInterruptLevel, 11, "the bus level comes back out of the vector");
     check_u32(in.Irql, 11, "the IRQL is recorded at the width the game reads it with");
     check_u32(in.Connected, 0, "a fresh interrupt is not connected");
@@ -258,14 +255,8 @@ static void test_interrupts()
     check_u32(KeDisconnectInterrupt(&in), 1, "disconnecting reports that it was connected");
     check_u32(in.Connected, 0, "and it reads back as disconnected");
     check_u32(KeDisconnectInterrupt(&in), 0, "disconnecting again reports that it was not");
-
-    // KeSynchronizeExecution calls the routine on the caller's thread with the context it was handed.
-    int context = 1;
-    sync_calls = 0;
-    check_u32(KeSynchronizeExecution(&in, (void *)sync_routine, &context), 1,
-              "KeSynchronizeExecution returns the routine's result");
-    check_u32(sync_calls, 1, "and the routine ran once");
-    check_u32(context, 42, "with the context it was given");
+    // KeSynchronizeExecution belongs to the sync layer and is tested there: it runs the routine under
+    // the dispatch mutex, which is xsync's job.
 }
 
 // ----------------------------------------------------------------------------------------------------------

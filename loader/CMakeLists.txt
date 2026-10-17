@@ -32,6 +32,9 @@ if(UNIX)
     src/kernel/ktable_posix.cpp
     src/kernel/k_memory_posix.cpp
     src/kernel/k_misc_posix.cpp
+    src/kernel/k_sync_posix.cpp
+    src/kernel/k_rtl_posix.cpp
+    src/kernel/k_file_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
@@ -79,6 +82,27 @@ if(UNIX)
   add_executable(test_memory tests/test_memory.cpp)
   target_link_libraries(test_memory PRIVATE blackcore)
   add_test(NAME memory COMMAND test_memory)
+
+  # The Nt* file surface: creation, reading, writing, the information classes, rename, directory
+  # enumeration, ioctls and symbolic links, all through the Xbox's own calls.
+  add_executable(test_kfile tests/test_kfile.cpp)
+  target_link_libraries(test_kfile PRIVATE blackcore)
+  add_test(NAME kfile COMMAND test_kfile)
+
+  # The Rtl* exports: strings, time (checked against gmtime_r), status mapping, critical sections.
+  add_executable(test_krtl tests/test_krtl.cpp)
+  target_link_libraries(test_krtl PRIVATE blackcore)
+  add_test(NAME krtl COMMAND test_krtl)
+
+  # The Xbox synchronisation surface: events, semaphores, waits across threads, IRQL, dispatcher objects.
+  add_executable(test_ksync tests/test_ksync.cpp)
+  target_link_libraries(test_ksync PRIVATE blackcore)
+  add_test(NAME ksync COMMAND test_ksync)
+
+  # The handle space both file and sync objects live in: two arenas, one value space.
+  add_executable(test_handle tests/test_handle.cpp)
+  target_link_libraries(test_handle PRIVATE blackcore)
+  add_test(NAME handle COMMAND test_handle)
 
   # The AV/HAL/interrupt/settings/section/crypto exports, the data exports, DbgPrint's format
   # translation, and the three calls that have to end the run (checked in a forked child, so a bugcheck

@@ -33,6 +33,9 @@ constexpr const char *kVersion = "0.2.0 (linux)";
 struct Options {
     std::string xbe = "game/default.xbe";
     std::string log = "blacklinux.log";
+    // Where \Device\Harddisk0 lives. Empty means "use the default under XDG_DATA_HOME", which is what a
+    // player's writable console data belongs in: the game's own folder is the DVD and stays read-only.
+    std::string hdd;
     bool probe = false;
     bool info = false;
     bool trace = false;
@@ -49,6 +52,7 @@ void usage()
             "usage: blacklinux [options]\n"
             "  --xbe <path>    XBE to run (default game/default.xbe)\n"
             "  --log <path>    log file (default blacklinux.log)\n"
+            "  --hdd <path>    writable folder for \\Device\\Harddisk0 (default $XDG_DATA_HOME/blacklinux)\n"
             "  --probe         enter the entry point, wait --timeout seconds, then exit\n"
             "  --info          print the image and exit without mapping it\n"
             "  --timeout <s>   --probe timeout in seconds (default 15)\n"
@@ -73,6 +77,10 @@ bool parse_args(int argc, char **argv, Options &o)
             const char *v = need("--xbe");
             if (!v) return false;
             o.xbe = v;
+        } else if (!strcmp(a, "--hdd")) {
+            const char *v = need("--hdd");
+            if (!v) return false;
+            o.hdd = v;
         } else if (!strcmp(a, "--log")) {
             const char *v = need("--log");
             if (!v) return false;

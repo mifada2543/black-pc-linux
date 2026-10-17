@@ -103,10 +103,11 @@ static void test_resolution_and_read()
     check(h2 != XF_INVALID_HANDLE_VALUE, "paths are case-insensitive even though the host filesystem is not");
     if (h2 != XF_INVALID_HANDLE_VALUE) xf_close(h2);
 
-    // No such file -> OBJECT_PATH_NOT_FOUND, not a generic failure.
+    // No such file: the name is missing, not the path. The Xbox says OBJECT_NAME_NOT_FOUND for this and
+    // OBJECT_PATH_NOT_FOUND for an unmapped device, and game code tells the two apart.
     NTSTATUS s;
     open_at("\\??\\D:\\media\\nope.xmv", XF_GENERIC_READ, XF_FILE_OPEN, 0, &s);
-    check(s == XF_OBJECT_PATH_NOT_FOUND, "a missing file gives OBJECT_PATH_NOT_FOUND");
+    check(s == XF_OBJECT_NAME_NOT_FOUND, "a missing file gives OBJECT_NAME_NOT_FOUND");
 
     // An unmapped device must not fall through to the host filesystem.
     open_at("\\??\\Q:\\secret", XF_GENERIC_READ, XF_FILE_OPEN, 0, &s);
@@ -287,7 +288,11 @@ static void test_raw_volume()
     // Geometry and partition info are what the game queries before touching the save partition.
     uint8_t geo[32];
     NTSTATUS gs = xf_device_io_control(raw, 0x70000, geo, sizeof geo, &iosb);
-    check(XF_NT_OK(gs) && *(uint32_t *)geo == 512, "IOCTL_DISK_GET_DRIVE_GEOMETRY reports 512 bytes/sector");
+    // DISK_GEOMETRY as NT lays it out: Cylinders (8), MediaType, TracksPerCylinder, SectorsPerTrack,
+    // BytesPerSector -- the offsets k_file.cpp fills, so a game reading it sees what it saw on the console.
+    check(XF_NT_OK(gs) && *(uint32_t *)(geo + 20) == 512, "IOCTL_DISK_GET_DRIVE_GEOMETRY reports 512 bytes/sector");
+    check(*(uint32_t *)(geo + 8) == 12, "and removable media, which is what every partition here is");
+    check(*(uint32_t *)(geo + 12) == 1 && *(uint32_t *)(geo + 16) == 1, "one track of one sector");
     uint8_t part[16];
     NTSTATUS ps = xf_device_io_control(raw, 0x74004, part, sizeof part, &iosb);
     check(XF_NT_OK(ps) && *(uint32_t *)(part + 4) == 0, "IOCTL_DISK_GET_PARTITION_INFO starts at sector 0 for the whole disk");

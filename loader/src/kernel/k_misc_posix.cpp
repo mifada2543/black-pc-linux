@@ -342,18 +342,6 @@ extern "C" uint8_t __attribute__((stdcall)) KeDisconnectInterrupt(XKInterrupt *I
     return was ? 1 : 0;
 }
 
-extern "C" uint8_t __attribute__((stdcall)) KeSynchronizeExecution(XKInterrupt *Interrupt, void *SynchronizeRoutine,
-                                                                    void *SynchronizeContext)
-{
-    // On the console this raised the IRQL to the interrupt's level and called the routine with
-    // interrupts masked. There is no IRQL to raise here (k_thread will bring the dispatch mutex that
-    // stands in for it), and the only interrupt that could fire is one that never does, so the routine
-    // runs at ordinary priority and says so.
-    (void)Interrupt;
-    if (!SynchronizeRoutine) return 0;
-    return ((uint8_t(__attribute__((stdcall)) *)(void *))SynchronizeRoutine)(SynchronizeContext);
-}
-
 // ----------------------------------------------------------------------------------------------------------
 // time, FPU
 

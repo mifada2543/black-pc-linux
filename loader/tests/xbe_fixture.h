@@ -36,7 +36,7 @@ constexpr uint32_t LIBVER_VA = BASE + 0x960;
 constexpr uint32_t DEBUGPATH_VA = BASE + 0xA00;
 
 constexpr uint32_t TEXT_VA = BASE + 0xF1000; // 0x101000
-constexpr uint32_t HANDLER_OFF = 0x64;       // where kBootCode's boot_handler lands (from objdump)
+constexpr uint32_t HANDLER_OFF = 0x66;       // where kBootCode's boot_handler lands (from objdump)
 constexpr uint32_t HANDLER_VA = TEXT_VA + HANDLER_OFF;
 constexpr uint32_t TEXT_RAW = 0x1000;
 constexpr uint32_t TEXT_SIZE = 0x1000;
@@ -100,13 +100,13 @@ constexpr int kKernelImportCount = (int)(sizeof(kKernelOrdinals) / sizeof(kKerne
 
 // Slot offsets the assembled code uses, recomputed here so the test can check the numbers rather than
 // trust the transcription.
-constexpr int SLOT_STUB0 = 30;    // ordinal 129, KeRaiseIrqlToDpcLevel, argc 0
+constexpr int SLOT_STUB0 = 31;    // ordinal 137, KeRemoveQueueDpc, argc 1
 constexpr int SLOT_STUB1 = 36;    // ordinal 149, KeSetTimer, argc 4
 constexpr int SLOT_POOL = 5;      // ordinal 15,  ExAllocatePoolWithTag
 constexpr int SLOT_NTALLOC = 54;  // ordinal 184, NtAllocateVirtualMemory
 constexpr int SLOT_RAISE = 95;    // ordinal 302, RtlRaiseException
 constexpr int SLOT_UNWIND = 99;   // ordinal 312, RtlUnwind
-static_assert(kKernelOrdinals[SLOT_STUB0] == 129, "slot 30 must be ordinal 129");
+static_assert(kKernelOrdinals[SLOT_STUB0] == 137, "slot 31 must be ordinal 137");
 static_assert(kKernelOrdinals[SLOT_STUB1] == 149, "slot 36 must be ordinal 149");
 static_assert(kKernelOrdinals[SLOT_POOL] == 15, "slot 5 must be ordinal 15");
 static_assert(kKernelOrdinals[SLOT_NTALLOC] == 184, "slot 54 must be ordinal 184");
@@ -115,7 +115,7 @@ static_assert(kKernelOrdinals[SLOT_UNWIND] == 312, "slot 99 must be ordinal 312"
 
 // Where the RtlRaiseException call returns to: boot_entry + 0x35, from the objdump below. The handler
 // must report exactly this as Context->Eip (the contract in seh.h), so the test asserts it.
-constexpr uint32_t RAISE_RETURN_OFF = 0x35;
+constexpr uint32_t RAISE_RETURN_OFF = 0x37;
 
 // ---------------------------------------------------------------------------
 // The boot stub, as GNU as emitted it for this sequence (Intel syntax source):
@@ -157,62 +157,70 @@ constexpr uint32_t RAISE_RETURN_OFF = 0x35;
 // MSVC try/except prologue actually emits.
 // ---------------------------------------------------------------------------
 constexpr uint8_t kBootCode[] = {
-    0xA1, 0x78, 0x20, 0x10, 0x00,                // 00  mov    eax,ds:0x102078
-    0xFF, 0xD0,                                  // 05  call   eax
-    0x6A, 0x00,                                  // 07  push   0x0
+    0x6A, 0x00,                                  // 00  push   0x0
+    0xA1, 0x7C, 0x20, 0x10, 0x00,                // 02  mov    eax,ds:0x10207c
+    0xFF, 0xD0,                                  // 07  call   eax
     0x6A, 0x00,                                  // 09  push   0x0
     0x6A, 0x00,                                  // 0B  push   0x0
     0x6A, 0x00,                                  // 0D  push   0x0
-    0xA1, 0x90, 0x20, 0x10, 0x00,                // 0F  mov    eax,ds:0x102090
-    0xFF, 0xD0,                                  // 14  call   eax
-    0x68, 0x64, 0x10, 0x10, 0x00,                // 16  push   0x101064
-    0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,    // 1B  push   DWORD PTR fs:0x0
-    0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,    // 22  mov    DWORD PTR fs:0x0,esp
-    0x68, 0x00, 0x22, 0x10, 0x00,                // 29  push   0x102200
-    0xA1, 0x7C, 0x21, 0x10, 0x00,                // 2E  mov    eax,ds:0x10217c
-    0xFF, 0xD0,                                  // 33  call   eax
-    0xA3, 0x00, 0x23, 0x10, 0x00,                // 35  mov    ds:0x102300,eax
-    0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,          // 3A  mov    eax,fs:0x0
-    0x68, 0xAD, 0xDE, 0x00, 0x00,                // 40  push   0xdead
-    0x6A, 0x00,                                  // 45  push   0x0
+    0x6A, 0x00,                                  // 0F  push   0x0
+    0xA1, 0x90, 0x20, 0x10, 0x00,                // 11  mov    eax,ds:0x102090
+    0xFF, 0xD0,                                  // 16  call   eax
+    0x68, 0x66, 0x10, 0x10, 0x00,                // 18  push   0x101066
+    0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,    // 1D  push   DWORD PTR fs:0x0
+    0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,    // 24  mov    DWORD PTR fs:0x0,esp
+    0x68, 0x00, 0x22, 0x10, 0x00,                // 2B  push   0x102200
+    0xA1, 0x7C, 0x21, 0x10, 0x00,                // 30  mov    eax,ds:0x10217c
+    0xFF, 0xD0,                                  // 35  call   eax
+    0xA3, 0x00, 0x23, 0x10, 0x00,                // 37  mov    ds:0x102300,eax
+    0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,          // 3C  mov    eax,fs:0x0
+    0x68, 0xAD, 0xDE, 0x00, 0x00,                // 42  push   0xdead
     0x6A, 0x00,                                  // 47  push   0x0
-    0x50,                                        // 49  push   eax
-    0xA1, 0x8C, 0x21, 0x10, 0x00,                // 4A  mov    eax,ds:0x10218c
-    0xFF, 0xD0,                                  // 4F  call   eax
-    0xA3, 0x04, 0x23, 0x10, 0x00,                // 51  mov    ds:0x102304,eax
-    0x8B, 0x0C, 0x24,                            // 56  mov    ecx,DWORD PTR [esp]
-    0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,    // 59  mov    DWORD PTR fs:0x0,ecx
-    0x83, 0xC4, 0x08,                            // 60  add    esp,0x8
-    0xC3,                                        // 63  ret
-    0x8B, 0x44, 0x24, 0x04,                      // 64  mov    eax,DWORD PTR [esp+0x4]  (boot_handler)
-    0x8B, 0x00,                                  // 68  mov    eax,DWORD PTR [eax]
-    0xA3, 0x08, 0x23, 0x10, 0x00,                // 6A  mov    ds:0x102308,eax
-    0x8B, 0x44, 0x24, 0x0C,                      // 6F  mov    eax,DWORD PTR [esp+0xc]
-    0x8B, 0x80, 0xB8, 0x00, 0x00, 0x00,          // 73  mov    eax,DWORD PTR [eax+0xb8]
-    0xA3, 0x0C, 0x23, 0x10, 0x00,                // 79  mov    ds:0x10230c,eax
-    0xC7, 0x05, 0x10, 0x23, 0x10, 0x00, 0xDE, 0xC0, 0x00, 0x00, // 7E  mov    DWORD PTR ds:0x102310,0xc0de
-    0x31, 0xC0,                                  // 88  xor    eax,eax
-    0xC3,                                        // 8A  ret
+    0x6A, 0x00,                                  // 49  push   0x0
+    0x50,                                        // 4B  push   eax
+    0xA1, 0x8C, 0x21, 0x10, 0x00,                // 4C  mov    eax,ds:0x10218c
+    0xFF, 0xD0,                                  // 51  call   eax
+    0xA3, 0x04, 0x23, 0x10, 0x00,                // 53  mov    ds:0x102304,eax
+    0x8B, 0x0C, 0x24,                            // 58  mov    ecx,DWORD PTR [esp]
+    0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,    // 5B  mov    DWORD PTR fs:0x0,ecx
+    0x83, 0xC4, 0x08,                            // 62  add    esp,0x8
+    0xC3,                                        // 65  ret
+    0x8B, 0x44, 0x24, 0x04,                      // 66  mov    eax,DWORD PTR [esp+0x4]
+    0x8B, 0x00,                                  // 6A  mov    eax,DWORD PTR [eax]
+    0xA3, 0x08, 0x23, 0x10, 0x00,                // 6C  mov    ds:0x102308,eax
+    0x8B, 0x44, 0x24, 0x0C,                      // 71  mov    eax,DWORD PTR [esp+0xc]
+    0x8B, 0x80, 0xB8, 0x00, 0x00, 0x00,          // 75  mov    eax,DWORD PTR [eax+0xb8]
+    0xA3, 0x0C, 0x23, 0x10, 0x00,                // 7B  mov    ds:0x10230c,eax
+    0xC7, 0x05, 0x10, 0x23, 0x10, 0x00, 0xDE, 0xC0, 0x00, 0x00, // 80  mov    DWORD PTR ds:0x102310,0xc0de
+    0x31, 0xC0,                                  // 8A  xor    eax,eax
+    0xC3,                                        // 8C  ret
 };
-constexpr uint32_t BOOT_ENTRY_LEN = 0x64; // boot_handler starts here
+constexpr uint32_t BOOT_ENTRY_LEN = 0x66; // boot_handler starts here
 
 // The immediates below must agree with the constants they were generated from, or the stub silently
 // reads the wrong memory -- the section table lives at 0x10180 and looks enough like code to call.
-static_assert(sizeof kBootCode == BOOT_ENTRY_LEN + 0x27, "the handler follows the entry at 0x64 and runs to 0x8A");
+static_assert(sizeof kBootCode == BOOT_ENTRY_LEN + 0x27, "the handler follows the entry at 0x66 and runs to 0x8D");
 constexpr uint32_t STUB0_VA = THUNK_VA + SLOT_STUB0 * 4;
 constexpr uint32_t STUB1_VA = THUNK_VA + SLOT_STUB1 * 4;
-static_assert(kBootCode[0x00] == 0xA1 && kBootCode[0x01] == (uint8_t)(STUB0_VA & 0xFF) &&
-                  kBootCode[0x04] == (uint8_t)((STUB0_VA >> 24) & 0xFF),
-              "boot_entry reads the thunk slot for ordinal 129");
-static_assert(kBootCode[0x0F] == 0xA1 && kBootCode[0x10] == (uint8_t)(STUB1_VA & 0xFF) &&
-                  kBootCode[0x13] == (uint8_t)((STUB1_VA >> 24) & 0xFF),
+#ifndef BOOTFIX_SKIP_ASM_ASSERTS // see tests/fixture_gen/gen.sh
+// These four checks compare the low byte and the third byte of each immediate -- the third is the one
+// that moves when the fixture's layout moves. The top byte of every address here is zero, so checking it
+// proves nothing; an earlier version of these asserts did exactly that and passed forever.
+static_assert(kBootCode[0x02] == 0xA1 && kBootCode[0x03] == (uint8_t)(STUB0_VA & 0xFF) &&
+                  kBootCode[0x05] == (uint8_t)((STUB0_VA >> 16) & 0xFF),
+              "boot_entry reads the thunk slot for ordinal 137");
+static_assert(kBootCode[0x11] == 0xA1 && kBootCode[0x12] == (uint8_t)(STUB1_VA & 0xFF) &&
+                  kBootCode[0x14] == (uint8_t)((STUB1_VA >> 16) & 0xFF),
               "and then the one for ordinal 149");
-static_assert(kBootCode[0x16] == 0x68 && kBootCode[0x17] == (uint8_t)(HANDLER_VA & 0xFF) &&
-                  kBootCode[0x1A] == (uint8_t)((HANDLER_VA >> 24) & 0xFF),
+#endif
+#ifndef BOOTFIX_SKIP_ASM_ASSERTS
+static_assert(kBootCode[0x18] == 0x68 && kBootCode[0x19] == (uint8_t)(HANDLER_VA & 0xFF) &&
+                  kBootCode[0x1B] == (uint8_t)((HANDLER_VA >> 16) & 0xFF),
               "the prologue pushes the handler that actually exists in this image");
-static_assert(kBootCode[0x29] == 0x68 && kBootCode[0x2A] == (uint8_t)(RECORD_VA & 0xFF) &&
-                  kBootCode[0x2D] == (uint8_t)((RECORD_VA >> 24) & 0xFF),
+static_assert(kBootCode[0x2B] == 0x68 && kBootCode[0x2C] == (uint8_t)(RECORD_VA & 0xFF) &&
+                  kBootCode[0x2E] == (uint8_t)((RECORD_VA >> 16) & 0xFF),
               "the raise passes the record that lives in .data");
+#endif
 
 // --- little writers that refuse to run off the end of the buffer ---------------------------------------
 

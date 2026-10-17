@@ -126,8 +126,8 @@ extern "C" void __attribute__((stdcall)) KeInitializeInterrupt(XKInterrupt *Inte
                                                                uint32_t InterruptMode, uint8_t ShareVector);
 extern "C" uint8_t __attribute__((stdcall)) KeConnectInterrupt(XKInterrupt *Interrupt);
 extern "C" uint8_t __attribute__((stdcall)) KeDisconnectInterrupt(XKInterrupt *Interrupt);
-extern "C" uint8_t __attribute__((stdcall)) KeSynchronizeExecution(XKInterrupt *Interrupt, void *SynchronizeRoutine,
-                                                                    void *SynchronizeContext);
+// KeSynchronizeExecution is not here: it synchronises through the dispatch mutex, which belongs to the
+// sync layer (k_sync_posix.h).
 
 // ---- time, FPU -------------------------------------------------------------------------------------------
 

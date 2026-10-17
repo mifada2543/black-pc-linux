@@ -1,5 +1,7 @@
 #include "platform/posix/xsync.h"
 
+#include "platform/posix/xhandle.h"
+
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -134,8 +136,9 @@ bool is_notification(XDispatcherHeader *h)
 
 HandleObject *handle_of(XHandle h)
 {
-    if (h >= g_handles.size()) return nullptr;
-    return g_handles[h].live ? &g_handles[h] : nullptr;
+    const size_t i = xhandle_index(h);
+    if (i >= g_handles.size()) return nullptr;
+    return g_handles[i].live ? &g_handles[i] : nullptr;
 }
 
 } // namespace
@@ -339,7 +342,7 @@ NTSTATUS xk_create_event(XHandle *out, uint32_t event_type, uint8_t initial_stat
         o.manual_reset = (event_type == 0); // NotificationEvent is manual reset
         o.count = initial_state ? 1 : 0;
         o.live = true;
-        *out = (XHandle)i;
+        *out = xhandle_make(XHANDLE_SYNC, (uint32_t)i);
         return XK_SUCCESS;
     }
     g_handles.emplace_back();
@@ -348,7 +351,7 @@ NTSTATUS xk_create_event(XHandle *out, uint32_t event_type, uint8_t initial_stat
     o.manual_reset = (event_type == 0);
     o.count = initial_state ? 1 : 0;
     o.live = true;
-    *out = (XHandle)(g_handles.size() - 1);
+    *out = xhandle_make(XHANDLE_SYNC, (uint32_t)(g_handles.size() - 1));
     return XK_SUCCESS;
 }
 
@@ -376,7 +379,7 @@ NTSTATUS xk_create_semaphore(XHandle *out, int32_t initial, int32_t maximum)
         o.count = initial;
         o.max = maximum;
         o.live = true;
-        *out = (XHandle)i;
+        *out = xhandle_make(XHANDLE_SYNC, (uint32_t)i);
         return XK_SUCCESS;
     }
     g_handles.emplace_back();
@@ -385,7 +388,7 @@ NTSTATUS xk_create_semaphore(XHandle *out, int32_t initial, int32_t maximum)
     o.count = initial;
     o.max = maximum;
     o.live = true;
-    *out = (XHandle)(g_handles.size() - 1);
+    *out = xhandle_make(XHANDLE_SYNC, (uint32_t)(g_handles.size() - 1));
     return XK_SUCCESS;
 }
 
@@ -429,10 +432,11 @@ NTSTATUS xk_wait_handle(XHandle h, uint8_t alertable, const XLargeInt *timeout)
 NTSTATUS xk_close(XHandle h)
 {
     std::lock_guard<std::mutex> g(g_handle_mutex);
-    if (h >= g_handles.size() || !g_handles[h].live) return XK_INVALID_HANDLE;
-    g_handles[h].live = false;
-    g_handles[h].count = 0;
-    g_handles[h].cv.notify_all();
+    const size_t i = xhandle_index(h);
+    if (i >= g_handles.size() || !g_handles[i].live) return XK_INVALID_HANDLE;
+    g_handles[i].live = false;
+    g_handles[i].count = 0;
+    g_handles[i].cv.notify_all();
     return XK_SUCCESS;
 }
 

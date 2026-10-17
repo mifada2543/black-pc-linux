@@ -13,8 +13,8 @@
 //   image_map              done (image.cpp)
 //   patch_fs_accesses      done (fs_patch.cpp, via XbeImage::patch_fs)
 //   kernel_resolve_thunks  done (ktable_posix.cpp)
-//   kfile_init             done (xfile.cpp, but not called yet: no file paths to mount until the game's
-//                          first NtCreateFile, which needs the mount table's game directories)
+//   kfile_init             done (k_file_posix.cpp over xfile.cpp): the mount table is built from the
+//                          folder the XBE came from plus the writable hard-disk folder
 //   install_crash_handlers done (seh.cpp: seh_install_signal_bridge)
 //   install_probes         not needed -- those patch Windows-only call sites
 //   install_d3d_hooks      NOT YET (Vulkan phase)
@@ -76,6 +76,11 @@ bool boot_inspect(const std::string &path, XbePosix &x, BootReport &rep, std::st
 // Parse, map, copy the sections, patch fs->gs, and fill the kernel import table. `img` stays mapped so
 // the caller can execute from it. Prints each step through logc.
 bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootReport &rep, std::string &err);
+
+// Where \Device\Harddisk0 should live when the command line did not say. $XDG_DATA_HOME/blacklinux, or
+// ~/.local/share/blacklinux; created if it is not there. The game folder is the DVD and stays read-only,
+// which is why the writable console data goes somewhere else.
+std::string boot_default_hdd_dir();
 
 // Enter the image's entry point on a real thread and wait. The entry point is game code that may never
 // return, so this returns when the thread returns, when `timeout_ms` expires (0 = wait forever), or when

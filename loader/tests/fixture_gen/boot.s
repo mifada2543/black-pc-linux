@@ -9,11 +9,13 @@
 .text
 .globl boot_entry
 boot_entry:
-    # Two calls that land on logging stubs, one with no arguments and one with four, so the stub's stack
-    # discipline is checked from game code: each stdcall stub must drop exactly its own arguments. These
-    # are the ordinals the HLE layers have *not* implemented, and they have to stay that way -- the fixture
-    # is regenerated whenever an ordinal is implemented so this keeps pointing at stubs.
-    mov eax, dword ptr [THUNK_STUB0]    # slot 30: ordinal 129, KeRaiseIrqlToDpcLevel, no arguments
+    # Two calls that land on logging stubs, one with a single argument and one with four, so the stub's
+    # stack discipline is checked from game code: each stdcall stub must drop exactly its own arguments
+    # and not one more. These are ordinals the HLE layers have *not* implemented, and they have to stay
+    # that way -- the fixture is regenerated whenever an ordinal is implemented so this keeps pointing at
+    # stubs, and the slot numbers come from the ordinal list rather than from being counted by hand.
+    push 0                             # ordinal 137 takes one argument
+    mov eax, dword ptr [THUNK_STUB0]    # slot 31: ordinal 137, KeRemoveQueueDpc
     call eax
     push 0                             # ordinal 149 takes four arguments
     push 0

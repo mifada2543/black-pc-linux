@@ -161,8 +161,14 @@ enum {
 // \Device\Harddisk0 and Partition1-5. Creates the partition folders and Partition1's TDATA/UDATA.
 void xf_init(const std::string &game_dir, const std::string &hdd_dir);
 
-// Symbolic link, as ObReferenceObjectByHandle on \??\D: does on Windows. Names are case-insensitive.
-void xf_add_symlink(const std::string &name, const std::string &target);
+// Symbolic links, as ObReferenceObjectByHandle on \??\D: does on Windows. Names are case-insensitive.
+// Adding a name that already exists reports a name collision rather than replacing it.
+NTSTATUS xf_add_symlink(const std::string &name, const std::string &target);
+NTSTATUS xf_remove_symlink(const std::string &name);
+// Opening a link yields a handle of its own (kind XHANDLE_LINK) that reports the target, because the
+// Xbox's link object does too and the game asks for it with NtQuerySymbolicLinkObject.
+NTSTATUS xf_open_symlink(XfHandle *out, const XAnsiString *name);
+NTSTATUS xf_query_symlink(XfHandle h, XAnsiString *target, uint32_t *returned_length);
 
 // Canonical Xbox path a handle refers to, for logging. "?" when the handle is not known.
 std::string xf_handle_desc(XfHandle h);
@@ -183,6 +189,12 @@ NTSTATUS xf_write(XfHandle h, const void *buf, uint32_t len, XLargeInteger *offs
 
 NTSTATUS xf_flush(XfHandle h);
 NTSTATUS xf_set_information_file(XfHandle h, uint32_t class_, const std::string &new_name);
+
+// The information classes the Xbox kernel answers for a file. Only the ones the game can need are
+// implemented -- see xfile.cpp for which numbers those are and why two are accepted for a rename -- and
+// anything else reports XF_INVALID_PARAMETER rather than filling in a guess.
+NTSTATUS xf_query_information(XfHandle h, uint32_t class_, void *info, uint32_t len, XIoStatusBlock *iosb);
+NTSTATUS xf_set_information(XfHandle h, uint32_t class_, const void *info, uint32_t len, XIoStatusBlock *iosb);
 NTSTATUS xf_delete(XfHandle h); // FileDispositionInformation: mark delete-on-close, do it at once
 
 NTSTATUS xf_query_volume(XfHandle h, void *info, uint32_t len, uint32_t class_, XIoStatusBlock *iosb);

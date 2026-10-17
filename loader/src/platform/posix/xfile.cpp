@@ -10,6 +10,10 @@
 
 #include "platform/posix/xfile.h"
 
+#include "platform/posix/log.h"
+
+#include "platform/posix/xhandle.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -74,10 +78,20 @@ struct Handle {
     bool used = false;
     int fd = -1;
     std::string xbox_path;
+    // The host path this handle resolved to. Kept because the directory listing has to stat each entry --
+    // getdents64 does not say what kind of file it is -- and the only way back to the host is here.
+    std::string host_path;
     const Mount *mount = nullptr;
     bool raw_volume = false;
     uint32_t access = 0;
     bool delete_pending = false;
+    // A symbolic-link object has no file behind it: xbox_path is the link's own name and link_target is
+    // what it resolves to, which is what NtQuerySymbolicLinkObject reports.
+    bool is_link = false;
+    std::string link_target;
+    // The file position the Xbox kernel would keep per file object: the game reads it back with
+    // FilePositionInformation, and there is no seek() here -- every read and write names its offset.
+    int64_t last_offset = 0;
     // Directory cursor: a live getdents64 buffer plus how far we have consumed it. dir_len is the number
 // of bytes the last read actually filled -- dir_buf stays at its full allocation, so dir_buf.size()
 // must never be used as the valid length. Keeping the buffer per handle is what makes "one entry per
@@ -119,7 +133,7 @@ void complete(XIoStatusBlock *iosb, NTSTATUS s, uint32_t info)
 uint32_t err_to_status(int e)
 {
     switch (e) {
-    case ENOENT:
+    case ENOENT: return XF_OBJECT_NAME_NOT_FOUND;
     case ENOTDIR: return XF_OBJECT_PATH_NOT_FOUND;
     case EACCES:
     case EPERM:
@@ -156,8 +170,9 @@ NTSTATUS resolve(uint32_t root, const XAnsiString *name, Resolved &r)
         root = XF_INVALID_HANDLE_VALUE;
     }
     if (root != XF_INVALID_HANDLE_VALUE) {
-        if (root >= kMaxHandles || !g_handles[root].used) return XF_INVALID_HANDLE;
-        std::string base = g_handles[root].xbox_path;
+        const uint32_t ri = xhandle_index(root);
+        if (ri >= kMaxHandles || !g_handles[ri].used) return XF_INVALID_HANDLE;
+        std::string base = g_handles[ri].xbox_path;
         if (!path.empty() && path[0] != '\\' && (base.empty() || base.back() != '\\')) base += '\\';
         path = base + path;
     }
@@ -232,6 +247,14 @@ std::string host_path_ci(const Mount &m, const std::string &rest)
         i = j;
     }
     return {};
+}
+
+// The arena entry a handle refers to, or null. Every public entry point resolves the handle through
+// this, so a handle from another layer cannot reach the file table by accident.
+Handle *file_of(XfHandle h)
+{
+    const uint32_t i = xhandle_index(h);
+    return i < kMaxHandles && g_handles[i].used ? &g_handles[i] : nullptr;
 }
 
 int alloc_handle()
@@ -346,6 +369,7 @@ NTSTATUS open_common(const char *what, XfHandle *out, uint32_t access, XObjectAt
     h.used = true;
     h.fd = fd;
     h.xbox_path = r.xbox_path;
+    h.host_path = r.host_path;
     h.mount = r.mount;
     h.raw_volume = raw;
     h.access = a;
@@ -354,7 +378,7 @@ NTSTATUS open_common(const char *what, XfHandle *out, uint32_t access, XObjectAt
     if (raw && r.mount->partition >= 0 && alloc && alloc->QuadPart > 0) {
         if (ftruncate(fd, alloc->QuadPart) != 0) { /* best effort; the game only does this on format */ }
     }
-    *out = (XfHandle)slot;
+    *out = xhandle_make(XHANDLE_FILE, (uint32_t)slot);
     complete(iosb, XF_SUCCESS, 0);
     (void)what;
     (void)attrs;
@@ -409,7 +433,15 @@ NTSTATUS dir_next(Handle &h, void *info, uint32_t len, XIoStatusBlock *iosb)
             // the attributes here, so d_ino/d_type is enough for the rest.
             out->EndOfFile.QuadPart = de->d_off;
             out->AllocationSize.QuadPart = de->d_off;
-            out->FileAttributes = de->d_type == DT_DIR ? 0x10 /* FILE_ATTRIBUTE_DIRECTORY */ : 0x80 /* NORMAL */;
+            // Most Linux filesystems report d_type as DT_UNKNOWN, and the game filters directory listings
+            // on FILE_ATTRIBUTE_DIRECTORY, so an unknown type has to be resolved with a stat.
+            bool is_dir = de->d_type == DT_DIR;
+            if (de->d_type == DT_UNKNOWN) {
+                struct stat st;
+                const std::string child = h.host_path + "/" + name;
+                is_dir = stat(child.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+            }
+            out->FileAttributes = is_dir ? 0x10 /* FILE_ATTRIBUTE_DIRECTORY */ : 0x80 /* NORMAL */;
             out->FileNameLength = nlen;
             uint32_t room = len - kDirInfoHeaderSize;
             uint32_t copy = nlen < room ? nlen : room;
@@ -452,10 +484,56 @@ std::string xstr(const XAnsiString *s)
     return std::string(s->Buffer, s->Length);
 }
 
-void xf_add_symlink(const std::string &name, const std::string &target)
+NTSTATUS xf_add_symlink(const std::string &name, const std::string &target)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
+    // Object-name collision, not an overwrite: two links with one name would make which device a path
+    // resolves to depend on creation order, and the game does check this status.
+    if (g_links.count(lower(name))) return XF_OBJECT_NAME_COLLISION;
     g_links[lower(name)] = target;
+    return XF_SUCCESS;
+}
+
+NTSTATUS xf_remove_symlink(const std::string &name)
+{
+    std::lock_guard<std::recursive_mutex> g(g_mutex);
+    return g_links.erase(lower(name)) ? XF_SUCCESS : XF_OBJECT_NAME_NOT_FOUND;
+}
+
+NTSTATUS xf_open_symlink(XfHandle *out, const XAnsiString *name)
+{
+    if (!out) return XF_INVALID_PARAMETER;
+    const std::string key = lower(name ? xstr(name) : std::string());
+    std::lock_guard<std::recursive_mutex> g(g_mutex);
+    auto it = g_links.find(key);
+    if (it == g_links.end()) return XF_OBJECT_PATH_NOT_FOUND;
+
+    // A link handle carries the link's name and target in the loader, because the Xbox's does too: the
+    // game asks the object for its target afterwards with NtQuerySymbolicLinkObject.
+    const int slot = alloc_handle();
+    if (slot < 0) return XF_NO_MEMORY;
+    Handle &h = g_handles[slot];
+    h = Handle();
+    h.used = true;
+    h.fd = -1;
+    h.xbox_path = "\\??\\" + it->first;
+    h.link_target = it->second;
+    h.is_link = true;
+    *out = xhandle_make(XHANDLE_LINK, (uint32_t)slot);
+    return XF_SUCCESS;
+}
+
+NTSTATUS xf_query_symlink(XfHandle h, XAnsiString *target, uint32_t *returned_length)
+{
+    std::lock_guard<std::recursive_mutex> g(g_mutex);
+    const Handle *t = file_of(h);
+    if (!t || !t->is_link) return XF_INVALID_HANDLE;
+    if (returned_length) *returned_length = (uint32_t)t->link_target.size();
+    if (!target || !target->Buffer) return XF_INVALID_PARAMETER;
+    if (target->MaximumLength < t->link_target.size()) return XF_BUFFER_TOO_SMALL;
+    memcpy(target->Buffer, t->link_target.data(), t->link_target.size());
+    target->Length = (uint16_t)t->link_target.size();
+    return XF_SUCCESS;
 }
 
 void xf_init(const std::string &game_dir, const std::string &hdd_dir)
@@ -480,8 +558,8 @@ void xf_init(const std::string &game_dir, const std::string &hdd_dir)
 std::string xf_handle_desc(XfHandle h)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h < kMaxHandles && g_handles[h].used) return g_handles[h].xbox_path;
-    return "?";
+    const Handle *t = file_of(h);
+    return t ? t->xbox_path : "?";
 }
 
 uint32_t xf_open_handle_count()
@@ -509,8 +587,9 @@ NTSTATUS xf_open_file(XfHandle *out, uint32_t access, XObjectAttributes *oa, uin
 NTSTATUS xf_close(XfHandle h)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) return XF_INVALID_HANDLE;
-    Handle &t = g_handles[h];
+    Handle *tp = file_of(h);
+    if (!tp) return XF_INVALID_HANDLE;
+    Handle &t = *tp;
     if (t.fd >= 0) close(t.fd);
     if (t.delete_pending && !t.xbox_path.empty()) {
         // Delete by resolved Xbox path so the mount-relative name is rebuilt, not guessed.
@@ -525,10 +604,11 @@ NTSTATUS xf_close(XfHandle h)
 NTSTATUS xf_duplicate(XfHandle src, XfHandle *out, uint32_t options)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (src >= kMaxHandles || !g_handles[src].used) return XF_INVALID_HANDLE;
+    const Handle *sp = file_of(src);
+    if (!sp) return XF_INVALID_HANDLE;
     int slot = alloc_handle();
     if (slot < 0) return XF_NO_MEMORY;
-    Handle &s = g_handles[src];
+    Handle &s = g_handles[xhandle_index(src)];
     Handle &d = g_handles[slot];
     d = s;
     d.used = true;
@@ -548,13 +628,15 @@ NTSTATUS xf_duplicate(XfHandle src, XfHandle *out, uint32_t options)
 NTSTATUS xf_read(XfHandle h, void *buf, uint32_t len, XLargeInteger *offset, XIoStatusBlock *iosb)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) {
+    Handle *hp = file_of(h);
+    if (!hp) {
         complete(iosb, XF_INVALID_HANDLE, 0);
         return XF_INVALID_HANDLE;
     }
-    Handle &t = g_handles[h];
+    Handle &t = *hp;
     uint8_t *p = (uint8_t *)buf;
     uint32_t done = 0;
+    if (offset && offset->QuadPart >= 0) t.last_offset = offset->QuadPart;
 
     if (offset && offset->QuadPart >= 0) {
         done = (uint32_t)pread(t.fd, p, len, (off_t)offset->QuadPart);
@@ -580,8 +662,12 @@ NTSTATUS xf_read(XfHandle h, void *buf, uint32_t len, XLargeInteger *offset, XIo
         complete(iosb, s, 0);
         return s;
     }
-    if (done < len && !t.raw_volume) {
-        complete(iosb, XF_END_OF_FILE, done);
+    // NT's rule, which the Xbox inherits: a read that gets *some* of what it asked for succeeds and reports
+    // the count; STATUS_END_OF_FILE is for a read that starts at or past the end and returns nothing.
+    // Returning it for a short read is a status the game reads as a failure -- 0xC0000011 has the high bit
+    // set, so NT_SUCCESS() is false for it -- and a game looping on status would give up early.
+    if (done == 0 && len > 0 && !t.raw_volume) {
+        complete(iosb, XF_END_OF_FILE, 0);
         return XF_END_OF_FILE;
     }
     complete(iosb, XF_SUCCESS, done);
@@ -591,15 +677,17 @@ NTSTATUS xf_read(XfHandle h, void *buf, uint32_t len, XLargeInteger *offset, XIo
 NTSTATUS xf_write(XfHandle h, const void *buf, uint32_t len, XLargeInteger *offset, XIoStatusBlock *iosb)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) {
+    Handle *hp = file_of(h);
+    if (!hp) {
         complete(iosb, XF_INVALID_HANDLE, 0);
         return XF_INVALID_HANDLE;
     }
-    Handle &t = g_handles[h];
+    Handle &t = *hp;
     if (t.mount && t.mount->readonly) {
         complete(iosb, XF_ACCESS_DENIED, 0);
         return XF_ACCESS_DENIED;
     }
+    if (offset && offset->QuadPart >= 0) t.last_offset = offset->QuadPart;
     ssize_t done = offset && offset->QuadPart >= 0 ? pwrite(t.fd, buf, len, (off_t)offset->QuadPart)
                                                     : write(t.fd, buf, len);
     if (done < 0) {
@@ -614,16 +702,18 @@ NTSTATUS xf_write(XfHandle h, const void *buf, uint32_t len, XLargeInteger *offs
 NTSTATUS xf_flush(XfHandle h)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) return XF_INVALID_HANDLE;
-    if (g_handles[h].fd >= 0) fsync(g_handles[h].fd);
+    Handle *hp = file_of(h);
+    if (!hp) return XF_INVALID_HANDLE;
+    if (hp->fd >= 0) fsync(hp->fd);
     return XF_SUCCESS;
 }
 
 NTSTATUS xf_set_information_file(XfHandle h, uint32_t, const std::string &new_name)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) return XF_INVALID_HANDLE;
-    Handle &t = g_handles[h];
+    Handle *hp = file_of(h);
+    if (!hp) return XF_INVALID_HANDLE;
+    Handle &t = *hp;
     if (new_name.empty()) return XF_INVALID_PARAMETER;
     Resolved r;
     XAnsiString s{(uint16_t)t.xbox_path.size(), (uint16_t)t.xbox_path.size(), (char *)t.xbox_path.data()};
@@ -637,11 +727,196 @@ NTSTATUS xf_set_information_file(XfHandle h, uint32_t, const std::string &new_na
     return XF_SUCCESS;
 }
 
+// ---- information classes -----------------------------------------------------
+//
+// The Xbox's class numbers are the NT ones for most of these (4, 13, 14 in particular), but the reference
+// numbers rename as 10 where NT numbers it 7. Both are accepted below, and a rename request that does not
+// resolve fails without touching the file, so an ambiguous class number costs a status rather than data.
+//
+// Only the classes the game can actually need are answered: the sizes it stats, the name it prints, the
+// position it seeks by, and the timestamps a save file carries. Anything else is reported, not guessed at.
+
+NTSTATUS xf_query_information(XfHandle h, uint32_t class_, void *info, uint32_t len, XIoStatusBlock *iosb)
+{
+    std::lock_guard<std::recursive_mutex> g(g_mutex);
+    Handle *hp = file_of(h);
+    if (!hp) {
+        complete(iosb, XF_INVALID_HANDLE, 0);
+        return XF_INVALID_HANDLE;
+    }
+    Handle &t = *hp;
+    if (!info) {
+        complete(iosb, XF_INVALID_PARAMETER, 0);
+        return XF_INVALID_PARAMETER;
+    }
+
+    struct stat st {};
+    const bool have_stat = t.fd >= 0 && fstat(t.fd, &st) == 0;
+    uint8_t *out = (uint8_t *)info;
+
+    switch (class_) {
+    case 4: { // FileBasicInformation: four timestamps and the attributes (40 bytes)
+        if (len < 40) {
+            complete(iosb, XF_BUFFER_TOO_SMALL, 0);
+            return XF_BUFFER_TOO_SMALL;
+        }
+        memset(out, 0, 40);
+        uint8_t *cursor = out; // walks the four timestamps; the attributes word is written from `out`
+        auto put_time = [&](int64_t sec, int64_t nsec) {
+            // Host times are seconds since 1970 in a long long; the Xbox wants 100 ns since 1601.
+            const int64_t units = (sec + 11644473600LL) * 10000000LL + nsec / 100;
+            memcpy(cursor, &units, 8);
+            cursor += 8;
+        };
+        if (have_stat) {
+            put_time(st.st_ctim.tv_sec, st.st_ctim.tv_nsec);
+            put_time(st.st_atim.tv_sec, st.st_atim.tv_nsec);
+            put_time(st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
+            put_time(st.st_mtim.tv_sec, st.st_mtim.tv_nsec); // the console has no separate change time
+        }
+        const uint32_t attrs = (uint32_t)(t.is_dir ? 0x10 /* FILE_ATTRIBUTE_DIRECTORY */
+                                                    : 0x80 /* FILE_ATTRIBUTE_NORMAL */);
+        memcpy(out + 32, &attrs, 4);
+        complete(iosb, XF_SUCCESS, 40);
+        return XF_SUCCESS;
+    }
+    case 5: { // FileStandardInformation: allocation size, end of file, links, flags (24 bytes)
+        if (len < 24) {
+            complete(iosb, XF_BUFFER_TOO_SMALL, 0);
+            return XF_BUFFER_TOO_SMALL;
+        }
+        memset(out, 0, 24);
+        const int64_t size = have_stat ? (int64_t)st.st_size : 0;
+        // The console's FATX reports allocation size and end of file as the same rounded-up length; a
+        // game that reads both wants them to agree.
+        const int64_t alloc = (size + 511) & ~(int64_t)511;
+        memcpy(out + 0, &alloc, 8);
+        memcpy(out + 8, &size, 8);
+        const uint32_t links = have_stat ? (uint32_t)st.st_nlink : 1;
+        memcpy(out + 16, &links, 4);
+        out[20] = t.delete_pending ? 1 : 0;
+        out[21] = t.is_dir ? 1 : 0;
+        complete(iosb, XF_SUCCESS, 24);
+        return XF_SUCCESS;
+    }
+    case 9: { // FileNameInformation: a 4-byte length and the name, relative to its volume, in bytes
+        std::string rel = t.xbox_path;
+        const size_t dev_len = t.mount ? t.mount->device.size() : 0;
+        if (dev_len && rel.size() > dev_len) rel = rel.substr(dev_len);
+        if (rel.empty()) rel = "\\";
+        if (len < 4) {
+            complete(iosb, XF_BUFFER_TOO_SMALL, 0);
+            return XF_BUFFER_TOO_SMALL;
+        }
+        const uint32_t n = (uint32_t)rel.size();
+        memcpy(out, &n, 4);
+        const uint32_t copy = n < len - 4 ? n : len - 4;
+        memcpy(out + 4, rel.data(), copy);
+        const NTSTATUS rs = copy < n ? XF_BUFFER_OVERFLOW : XF_SUCCESS;
+        complete(iosb, rs, 4 + copy);
+        return rs;
+    }
+    case 14: { // FilePositionInformation: the position the last read or write used (8 bytes)
+        if (len < 8) {
+            complete(iosb, XF_BUFFER_TOO_SMALL, 0);
+            return XF_BUFFER_TOO_SMALL;
+        }
+        memcpy(out, &t.last_offset, 8);
+        complete(iosb, XF_SUCCESS, 8);
+        return XF_SUCCESS;
+    }
+    default:
+        logf("file: NtQueryInformationFile('%s', class %u) not answered here", t.xbox_path.c_str(), class_);
+        complete(iosb, XF_INVALID_PARAMETER, 0);
+        return XF_INVALID_PARAMETER;
+    }
+}
+
+NTSTATUS xf_set_information(XfHandle h, uint32_t class_, const void *info, uint32_t len, XIoStatusBlock *iosb)
+{
+    std::lock_guard<std::recursive_mutex> g(g_mutex);
+    Handle *hp = file_of(h);
+    if (!hp) {
+        complete(iosb, XF_INVALID_HANDLE, 0);
+        return XF_INVALID_HANDLE;
+    }
+    Handle &t = *hp;
+    if (!info) {
+        complete(iosb, XF_INVALID_PARAMETER, 0);
+        return XF_INVALID_PARAMETER;
+    }
+    const uint8_t *p = (const uint8_t *)info;
+
+    switch (class_) {
+    case 7:   // FileRenameInformation, NT's number
+    case 10: { // ... and the number the reference uses for it
+        // { BOOLEAN ReplaceIfExists; HANDLE RootDirectory; OBJECT_STRING Name; }
+        if (len < 12) {
+            complete(iosb, XF_INVALID_PARAMETER, 0);
+            return XF_INVALID_PARAMETER;
+        }
+        const XAnsiString *name = (const XAnsiString *)(p + 8);
+        const uint32_t root = *(const uint32_t *)(p + 4);
+        Resolved r;
+        const NTSTATUS rs = resolve(root, name, r);
+        if (!XF_NT_OK(rs)) {
+            // A rename that does not resolve changes nothing: that is what makes accepting two possible
+            // class numbers safe.
+            complete(iosb, rs, 0);
+            return rs;
+        }
+        // The source is this handle's own path, resolved again because a rename can cross volumes and the
+        // host name has to be the one the handle had, not one guessed from the target.
+        XAnsiString self{(uint16_t)t.xbox_path.size(), (uint16_t)t.xbox_path.size(), (char *)t.xbox_path.data()};
+        Resolved mine;
+        if (!XF_NT_OK(resolve(XF_INVALID_HANDLE_VALUE, &self, mine))) {
+            complete(iosb, XF_OBJECT_PATH_NOT_FOUND, 0);
+            return XF_OBJECT_PATH_NOT_FOUND;
+        }
+        const bool replace = p[0] != 0;
+        if (rename(mine.host_path.c_str(), r.host_path.c_str()) != 0) {
+            if (!(replace && errno == EEXIST)) {
+                const NTSTATUS st = err_to_status(errno);
+                complete(iosb, st, 0);
+                return st;
+            }
+            unlink(r.host_path.c_str());
+            if (rename(mine.host_path.c_str(), r.host_path.c_str()) != 0) {
+                const NTSTATUS st = err_to_status(errno);
+                complete(iosb, st, 0);
+                return st;
+            }
+        }
+        t.xbox_path = r.xbox_path;
+        t.mount = r.mount;
+        logf("file: renamed '%s' -> '%s'", mine.xbox_path.c_str(), r.xbox_path.c_str());
+        complete(iosb, XF_SUCCESS, 0);
+        return XF_SUCCESS;
+    }
+    case 14: { // FilePositionInformation: remember it for the next query
+        if (len < 8) {
+            complete(iosb, XF_INVALID_PARAMETER, 0);
+            return XF_INVALID_PARAMETER;
+        }
+        int64_t pos;
+        memcpy(&pos, p, 8);
+        t.last_offset = pos;
+        complete(iosb, XF_SUCCESS, 0);
+        return XF_SUCCESS;
+    }
+    default:
+        logf("file: NtSetInformationFile('%s', class %u) not answered here", t.xbox_path.c_str(), class_);
+        complete(iosb, XF_INVALID_PARAMETER, 0);
+        return XF_INVALID_PARAMETER;
+    }
+}
+
 NTSTATUS xf_delete(XfHandle h)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) return XF_INVALID_HANDLE;
-    g_handles[h].delete_pending = true;
+    Handle *hp = file_of(h);
+    if (!hp) return XF_INVALID_HANDLE;
+    hp->delete_pending = true;
     return XF_SUCCESS; // performed at close, matching FILE_FLAG_DELETE_ON_CLOSE
 }
 
@@ -650,7 +925,8 @@ NTSTATUS xf_query_volume(XfHandle h, void *info, uint32_t len, uint32_t class_, 
     std::lock_guard<std::recursive_mutex> g(g_mutex);
     uint8_t *p = (uint8_t *)info;
     int part = 0;
-    if (h < kMaxHandles && g_handles[h].used && g_handles[h].mount) part = g_handles[h].mount->partition;
+    if (const Handle *hp = file_of(h))
+        if (hp->mount) part = hp->mount->partition;
 
     // class 3 = FileFsSizeInformation (24 bytes), class 7 = FileFsFullSizeInformation (32).
     if ((class_ == 3 || class_ == 7) && part >= 1 && part <= 5) {
@@ -658,7 +934,7 @@ NTSTATUS xf_query_volume(XfHandle h, void *info, uint32_t len, uint32_t class_, 
         uint64_t total = kPartitions[part].size;
         struct statvfs vfs {};
         uint64_t avail = 0;
-        if (h < kMaxHandles && g_handles[h].fd >= 0 && fstatvfs(g_handles[h].fd, &vfs) == 0)
+        if (const Handle *hv = file_of(h); hv && hv->fd >= 0 && fstatvfs(hv->fd, &vfs) == 0)
             avail = (uint64_t)vfs.f_bavail * vfs.f_frsize;
         if (avail > total) avail = total;
         uint32_t need = class_ == 3 ? 24 : 32;
@@ -710,11 +986,12 @@ NTSTATUS xf_query_volume(XfHandle h, void *info, uint32_t len, uint32_t class_, 
 NTSTATUS xf_query_directory(XfHandle h, void *info, uint32_t len, const std::string &mask, bool restart, XIoStatusBlock *iosb)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) {
+    Handle *hp = file_of(h);
+    if (!hp) {
         complete(iosb, XF_INVALID_HANDLE, 0);
         return XF_INVALID_HANDLE;
     }
-    Handle &t = g_handles[h];
+    Handle &t = *hp;
     if (restart) {
         t.dir_pos = 0;
         t.dir_len = 0;
@@ -768,32 +1045,33 @@ NTSTATUS xf_query_directory_attributes(XObjectAttributes *oa, XFileFullDirectory
 NTSTATUS xf_device_io_control(XfHandle h, uint32_t code, void *out, uint32_t out_len, XIoStatusBlock *iosb)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);
-    if (h >= kMaxHandles || !g_handles[h].used) {
+    Handle *hp = file_of(h);
+    if (!hp) {
         complete(iosb, XF_INVALID_HANDLE, 0);
         return XF_INVALID_HANDLE;
     }
-    int part = g_handles[h].mount ? g_handles[h].mount->partition : 0;
+    const int part = hp->mount ? hp->mount->partition : 0;
     uint8_t *p = (uint8_t *)out;
     switch (code) {
     case 0x70000: { // IOCTL_DISK_GET_DRIVE_GEOMETRY
         if (part < 0 || part > 5) return XF_INVALID_DEVICE_REQUEST;
-        if (out_len < 32) {
+        if (out_len < 24) {
             complete(iosb, XF_BUFFER_TOO_SMALL, 0);
             return XF_BUFFER_TOO_SMALL;
         }
-        // DISK_GEOMETRY: cylinders, tracks, sectors, bytes per sector, media type.
+        // DISK_GEOMETRY as NT lays it out, which is what the Xbox reports and what k_file.cpp fills:
+        //   Cylinders (LARGE_INTEGER), MediaType, TracksPerCylinder, SectorsPerTrack, BytesPerSector.
+        // The values come from the reference: removable media, one track of one sector, 512-byte sectors,
+        // and a cylinder count that adds up to the partition's size.
         const PartitionGeom &g = kPartitions[part];
-        uint32_t bps = 512;
-        uint32_t total = (uint32_t)(g.size / bps);
-        uint32_t heads = 16, spt = 63;
-        uint32_t cyl = total / (heads * spt);
-        memset(p, 0, 32);
-        *(uint32_t *)(p + 0) = bps;            // BytesPerSector
-        *(uint32_t *)(p + 4) = spt;            // SectorsPerTrack
-        *(uint32_t *)(p + 8) = heads;          // Tracks
-        *(uint32_t *)(p + 12) = cyl;           // Cylinders
-        *(uint32_t *)(p + 16) = 0;             // MediaType: RemovableMedia (0)
-        complete(iosb, XF_SUCCESS, 32);
+        const uint64_t cylinders = g.size / 512;
+        memset(p, 0, 24);
+        memcpy(p + 0, &cylinders, 8);
+        *(uint32_t *)(p + 8) = 12;   // MediaType: RemovableMedia
+        *(uint32_t *)(p + 12) = 1;   // TracksPerCylinder
+        *(uint32_t *)(p + 16) = 1;   // SectorsPerTrack
+        *(uint32_t *)(p + 20) = 512; // BytesPerSector
+        complete(iosb, XF_SUCCESS, 24);
         return XF_SUCCESS;
     }
     case 0x74004: { // IOCTL_DISK_GET_PARTITION_INFO

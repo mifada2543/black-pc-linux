@@ -35,6 +35,7 @@ if(UNIX)
     src/kernel/k_sync_posix.cpp
     src/kernel/k_rtl_posix.cpp
     src/kernel/k_file_posix.cpp
+    src/kernel/k_thread_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
@@ -66,6 +67,16 @@ if(UNIX)
   target_link_libraries(test_xbe PRIVATE blackcore)
   add_test(NAME xbe COMMAND test_xbe)
 
+  # How a run ends and what the exit code says: halt, bugcheck, --strict, and the ordinary case. Each
+  # scenario forks, because the exit request is process-wide and one-shot by design.
+  add_executable(test_exit tests/test_exit.cpp)
+  target_link_libraries(test_exit PRIVATE blackcore)
+  add_test(NAME exit COMMAND test_exit)
+
+  # Not a test: writes the same synthetic image to a file, so the program itself can be run against it.
+  add_executable(fixture_dump tests/fixture_dump.cpp)
+  target_link_libraries(fixture_dump PRIVATE blackcore)
+
   # Dispatcher objects, critical sections and IRQL. Real threads and real timeouts.
   add_executable(test_xsync tests/test_xsync.cpp)
   target_link_libraries(test_xsync PRIVATE blackcore)
@@ -82,6 +93,12 @@ if(UNIX)
   add_executable(test_memory tests/test_memory.cpp)
   target_link_libraries(test_memory PRIVATE blackcore)
   add_test(NAME memory COMMAND test_memory)
+
+  # Threads: what a worker finds in its own KPCR block -- KPRCB, IRQL, KTHREAD, TLS slots -- plus
+  # suspend/resume, priorities, and the entry-point shapes the Xbox uses.
+  add_executable(test_kthread tests/test_kthread.cpp)
+  target_link_libraries(test_kthread PRIVATE blackcore)
+  add_test(NAME kthread COMMAND test_kthread)
 
   # The Nt* file surface: creation, reading, writing, the information classes, rename, directory
   # enumeration, ioctls and symbolic links, all through the Xbox's own calls.

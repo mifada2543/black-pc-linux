@@ -75,7 +75,12 @@ bool boot_inspect(const std::string &path, XbePosix &x, BootReport &rep, std::st
 
 // Parse, map, copy the sections, patch fs->gs, and fill the kernel import table. `img` stays mapped so
 // the caller can execute from it. Prints each step through logc.
-bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootReport &rep, std::string &err);
+//
+// `hdd` is the writable folder for \Device\Harddisk0; an empty string means boot_default_hdd_dir(). It
+// is a parameter rather than a global because the option was parsed and then ignored, which is the kind
+// of bug that only shows when someone actually passes the flag.
+bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootReport &rep, std::string &err,
+                  const std::string &hdd = std::string());
 
 // Where \Device\Harddisk0 should live when the command line did not say. $XDG_DATA_HOME/blacklinux, or
 // ~/.local/share/blacklinux; created if it is not there. The game folder is the DVD and stays read-only,

@@ -32,10 +32,13 @@
 #include "kernel/k_misc_posix.h"
 #include "kernel/k_rtl_posix.h"
 #include "kernel/k_sync_posix.h"
+#include "kernel/k_thread_posix.h"
+#include "platform/posix/boot.h"
 #include "platform/posix/seh.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <string>
@@ -190,6 +193,9 @@ template <typename Fn> void *fn_ptr(Fn f) { return reinterpret_cast<void *>(rein
 
 std::atomic<uint32_t> g_stub_calls[400];
 bool g_trace;
+// --strict: an unimplemented call ends the run instead of just saying so. Exit code 2, the same
+// one the Windows port uses, so a script cannot confuse it with a crash or a clean exit.
+static std::atomic<bool> g_strict{false};
 
 // One RWX page for generated thunks, and one RW page for data-export cells.
 constexpr size_t PAGE = 0x10000;
@@ -291,6 +297,17 @@ void kernel_bind_implemented()
         {340, (void *)&XcHMAC},
         {360, (void *)&HalInitiateShutdown},
 
+        // k_thread_posix.cpp: real threads with their own KPCR-visible state, suspend/resume, priorities
+        // and the object-manager calls that hand a thread handle back as a KTHREAD.
+        {124, (void *)&KeQueryBasePriorityThread},
+        {143, (void *)&KeSetBasePriorityThread},
+        {224, (void *)&NtResumeThread},
+        {231, (void *)&NtSuspendThread},
+        {246, (void *)&ObReferenceObjectByHandle},
+        {250, (void *)&ObfDereferenceObject},
+        {255, (void *)&PsCreateSystemThreadEx},
+        {258, (void *)&PsTerminateSystemThread},
+
         // k_sync_posix.cpp: events, semaphores, waits, IRQL, critical sections, and NtClose's dispatch.
         {99, (void *)&KeDelayExecutionThread},
         {129, (void *)&KeRaiseIrqlToDpcLevel},
@@ -379,6 +396,18 @@ extern "C" uint64_t blackrt_stub_called_posix(uint32_t ordinal, const uint32_t *
     if (n == 1 || g_trace)
         fprintf(stderr, "[k] UNIMPLEMENTED %s(%s) ordinal %u, call #%u\n", e ? e->name : "?", argbuf, ordinal, n);
 
+    // The stub returns bytes to drop, never a status: the caller is game code with its own idea of what
+    // an unimplemented function returns. Stopping the run is therefore done here, by asking the boot
+    // sequence to end it and then parking this thread -- the same shape HalReturnToFirmware uses.
+    if (g_strict) {
+        char why[128];
+        snprintf(why, sizeof why, "unimplemented kernel call %s (--strict)",
+                 e && e->name ? e->name : "ordinal");
+        boot_request_exit(2, why);
+        // Park: returning would hand game code a made-up status for a call it expects a real one from.
+        for (;;) sleep(3600);
+    }
+
     // What the caller expects to find dropped from its stack when it returns.
     uint32_t bytes = 0;
     if (e) {
@@ -440,6 +469,8 @@ bool kernel_bind_variable(uint32_t ordinal, void *address)
 uint32_t kernel_stub_calls(uint32_t ordinal) { return ordinal < 400 ? g_stub_calls[ordinal].load() : 0; }
 
 void kernel_set_trace(bool on) { g_trace = on; }
+
+void kernel_set_strict(bool on) { g_strict = on; }
 
 const KernelThunkStats &kernel_thunk_stats() { return g_stats; }
 

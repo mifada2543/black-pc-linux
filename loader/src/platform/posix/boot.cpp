@@ -3,6 +3,7 @@
 #include "kernel/k_memory_posix.h"
 #include "kernel/k_file_posix.h"
 #include "kernel/k_misc_posix.h"
+#include "kernel/k_thread_posix.h"
 #include "platform/posix/fs_patch.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
@@ -62,28 +63,16 @@ const char *section_flags(const BootReport::Section &s)
     return buf;
 }
 
-struct BootThread {
-    uint32_t entry = 0;
-    uint32_t stack_top = 0;
-};
-
-// The game owns this thread from here on. It is entered exactly as the Windows port enters it: at the
-// XBE's entry point, with nothing of ours on the stack, because the game's own prologue has to find
-// its TEB fields and install its SEH frame against the stack it makes for itself.
-void *boot_thread(void *arg)
-{
-    BootThread *b = (BootThread *)arg;
-#if defined(__GLIBC__)
-    pthread_setname_np(pthread_self(), "boot");
-#endif
-    uint32_t marker = 0;
-    b->stack_top = (uint32_t)(uintptr_t)&marker;
-    ((void (*)(void))(uintptr_t)b->entry)();
-    return nullptr; // game entry points do not return; if this one did, so be it
-}
-
+// The one exit request the loader honours, whatever asked for it. HalReturnToFirmware and KeBugCheck both
+// set it and then park their thread, so whoever gets here first is the reason the run ended.
 std::atomic<int> g_exit_code{-1}; // negative = no exit requested
 const char *g_exit_why = "unspecified";
+
+// The thread boot_run_entry is watching, so that an exit request can mark it finished. Without this the
+// loader reads "did it finish?" and "was an exit requested?" as two separate reads, and a game that
+// bugchecks and returns in the same instant can be reported as a clean return with its bugcheck code
+// dropped. The record outlives boot_run_entry -- threads are never freed -- so this pointer stays valid.
+std::atomic<XboxThread *> g_watched{nullptr};
 
 } // namespace
 
@@ -96,6 +85,10 @@ void boot_request_exit(int code, const char *why)
         g_exit_why = why ? why : "unspecified";
         logc("exit requested: %s (code %d)", g_exit_why, code);
     }
+    // The requester is parked and will not finish on its own, so the watched thread is marked finished here.
+    // The flag above is already set by the time this is visible, which is what closes the window between
+    // "the run ended" and "the thread stopped": whoever wakes up reads both together.
+    kthread_mark_finished(g_watched.load());
 }
 
 bool boot_exit_requested() { return g_exit_code.load() >= 0; }
@@ -157,7 +150,8 @@ bool boot_inspect(const std::string &path, XbePosix &x, BootReport &rep, std::st
     return true;
 }
 
-bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootReport &rep, std::string &err)
+bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootReport &rep, std::string &err,
+                  const std::string &hdd)
 {
     if (!boot_inspect(path, x, rep, err)) return false;
 
@@ -200,7 +194,8 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     {
         const size_t slash = path.find_last_of('/');
         const std::string game_dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
-        kfile_init(game_dir.empty() ? std::string(".") : game_dir, boot_default_hdd_dir());
+        const std::string hdd_dir = hdd.empty() ? boot_default_hdd_dir() : hdd;
+        kfile_init(game_dir.empty() ? std::string(".") : game_dir, hdd_dir);
     }
 
     // The section loader is told which image is running, so XeLoadSection can recognise the section
@@ -227,60 +222,59 @@ BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeo
 {
     if (stack_top) *stack_top = 0;
 
-    BootThread boot;
-    boot.entry = entry;
-
     // The image header says how much stack the game wants. Give it at least that, and never less than a
     // megabyte: the game's deep expressions are its own business, but a thread that runs out mid-frame
     // is indistinguishable from a SEH bug.
-    size_t stack = stack_commit > (1u << 20) ? stack_commit : (size_t)(1u << 20);
+    uint32_t stack = stack_commit > (1u << 20) ? stack_commit : (uint32_t)(1u << 20);
     stack += 64 * 1024; // for our own frames between here and the game's entry
 
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, stack);
+    // The boot thread goes through the thread layer rather than pthread directly, so that it has a KTHREAD
+    // and a TLS block before its first instruction -- the game's prologue reads fs:[0x20], fs:[0x24] and
+    // fs:[0x28] as its first act, and the entry point is entered the Xbox's way: cdecl, no arguments.
+    uint32_t handle = 0, tid = 0;
+    if (kthread_create(&handle, &tid, stack, 0, entry, 0, 0, false, "boot", true) != KT_SUCCESS)
+        return BootOutcome::FailedToStart;
+    XboxThread *thread = kthread_from_handle(handle);
+    if (!thread) return BootOutcome::FailedToStart;
+    g_watched.store(thread);
 
-    pthread_t thread;
-    int rc = pthread_create(&thread, &attr, boot_thread, &boot);
-    pthread_attr_destroy(&attr);
-    if (rc != 0) return BootOutcome::FailedToStart;
+    // An exit request always wins over "the entry point returned", whichever the loader happens to notice
+    // first. The two are observed in the same loop and a request can arrive while the loop is asleep
+    // waiting for the thread -- so it is checked at both points, not just one. Otherwise a game that
+    // bugchecks on its way out of the entry point is reported as a clean return and its bugcheck code is
+    // lost, which is precisely the confusion the exit codes exist to prevent.
+    auto end_on_request = [&]() {
+        if (!boot_exit_requested()) return false;
+        thread->detached = true; // the thread that asked is parked, and must not be joined
+        if (stack_top) *stack_top = thread->stack_top;
+        logc("boot: the run ended on request (%s)", boot_exit_reason());
+        return true;
+    };
 
     if (timeout_ms) {
-        // Poll for completion rather than join, so a game that never returns does not hold the process.
-        // pthread_tryjoin_np is the glibc call that answers "has it finished yet" without blocking; the
-        // loop is the portable shape around it, one 10 ms slice at a time.
+        // One 10 ms slice at a time rather than a single wait, so the loop can watch for an exit request
+        // between slices; a game that never returns must not hold the process past the timeout.
         const uint32_t slice_ms = 10;
         for (uint32_t waited = 0; waited < timeout_ms; waited += slice_ms) {
-            void *ret = nullptr;
-            if (pthread_tryjoin_np(thread, &ret) == 0) {
-                if (stack_top) *stack_top = boot.stack_top;
+            if (end_on_request()) return BootOutcome::Exited;
+            if (kthread_wait_finished(thread, slice_ms)) {
+                if (end_on_request()) return BootOutcome::Exited;
+                if (stack_top) *stack_top = thread->stack_top;
                 logc("boot: the entry point returned after %u ms", waited);
                 return BootOutcome::Returned;
             }
-            // A kernel call asked to end the run. The thread that asked is parked and will not finish, so
-            // it is detached rather than joined, the same as a game that never returns.
-            if (boot_exit_requested()) {
-                pthread_detach(thread);
-                if (stack_top) *stack_top = boot.stack_top;
-                logc("boot: the run ended on request (%s)", boot_exit_reason());
-                return BootOutcome::Exited;
-            }
-            struct timespec ts = {0, (long)slice_ms * 1000 * 1000};
-            nanosleep(&ts, nullptr);
         }
-        pthread_detach(thread);
-        if (stack_top) *stack_top = boot.stack_top;
+        thread->detached = true;
+        if (stack_top) *stack_top = thread->stack_top;
         return BootOutcome::TimedOut;
     }
 
-    // Waiting forever still has to stop if the game asks to leave.
-    if (boot_exit_requested()) {
-        pthread_detach(thread);
-        if (stack_top) *stack_top = boot.stack_top;
-        logc("boot: the run ended on request (%s)", boot_exit_reason());
-        return BootOutcome::Exited;
+    // Waiting forever still has to stop if the game asks to leave, and for the same reason as above.
+    if (end_on_request()) return BootOutcome::Exited;
+    while (!kthread_wait_finished(thread, 10)) {
+        if (end_on_request()) return BootOutcome::Exited;
     }
-    pthread_join(thread, nullptr);
-    if (stack_top) *stack_top = boot.stack_top;
+    if (end_on_request()) return BootOutcome::Exited;
+    if (stack_top) *stack_top = thread->stack_top;
     return BootOutcome::Returned;
 }

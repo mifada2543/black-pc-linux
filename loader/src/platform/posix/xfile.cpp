@@ -555,6 +555,16 @@ void xf_init(const std::string &game_dir, const std::string &hdd_dir)
     make_dirs(hdd_dir + "/Partition1/UDATA");
 }
 
+std::string xf_device_host_path(const char *xbox_device_path)
+{
+    if (!xbox_device_path) return std::string();
+    std::lock_guard<std::recursive_mutex> g(g_mutex);
+    const std::string want = lower(xbox_device_path);
+    for (const Mount &m : g_mounts)
+        if (m.key == want) return m.host;
+    return std::string();
+}
+
 std::string xf_handle_desc(XfHandle h)
 {
     std::lock_guard<std::recursive_mutex> g(g_mutex);

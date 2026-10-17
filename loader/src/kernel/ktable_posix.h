@@ -36,6 +36,11 @@ uint32_t kernel_stub_calls(uint32_t ordinal);
 // Log every stub call, not just the first.
 void kernel_set_trace(bool on);
 
+// Make an unimplemented kernel call end the run instead of being logged. The Windows port has this
+// (ktable.cpp asks request_exit(2, ...) from the stub tail) and --strict is advertised in the usage text;
+// on this port the flag used to be parsed and ignored, so an unimplemented call was only ever a log line.
+void kernel_set_strict(bool on);
+
 // For the HLE modules that land later: give an ordinal a real target, or point a data export's cell at
 // an address. kernel_resolve_thunks calls kernel_bind_implemented() first, which is where a new module
 // registers its ordinals; kernel_bind_export is for anything that needs to happen later than that.

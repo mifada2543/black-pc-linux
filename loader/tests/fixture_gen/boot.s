@@ -23,6 +23,13 @@ boot_entry:
     push 0
     mov eax, dword ptr [THUNK_STUB1]    # slot 36: ordinal 149, KeSetTimer
     call eax
+    # A TLS slot, the way game code reaches it: fs:[0xE10 + 4*slot]. The value is written and read back
+    # through the same patched addressing, and left where the test can see it. This is the one thing that
+    # proves the *thread* state is right: if the displacement resolved to anything but this thread's block,
+    # the read-back would not be what was written, and the value would also show up in another thread.
+    mov dword ptr fs:[0xE1C], TLS_SLOT_VALUE   # TLS slot 3
+    mov eax, fs:[0xE1C]
+    mov dword ptr [TLS_SLOT], eax
     push HANDLER                       # the handler below
     push dword ptr fs:[0]              # the old chain head -- MSVC pushes the handler first, so the
                                         # record is { prev, handler } (see seh.h)

@@ -1,5 +1,6 @@
 #include "kernel/k_sync_posix.h"
 
+#include "kernel/k_thread_posix.h" // kthread_set_irql: the level the game reads at fs:[0x24]
 #include "platform/posix/log.h"
 #include "platform/posix/xfile.h"   // xf_close / xf_duplicate, for NtClose's cross-layer dispatch
 #include "platform/posix/xhandle.h" // which arena a handle belongs to
@@ -38,18 +39,25 @@ void sync_trampoline(void *) { t_sync_fn(t_sync_arg); }
 extern "C" uint8_t __attribute__((stdcall)) KeRaiseIrqlToDpcLevel()
 {
     // Returns the previous IRQL, which the game uses to restore it. DISPATCH_LEVEL is the level DPCs and
-    // interrupts run at, and xsync's dispatch mutex is what that means here.
-    return xk_raise_irql(IRQL_DISPATCH);
+    // interrupts run at, and xsync's dispatch mutex is what that means here. The new level is published
+    // into this thread's block as well, because the game reads its IRQL at fs:[0x24] and expects to see
+    // the level it just raised to.
+    const uint8_t old = xk_raise_irql(IRQL_DISPATCH);
+    kthread_set_irql(xk_current_irql());
+    return old;
 }
 
 extern "C" uint8_t __attribute__((fastcall)) KfRaiseIrql(uint8_t NewIrql)
 {
-    return xk_raise_irql(NewIrql);
+    const uint8_t old = xk_raise_irql(NewIrql);
+    kthread_set_irql(xk_current_irql());
+    return old;
 }
 
 extern "C" void __attribute__((fastcall)) KfLowerIrql(uint8_t NewIrql)
 {
     xk_lower_irql(NewIrql);
+    kthread_set_irql(xk_current_irql());
 }
 
 extern "C" void __attribute__((stdcall)) KeStallExecutionProcessor(uint32_t MicroSeconds)
@@ -146,11 +154,15 @@ extern "C" NTSTATUS __attribute__((stdcall)) NtClose(uint32_t Handle)
     case XHANDLE_FILE:
     case XHANDLE_LINK:
         return xf_close(Handle);
-    case XHANDLE_THREAD:
-        // Thread handles land here when k_thread exists. Until then this is a handle the game was given
-        // by something this port has not implemented, so it says so rather than closing nothing quietly.
-        logf("sync: NtClose(0x%08x): a thread handle, and no thread layer has created it", Handle);
-        return KS_INVALID_HANDLE;
+    case XHANDLE_THREAD: {
+        // Closing a thread handle does not kill the thread on the Xbox, and neither does it here: the
+        // handle is forgotten and the thread runs on. Closing the *current* thread's own handle is legal
+        // too, which is why nothing is torn down here.
+        XboxThread *t = kthread_from_handle(Handle);
+        if (!t) return KS_INVALID_HANDLE;
+        logf("sync: NtClose(0x%08x): thread '%s' keeps running, the handle is gone", Handle, t->name);
+        return KS_SUCCESS;
+    }
     default:
         logf("sync: NtClose(0x%08x): not a handle of this port", Handle);
         return KS_INVALID_HANDLE;

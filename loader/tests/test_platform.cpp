@@ -42,6 +42,7 @@ static void *teb_thread(void *arg)
     XboxTeb *t = teb();
     t->irql = 0x22222222u;
     t->dpc_active = 0x33333333u;
+    t->tls_slots[7] = 0x77777777u;
     return nullptr;
 }
 
@@ -54,33 +55,49 @@ static void test_teb()
     check(teb_k_matches_here(), "K recomputed on this thread matches the process value");
     check(teb_thread_pointer() != 0, "%gs:0 is a real glibc TCB pointer");
 
-    // The patched displacement for each remapped Xbox field must land exactly on the field.
-    struct { uint32_t xbox; size_t want; } cases[] = {
-        {0x00, offsetof(XboxTeb, seh)},
-        {0x04, offsetof(XboxTeb, tls_array)},
-        {0x20, offsetof(XboxTeb, prcb)},
-        {0x24, offsetof(XboxTeb, irql)},
-        {0x28, offsetof(XboxTeb, thread)},
-        {0x58, offsetof(XboxTeb, dpc_active)},
+    // The block is laid out at the Xbox's own displacements, so every displacement the patcher bakes must
+    // resolve onto the field that displacement names -- which for the KPRCB overlaps means KPCR+0x24 and
+    // KPCR+0x28 land inside it.
+    struct { uint32_t xbox; size_t want; const char *what; } cases[] = {
+        {0x00, offsetof(XboxTeb, seh), "the SEH chain head"},
+        {0x04, offsetof(XboxTeb, stack_base), "NtTib.StackBase"},
+        {0x20, offsetof(XboxTeb, prcb), "KPCR.Prcb"},
+        {0x24, offsetof(XboxTeb, irql), "KPCR.Irql"},
+        {0x28, offsetof(XboxTeb, thread), "KPRCB.CurrentThread"},
+        {0x58, offsetof(XboxTeb, dpc_active), "KPRCB.DpcRoutineActive"},
+        {0xE10, offsetof(XboxTeb, tls_slots), "TLS slot 0"},
+        {0xE1C, offsetof(XboxTeb, tls_slots) + 4 * 3, "TLS slot 3"},
     };
     bool all_land = true;
     for (auto &c : cases) {
-        uint32_t disp = teb_patch_offset(c.xbox);
-        // gs:[disp] resolves to tcb + disp == &xteb + want
-        if (teb_thread_pointer() + disp != (uint32_t)(uintptr_t)t + c.want) all_land = false;
+        const uint32_t disp = teb_patch_offset(c.xbox);
+        // gs:[disp] resolves to tcb + disp, which has to be &xteb + want
+        if (teb_patch_offset(c.xbox) == UINT32_MAX || teb_thread_pointer() + disp != (uint32_t)(uintptr_t)t + c.want)
+            all_land = false;
     }
-    check(all_land, "every remapped displacement resolves onto its field");
+    check(all_land, "every displacement the patcher bakes resolves onto the field it names");
 
-    check(teb_patch_offset(0x34) == UINT32_MAX, "an unknown Xbox displacement is left unpatched");
-    check(!teb_is_remapped(0x34) && teb_is_remapped(0x00),
-          "fs:[0x00] is remapped on Linux (unlike Windows) while others are not");
+    // Anything inside the block is answerable; anything past it is refused rather than pointed at memory
+    // this block does not own.
+    check(teb_patch_offset(0x34) != UINT32_MAX, "an unnamed displacement inside the block is still remapped");
+    check(teb_patch_offset(XBOX_DISP_MAX) == UINT32_MAX, "a displacement past the end of the block is refused");
+    check(teb_patch_offset(XBOX_DISP_MAX - 4) != UINT32_MAX, "and the last word inside it is not");
+    check(!teb_is_remapped(XBOX_DISP_MAX) && teb_is_remapped(0x00), "the remapped range covers the block");
 
     // Round-trip through the addressing a rewritten instruction would use.
-    t->prcb = 0xDEAD0001u; t->irql = 0xDEAD0002u; t->thread = 0xDEAD0003u;
-    t->tls_array = 0xDEAD0004u; t->dpc_active = 0xDEAD0005u; t->seh = 0xDEAD0006u;
-    bool rt = t->prcb == 0xDEAD0001u && t->irql == 0xDEAD0002u && t->thread == 0xDEAD0003u &&
-              t->tls_array == 0xDEAD0004u && t->dpc_active == 0xDEAD0005u && t->seh == 0xDEAD0006u;
-    check(rt, "all six fields round-trip");
+    t->seh = 0xDEAD0006u;
+    t->stack_base = 0xDEAD0004u;
+    t->irql = 0xDEAD0002u;
+    t->thread = 0xDEAD0003u;
+    t->dpc_active = 0xDEAD0005u;
+    t->tls_slots[0] = 0xDEAD0007u;
+    t->tls_slots[3] = 0xDEAD0008u;
+    check(t->seh == 0xDEAD0006u && t->stack_base == 0xDEAD0004u && t->irql == 0xDEAD0002u &&
+              t->thread == 0xDEAD0003u && t->dpc_active == 0xDEAD0005u && t->tls_slots[0] == 0xDEAD0007u &&
+              t->tls_slots[3] == 0xDEAD0008u,
+          "the fields, including two TLS slots, round-trip");
+    check((uint32_t)(uintptr_t)&t->tls_slots[3] - (uint32_t)(uintptr_t)t == 0xE1C,
+          "and TLS slot 3 is where the Xbox puts it");
 
     // Second thread: same K, separate storage.
     pthread_t th;
@@ -90,8 +107,8 @@ static void test_teb()
     }
     pthread_join(th, nullptr);
     check(g_thread_k_ok, "K is identical on a second thread");
-    check(t->irql == 0xDEAD0002u && t->dpc_active == 0xDEAD0005u,
-          "the other thread's writes did not leak into this one");
+    check(t->irql == 0xDEAD0002u && t->dpc_active == 0xDEAD0005u && t->tls_slots[3] == 0xDEAD0008u && t->tls_slots[7] == 0,
+          "the other thread's writes, TLS slots included, did not leak into this one");
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +386,9 @@ static const Fixture kFixtures[] = {
     {"mov eax, fs:[0x58]",              b({0x64, 0xA1, 0x58, 0, 0, 0}),                0x58, true},
     {"pop dword fs:[0x28]",             b({0x64, 0x8F, 0x05, 0x28, 0, 0, 0}),             0x28, true},
     {"mov fs:[0], eax",                 b({0x64, 0xA3, 0x00, 0, 0, 0}),                0x00, true},
-    {"mov eax, fs:[0x34] (unmapped)",   b({0x64, 0xA1, 0x34, 0, 0, 0}),                0x34, false},
+    // Past the end of the block: not answerable, so the patcher must refuse rather than point it at memory
+    // this thread does not own.
+    {"mov eax, fs:[0x3000] (past the block)", b({0x64, 0xA1, 0x00, 0x30, 0, 0}),                0x3000, false},
     {"pop dword fs:[eax] (no disp)",    b({0x64, 0x8F, 0x00}),                          0,    false},
 };
 

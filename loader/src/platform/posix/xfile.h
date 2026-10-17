@@ -170,6 +170,11 @@ NTSTATUS xf_remove_symlink(const std::string &name);
 NTSTATUS xf_open_symlink(XfHandle *out, const XAnsiString *name);
 NTSTATUS xf_query_symlink(XfHandle h, XAnsiString *target, uint32_t *returned_length);
 
+// The host folder behind an \Device\* mount point, empty when the path is not one. Matching is exact,
+// because \Device\Harddisk0 on its own is not a mount point (Partition0..5 are) and answering for it
+// anyway would hide which partition a path really lands in.
+std::string xf_device_host_path(const char *xbox_device_path);
+
 // Canonical Xbox path a handle refers to, for logging. "?" when the handle is not known.
 std::string xf_handle_desc(XfHandle h);
 

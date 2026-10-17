@@ -20,6 +20,7 @@
 // What it does not do yet, and says so at boot time: no kernel memory allocation, no TLS slots for the
 // boot thread, no DPC/timer thread, no graphics. The first kernel calls the game makes are logged as
 // stubs, which is exactly the list that says what to implement next.
+#include "kernel/ktable_posix.h"
 #include "platform/posix/boot.h"
 #include "platform/posix/log.h"
 
@@ -132,15 +133,16 @@ int run(const Options &o)
         return 0;
     }
 
-    if (!boot_prepare(o.xbe, x, img, rep, err)) {
+    if (!boot_prepare(o.xbe, x, img, rep, err, o.hdd)) {
         fprintf(stderr, "blacklinux: %s\n", err.c_str());
         logc("boot failed: %s", err.c_str());
         log_close();
         return 1;
     }
+    kernel_set_strict(o.strict);
     boot_print_report(rep);
 
-    logc("not yet implemented: boot-thread TLS slots, the DPC/timer thread, and graphics");
+    logc("not yet implemented: the DPC/timer thread, and graphics");
     logc("starting XBE entry point 0x%08x", rep.entry);
 
     uint32_t stack_top = 0;

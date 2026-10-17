@@ -291,7 +291,7 @@ static void test_map_and_execute()
         auto fn = (uint32_t(*)(void))((uintptr_t)(TEXT_VA + off));
         return fn();
     };
-    check(call(FN_READ_PRCB) == 0x11223344, "patched code reads KPCR.Prcb out of this thread's TEB");
+    check(call(FN_READ_PRCB) == 0x11223344, "patched code reads KPCR.Prcb out of this thread's block");
     check(call(FN_READ_IRQL) == 0x55, "patched code reads KPCR.Irql");
     check(call(FN_READ_DPC) == 1, "patched code reads KPRCB.DpcRoutineActive");
 
@@ -313,8 +313,11 @@ static void test_map_and_execute()
     // And the unpatched behaviour, to prove the patch is what made it work: a fresh thread would
     // fault on a raw fs access. Assert the prefix is gone rather than triggering it.
     check(img.at(TEXT_VA + FN_READ_PRCB)[0] == 0x65, "the fs prefix byte is now gs in the mapped image");
-    check(img.at(TEXT_VA + FN_READ_PRCB)[2] == 0xC4 && img.at(TEXT_VA + FN_READ_PRCB)[3] == 0xFF,
-          "the displacement in the mapped image is the patched K+offset");
+    // K depends on where glibc puts this thread's block, so the bytes are compared against the value the
+    // patcher baked rather than against numbers typed in here.
+    uint32_t baked;
+    memcpy(&baked, img.at(TEXT_VA + FN_READ_PRCB) + 2, 4);
+    check(baked == teb_patch_offset(0x20), "the displacement in the mapped image is the patched K+offset");
 
     img.unmap();
     check(!img.valid(), "unmapped cleanly");

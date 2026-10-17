@@ -19,11 +19,13 @@
 #include "platform/posix/image.h"
 #include "platform/posix/seh.h"
 #include "platform/posix/teb.h"
+#include "platform/posix/xfile.h"
 
 #include "xbe_fixture.h"
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -172,14 +174,22 @@ static void test_resolve()
             return;
         }
         const uint8_t *code = b.img.at(TEXT_VA);
-        check(code[0x1D] == 0x65 && code[0x24] == 0x65 && code[0x3C] == 0x65,
+        // Offsets from boot.dis. Every one of these is an fs access, and every one has to become gs: %fs:0
+        // faults on Linux, so an unpatched one is not a wrong value but a dead process.
+        check(code[0x33] == 0x65 && code[0x3A] == 0x65 && code[0x52] == 0x65,
               "push dword [fs:0], mov [fs:0], esp and mov eax, [fs:0] all became gs:");
+        check(code[0x71] == 0x65, "and so did the epilogue's mov [fs:0], ecx");
+        check(code[0x18] == 0x65 && code[0x23] == 0x65, "the TLS slot's write and read became gs: too");
         // 65 FF 35 disp32 and 65 89 25 disp32: the displacement starts three bytes into each instruction.
-        uint32_t disp_push, disp_store;
-        memcpy(&disp_push, code + 0x20, 4);
-        memcpy(&disp_store, code + 0x27, 4);
+        uint32_t disp_push, disp_store, disp_tls;
+        memcpy(&disp_push, code + 0x36, 4);
+        memcpy(&disp_store, code + 0x3D, 4);
+        memcpy(&disp_tls, code + 0x25, 4);
         check(disp_push == teb_patch_offset(0) && disp_store == teb_patch_offset(0),
               "the chain-head displacement landed on this thread's TEB field");
+        // 0xE1C is TLS slot 3, and the block's slot array starts at 0xE10, so this is the fourth pointer.
+        check(disp_tls == teb_patch_offset(0xE1C),
+              "the TLS slot displacement is K+0xE1C, which is slot 3 of this thread's array");
     }
 }
 
@@ -220,6 +230,15 @@ static void test_boot_execution()
           "Context->Eip is the address right after the call that raised it");
     check(read_va(RAISE_EAX_VA) == 1, "RtlRaiseException returned true, so the exception was handled");
     check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "RtlUnwind returned the running ReturnValue");
+
+    // Game code wrote TLS slot 3 through fs:[0xE1C] and read it back the same way. That only works if the
+    // patched displacement resolves into *the thread that is running the game*, which is the whole point of
+    // giving each thread its own block.
+    check(read_va(TLS_SLOT_VA) == TLS_SLOT_VALUE,
+          "game code read its own TLS slot back through fs:[0xE1C]");
+    check(teb()->tls_slots[3] != TLS_SLOT_VALUE,
+          "and that slot belongs to the boot thread, not to the thread running the test");
+    check(teb()->tls_slots[0] == 0 && teb()->tls_slots[1] == 0, "the rest of this thread's slots are untouched");
 
     // Ordinals 129 and 149 are the two the fixture calls on purpose and that the HLE layers deliberately
     // do not implement: one stdcall with no arguments, one with four. Each stub must drop exactly its own.
@@ -275,6 +294,27 @@ static void test_boot_from_file()
         check(rep.entry == ENTRY_VA && rep.base == BASE, "the header fields match the buffer path");
         check(rep.sections.size() == 3 && rep.sections[0].name == ".text", "the section table parsed");
         check(!rep.title.empty(), "the certificate title came through");
+    }
+
+    // --hdd has to reach the mount table. The option was parsed and then dropped on the floor for a while,
+    // which no test could see because the mount table was only ever checked through its own tests.
+    {
+        const std::string hdd = path + "-hdd";
+        XbeImage img2;
+        XbePosix x2;
+        BootReport rep2;
+        std::string err2;
+        const bool ok2 = boot_prepare(path, x2, img2, rep2, err2, hdd);
+        check(ok2, "boot_prepare accepts a caller-chosen hard disk folder");
+        check(xf_device_host_path("\\Device\\Harddisk0\\Partition1") == hdd + "/Partition1",
+              "and that folder is what Partition1 resolves to, not the default one");
+        // Only \Device\Harddisk0\Partition0..5 are mount points: \Device\Harddisk0 on its own is not
+        // one, and pretending it is would hide which partition a path really lands in.
+        check(xf_device_host_path("\\Device\\Harddisk0").empty() && !xf_device_host_path("\\Device\\CdRom0").empty(),
+              "a device path that is not a mount point is empty, while the DVD's is not");
+        if (ok2) img2.unmap();
+        const std::string rm = "rm -rf '" + hdd + "'";
+        if (system(rm.c_str()) != 0) printf("  (warning: could not remove %s)\n", hdd.c_str());
     }
 
     // The real boot sequence, then the entry point on a thread, through the same functions main() calls.

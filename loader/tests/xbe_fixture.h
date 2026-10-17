@@ -36,7 +36,7 @@ constexpr uint32_t LIBVER_VA = BASE + 0x960;
 constexpr uint32_t DEBUGPATH_VA = BASE + 0xA00;
 
 constexpr uint32_t TEXT_VA = BASE + 0xF1000; // 0x101000
-constexpr uint32_t HANDLER_OFF = 0x66;       // where kBootCode's boot_handler lands (from objdump)
+constexpr uint32_t HANDLER_OFF = 0x7C;       // where kBootCode's boot_handler lands (from objdump)
 constexpr uint32_t HANDLER_VA = TEXT_VA + HANDLER_OFF;
 constexpr uint32_t TEXT_RAW = 0x1000;
 constexpr uint32_t TEXT_SIZE = 0x1000;
@@ -63,6 +63,8 @@ constexpr uint32_t UNWIND_EAX_VA = DATA_VA + 0x304; // EAX after RtlUnwind retur
 constexpr uint32_t HANDLER_CODE_VA = DATA_VA + 0x308; // ExceptionCode the handler saw
 constexpr uint32_t HANDLER_EIP_VA = DATA_VA + 0x30C; // Context->Eip the handler saw
 constexpr uint32_t HANDLER_RAN_VA = DATA_VA + 0x310; // written by the handler, so "it ran" is observable
+constexpr uint32_t TLS_SLOT_VA = DATA_VA + 0x314;   // what game code read back out of its own TLS slot
+constexpr uint32_t TLS_SLOT_VALUE = 0xC0DE0003;     // the value the stub puts in TLS slot 3
 
 // The exception the boot stub raises. SYNTHETIC: a private code, nothing in the kernel defines it, so a
 // stray raise somewhere else cannot be mistaken for this one.
@@ -113,9 +115,10 @@ static_assert(kKernelOrdinals[SLOT_NTALLOC] == 184, "slot 54 must be ordinal 184
 static_assert(kKernelOrdinals[SLOT_RAISE] == 302, "slot 95 must be ordinal 302");
 static_assert(kKernelOrdinals[SLOT_UNWIND] == 312, "slot 99 must be ordinal 312");
 
-// Where the RtlRaiseException call returns to: boot_entry + 0x35, from the objdump below. The handler
-// must report exactly this as Context->Eip (the contract in seh.h), so the test asserts it.
-constexpr uint32_t RAISE_RETURN_OFF = 0x37;
+// Where the RtlRaiseException call returns to: the instruction right after `call eax`, from the objdump
+// below. The handler must report exactly this as Context->Eip (the contract in seh.h), so the test asserts
+// it -- which is why these offsets are read from the disassembly rather than counted by hand.
+constexpr uint32_t RAISE_RETURN_OFF = 0x4D;
 
 // ---------------------------------------------------------------------------
 // The boot stub, as GNU as emitted it for this sequence (Intel syntax source):
@@ -126,7 +129,10 @@ constexpr uint32_t RAISE_RETURN_OFF = 0x37;
 //       push 0 / push 0 / push 0 / push 0   ; ordinal 2 takes four arguments
 //       mov eax, dword ptr [THUNK_VA+4]      ; slot 1: ordinal 2
 //       call eax
-//       push HANDLER                        ; the handler below, which sits at +0x65
+//       mov dword ptr fs:[0xE1C], TLS_SLOT_VALUE   ; TLS slot 3, written through fs
+//       mov eax, fs:[0xE1C]                 ; and read back through the same addressing
+//       mov dword ptr [OUT_TLS], eax         ; left where the test can see what came back
+//       push HANDLER                        ; the handler below, which sits at +0x7C
 //       push dword ptr fs:[0]               ; the old head
 //       mov dword ptr fs:[0], esp           ; install -- the game's own SEH frame
 //       push RECORD                         ; &record
@@ -152,9 +158,10 @@ constexpr uint32_t RAISE_RETURN_OFF = 0x37;
 //       xor eax, eax                        ; ExceptionContinueExecution
 //       ret
 //
-// Note the three fs-relative forms it uses -- `push dword [fs:0]`, `mov [fs:0], esp`, `mov eax, [fs:0]`
-// -- because each is a different encoding for the patcher to recognise, and the middle one is what an
-// MSVC try/except prologue actually emits.
+// Note the fs-relative forms it uses -- `push dword [fs:0]`, `mov [fs:0], esp`, `mov eax, [fs:0]`,
+// `mov dword [fs:0], imm32` and `mov eax, [fs:0xE1C]` -- because each is a different encoding for the
+// patcher to recognise, the `mov [fs:0], esp` is what an MSVC try/except prologue actually emits, and the
+// 0xE1C pair is the TLS slot the game's CRT reaches for.
 // ---------------------------------------------------------------------------
 constexpr uint8_t kBootCode[] = {
     0x6A, 0x00,                                  // 00  push   0x0
@@ -166,40 +173,46 @@ constexpr uint8_t kBootCode[] = {
     0x6A, 0x00,                                  // 0F  push   0x0
     0xA1, 0x90, 0x20, 0x10, 0x00,                // 11  mov    eax,ds:0x102090
     0xFF, 0xD0,                                  // 16  call   eax
-    0x68, 0x66, 0x10, 0x10, 0x00,                // 18  push   0x101066
-    0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,    // 1D  push   DWORD PTR fs:0x0
-    0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,    // 24  mov    DWORD PTR fs:0x0,esp
-    0x68, 0x00, 0x22, 0x10, 0x00,                // 2B  push   0x102200
-    0xA1, 0x7C, 0x21, 0x10, 0x00,                // 30  mov    eax,ds:0x10217c
-    0xFF, 0xD0,                                  // 35  call   eax
-    0xA3, 0x00, 0x23, 0x10, 0x00,                // 37  mov    ds:0x102300,eax
-    0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,          // 3C  mov    eax,fs:0x0
-    0x68, 0xAD, 0xDE, 0x00, 0x00,                // 42  push   0xdead
-    0x6A, 0x00,                                  // 47  push   0x0
-    0x6A, 0x00,                                  // 49  push   0x0
-    0x50,                                        // 4B  push   eax
-    0xA1, 0x8C, 0x21, 0x10, 0x00,                // 4C  mov    eax,ds:0x10218c
-    0xFF, 0xD0,                                  // 51  call   eax
-    0xA3, 0x04, 0x23, 0x10, 0x00,                // 53  mov    ds:0x102304,eax
-    0x8B, 0x0C, 0x24,                            // 58  mov    ecx,DWORD PTR [esp]
-    0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,    // 5B  mov    DWORD PTR fs:0x0,ecx
-    0x83, 0xC4, 0x08,                            // 62  add    esp,0x8
-    0xC3,                                        // 65  ret
-    0x8B, 0x44, 0x24, 0x04,                      // 66  mov    eax,DWORD PTR [esp+0x4]
-    0x8B, 0x00,                                  // 6A  mov    eax,DWORD PTR [eax]
-    0xA3, 0x08, 0x23, 0x10, 0x00,                // 6C  mov    ds:0x102308,eax
-    0x8B, 0x44, 0x24, 0x0C,                      // 71  mov    eax,DWORD PTR [esp+0xc]
-    0x8B, 0x80, 0xB8, 0x00, 0x00, 0x00,          // 75  mov    eax,DWORD PTR [eax+0xb8]
-    0xA3, 0x0C, 0x23, 0x10, 0x00,                // 7B  mov    ds:0x10230c,eax
-    0xC7, 0x05, 0x10, 0x23, 0x10, 0x00, 0xDE, 0xC0, 0x00, 0x00, // 80  mov    DWORD PTR ds:0x102310,0xc0de
-    0x31, 0xC0,                                  // 8A  xor    eax,eax
-    0xC3,                                        // 8C  ret
+    0x64, 0xC7, 0x05, 0x1C, 0x0E, 0x00, 0x00, 0x03, 0x00, 0xDE, 0xC0, // 18  mov    DWORD PTR fs:0xe1c,0xc0de0003
+    0x64, 0xA1, 0x1C, 0x0E, 0x00, 0x00,          // 23  mov    eax,fs:0xe1c
+    0xA3, 0x14, 0x23, 0x10, 0x00,                // 29  mov    ds:0x102314,eax
+    0x68, 0x7C, 0x10, 0x10, 0x00,                // 2E  push   0x10107c
+    0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,    // 33  push   DWORD PTR fs:0x0
+    0x64, 0x89, 0x25, 0x00, 0x00, 0x00, 0x00,    // 3A  mov    DWORD PTR fs:0x0,esp
+    0x68, 0x00, 0x22, 0x10, 0x00,                // 41  push   0x102200
+    0xA1, 0x7C, 0x21, 0x10, 0x00,                // 46  mov    eax,ds:0x10217c
+    0xFF, 0xD0,                                  // 4B  call   eax
+    0xA3, 0x00, 0x23, 0x10, 0x00,                // 4D  mov    ds:0x102300,eax
+    0x64, 0xA1, 0x00, 0x00, 0x00, 0x00,          // 52  mov    eax,fs:0x0
+    0x68, 0xAD, 0xDE, 0x00, 0x00,                // 58  push   0xdead
+    0x6A, 0x00,                                  // 5D  push   0x0
+    0x6A, 0x00,                                  // 5F  push   0x0
+    0x50,                                        // 61  push   eax
+    0xA1, 0x8C, 0x21, 0x10, 0x00,                // 62  mov    eax,ds:0x10218c
+    0xFF, 0xD0,                                  // 67  call   eax
+    0xA3, 0x04, 0x23, 0x10, 0x00,                // 69  mov    ds:0x102304,eax
+    0x8B, 0x0C, 0x24,                            // 6E  mov    ecx,DWORD PTR [esp]
+    0x64, 0x89, 0x0D, 0x00, 0x00, 0x00, 0x00,    // 71  mov    DWORD PTR fs:0x0,ecx
+    0x83, 0xC4, 0x08,                            // 78  add    esp,0x8
+    0xC3,                                        // 7B  ret
+    0x8B, 0x44, 0x24, 0x04,                      // 7C  mov    eax,DWORD PTR [esp+0x4]  (boot_handler)
+    0x8B, 0x00,                                  // 80  mov    eax,DWORD PTR [eax]
+    0xA3, 0x08, 0x23, 0x10, 0x00,                // 82  mov    ds:0x102308,eax
+    0x8B, 0x44, 0x24, 0x0C,                      // 87  mov    eax,DWORD PTR [esp+0xc]
+    0x8B, 0x80, 0xB8, 0x00, 0x00, 0x00,          // 8B  mov    eax,DWORD PTR [eax+0xb8]
+    0xA3, 0x0C, 0x23, 0x10, 0x00,                // 91  mov    ds:0x10230c,eax
+    0xC7, 0x05, 0x10, 0x23, 0x10, 0x00, 0xDE, 0xC0, 0x00, 0x00, // 96  mov    DWORD PTR ds:0x102310,0xc0de
+    0x31, 0xC0,                                  // A0  xor    eax,eax
+    0xC3,                                        // A2  ret
 };
-constexpr uint32_t BOOT_ENTRY_LEN = 0x66; // boot_handler starts here
+
+constexpr uint32_t BOOT_ENTRY_LEN = 0x7C; // boot_handler starts here
 
 // The immediates below must agree with the constants they were generated from, or the stub silently
 // reads the wrong memory -- the section table lives at 0x10180 and looks enough like code to call.
-static_assert(sizeof kBootCode == BOOT_ENTRY_LEN + 0x27, "the handler follows the entry at 0x66 and runs to 0x8D");
+#ifndef BOOTFIX_SKIP_ASM_ASSERTS // see tests/fixture_gen/gen.sh, which checks this against objdump
+static_assert(sizeof kBootCode == BOOT_ENTRY_LEN + 0x27, "the handler follows the entry at 0x7C and runs to 0xA3");
+#endif
 constexpr uint32_t STUB0_VA = THUNK_VA + SLOT_STUB0 * 4;
 constexpr uint32_t STUB1_VA = THUNK_VA + SLOT_STUB1 * 4;
 #ifndef BOOTFIX_SKIP_ASM_ASSERTS // see tests/fixture_gen/gen.sh
@@ -214,11 +227,11 @@ static_assert(kBootCode[0x11] == 0xA1 && kBootCode[0x12] == (uint8_t)(STUB1_VA &
               "and then the one for ordinal 149");
 #endif
 #ifndef BOOTFIX_SKIP_ASM_ASSERTS
-static_assert(kBootCode[0x18] == 0x68 && kBootCode[0x19] == (uint8_t)(HANDLER_VA & 0xFF) &&
-                  kBootCode[0x1B] == (uint8_t)((HANDLER_VA >> 16) & 0xFF),
+static_assert(kBootCode[0x2E] == 0x68 && kBootCode[0x2F] == (uint8_t)(HANDLER_VA & 0xFF) &&
+                  kBootCode[0x31] == (uint8_t)((HANDLER_VA >> 16) & 0xFF),
               "the prologue pushes the handler that actually exists in this image");
-static_assert(kBootCode[0x2B] == 0x68 && kBootCode[0x2C] == (uint8_t)(RECORD_VA & 0xFF) &&
-                  kBootCode[0x2E] == (uint8_t)((RECORD_VA >> 16) & 0xFF),
+static_assert(kBootCode[0x41] == 0x68 && kBootCode[0x42] == (uint8_t)(RECORD_VA & 0xFF) &&
+                  kBootCode[0x44] == (uint8_t)((RECORD_VA >> 16) & 0xFF),
               "the raise passes the record that lives in .data");
 #endif
 

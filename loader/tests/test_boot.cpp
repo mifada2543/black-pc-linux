@@ -1,0 +1,221 @@
+// The loader's Phase 1 boot path, end to end, without default.xbe.
+//
+// This is the gate the plan calls "XBE mapped, 115 imports resolve, boot thread runs, first kernel
+// call logged" -- run against a synthetic image instead of the real one. The loader code under test is
+// the production path (parse, map, copy sections, patch fs->gs, resolve imports) and the code that runs
+// afterwards is real machine code out of the fixture's .text: it calls through the import table the
+// loader filled, installs an MSVC-shaped SEH frame, raises an exception and unwinds.
+//
+// What that does and does not prove is stated in xbe_fixture.h: the fixture is SYNTHETIC, so a green
+// run means the boot path is sound, not that default.xbe would boot. Every fixture assumption gets
+// checked against the real file when it arrives.
+//
+// Expected noise on stderr: two "[k] UNIMPLEMENTED" lines, one per stub the boot stub calls on purpose.
+#include "kernel/ktable_posix.h"
+#include "platform/posix/image.h"
+#include "platform/posix/seh.h"
+#include "platform/posix/teb.h"
+
+#include "xbe_fixture.h"
+
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <string>
+
+using namespace bootfix;
+
+static int g_failures, g_checks;
+
+static void check(bool cond, const std::string &what)
+{
+    g_checks++;
+    if (cond) {
+        printf("  ok   %s\n", what.c_str());
+    } else {
+        printf("  FAIL %s\n", what.c_str());
+        g_failures++;
+    }
+}
+
+// The Phase 1 sequence, in the order the boot path runs it.
+struct Boot {
+    XbePosix x;
+    XbeImage img;
+    std::string err;
+
+    bool prepare(bool resolve = true)
+    {
+        if (!x.load_from_memory(build(), err)) return false;
+        if (!img.map(x, err)) return false;
+        if (!img.copy_sections(err)) return false;
+        img.patch_fs(nullptr);
+        if (resolve && !kernel_resolve_thunks(x, img, err)) return false;
+        return true;
+    }
+};
+
+static uint32_t slot_at(XbeImage &img, uint32_t thunk_va, int index)
+{
+    const uint8_t *p = img.at(thunk_va + (uint32_t)index * 4);
+    uint32_t v = 0;
+    if (p) memcpy(&v, p, 4);
+    return v;
+}
+
+static uint32_t read_va(uint32_t va)
+{
+    uint32_t v = 0;
+    memcpy(&v, (const void *)(uintptr_t)va, 4);
+    return v;
+}
+
+// --- the import table itself --------------------------------------------------------------------------------
+
+static void test_export_table()
+{
+    printf("\nkernel export table\n");
+
+    check(strcmp(kernel_export_name(1), "AvGetSavedDataAddress") == 0, "ordinal 1 is AvGetSavedDataAddress");
+    check(strcmp(kernel_export_name(302), "RtlRaiseException") == 0, "ordinal 302 is RtlRaiseException");
+    check(strcmp(kernel_export_name(312), "RtlUnwind") == 0, "ordinal 312 is RtlUnwind");
+    check(strcmp(kernel_export_name(16), "ExEventObjectType") == 0, "a data export is named as a data export");
+    check(strcmp(kernel_export_name(9999), "?") == 0, "an unknown ordinal has no name");
+
+    // The fixture imports exactly the set the Windows reference table knows. If either side gains or
+    // loses an ordinal, this fails instead of the port quietly importing one kernel function too few.
+    int unknown = 0;
+    for (int i = 0; i < kKernelImportCount; i++)
+        if (strcmp(kernel_export_name(kKernelOrdinals[i]), "?") == 0) unknown++;
+    check(unknown == 0, "every one of the 115 fixture ordinals is in the table (" + std::to_string(unknown) + " missing)");
+}
+
+// --- resolving the table --------------------------------------------------------------------------------------
+
+static void test_resolve()
+{
+    printf("\nimport resolution\n");
+
+    {
+        Boot b;
+        if (!b.prepare()) {
+            check(false, "boot path prepared: " + b.err);
+            return;
+        }
+
+        const KernelThunkStats &st = kernel_thunk_stats();
+        check(st.imports == kKernelImportCount,
+              "every import filled (" + std::to_string(st.imports) + "/" + std::to_string(kKernelImportCount) + ")");
+        check(st.implemented == 2, "exactly the two SEH ordinals have real implementations");
+        check(st.implemented + st.data_exports + st.stubbed == st.imports, "every import is accounted for");
+        check(!st.stub_names.empty(), "the rest are logging stubs: " + st.stub_names.substr(0, 60) + "...");
+
+        int zero_slots = 0;
+        for (int i = 0; i < kKernelImportCount; i++)
+            if (!slot_at(b.img, THUNK_VA, i)) zero_slots++;
+        check(zero_slots == 0, "no slot was left unbound");
+
+        check(slot_at(b.img, THUNK_VA, SLOT_RAISE) == (uint32_t)(uintptr_t)&seh_raise_entry,
+              "ordinal 302 points at this port's RtlRaiseException");
+        check(slot_at(b.img, THUNK_VA, SLOT_UNWIND) == (uint32_t)(uintptr_t)&seh_unwind,
+              "ordinal 312 points at this port's RtlUnwind");
+
+        // A data export must not be handed a code address: the game reads the slot and dereferences it.
+        const int slot_data = 6; // ordinal 16, ExEventObjectType
+        uint32_t cell = slot_at(b.img, THUNK_VA, slot_data);
+        check(cell != 0 && cell != slot_at(b.img, THUNK_VA, SLOT_ORD1),
+              "a data export is bound to its own cell, not to a thunk");
+        check(cell != 0 && *(uint32_t *)(uintptr_t)cell == 0, "the data export cell starts zeroed");
+    }
+
+    // An ordinal nobody knows must stop the boot rather than be bound to something arbitrary. This
+    // needs its own mapping: only one image can own 0x10000 at a time.
+    {
+        std::vector<uint8_t> bytes = build();
+        bootfix::put32(bytes, DATA_RAW + 3 * 4, 9999); // slot 3 now claims an ordinal that does not exist
+        XbePosix x;
+        XbeImage img;
+        std::string err;
+        bool parsed = x.load_from_memory(std::move(bytes), err);
+        bool mapped = parsed && img.map(x, err);
+        bool copied = mapped && img.copy_sections(err);
+        bool resolved = copied && kernel_resolve_thunks(x, img, err);
+        check(!resolved && err.find("9999") != std::string::npos, "an unknown ordinal is refused by name: " + err);
+    }
+
+    // The fs forms the boot stub uses must all be rewritten, or the game would read through %fs -- which
+    // is base 0 here, so the chain install would fault.
+    {
+        Boot b;
+        if (!b.prepare()) {
+            check(false, "boot path prepared for the patch check: " + b.err);
+            return;
+        }
+        const uint8_t *code = b.img.at(TEXT_VA);
+        check(code[0x1B] == 0x65 && code[0x22] == 0x65 && code[0x3A] == 0x65,
+              "push dword [fs:0], mov [fs:0], esp and mov eax, [fs:0] all became gs:");
+        // 65 FF 35 disp32 and 65 89 25 disp32: the displacement is the fourth byte of each.
+        uint32_t disp_push, disp_store;
+        memcpy(&disp_push, code + 0x1E, 4);
+        memcpy(&disp_store, code + 0x25, 4);
+        check(disp_push == teb_patch_offset(0) && disp_store == teb_patch_offset(0),
+              "the chain-head displacement landed on this thread's TEB field");
+    }
+}
+
+// --- running the boot stub -----------------------------------------------------------------------------------
+
+static uint32_t g_boot_entry;
+static uint32_t g_head_after;
+
+static void *boot_thread(void *)
+{
+    ((void (*)(void))(uintptr_t)g_boot_entry)();
+    g_head_after = seh_head(); // the fixture's epilogue should have put the chain back
+    return nullptr;
+}
+
+static void test_boot_execution()
+{
+    printf("\nboot thread\n");
+
+    Boot b;
+    if (!b.prepare()) {
+        check(false, "boot path prepared: " + b.err);
+        return;
+    }
+
+    g_boot_entry = ENTRY_VA;
+    g_head_after = 0xDEADDEADu;
+    pthread_t th;
+    if (pthread_create(&th, nullptr, boot_thread, nullptr) != 0) {
+        check(false, "the boot thread started");
+        return;
+    }
+    pthread_join(th, nullptr);
+
+    check(read_va(HANDLER_RAN_VA) == 0xC0DE, "the game's own SEH frame was found by the dispatcher");
+    check(read_va(HANDLER_CODE_VA) == RAISE_CODE, "the handler saw the raised exception code");
+    check(read_va(HANDLER_EIP_VA) == ENTRY_VA + RAISE_RETURN_OFF,
+          "Context->Eip is the address right after the call that raised it");
+    check(read_va(RAISE_EAX_VA) == 1, "RtlRaiseException returned true, so the exception was handled");
+    check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "RtlUnwind returned the running ReturnValue");
+
+    check(kernel_stub_calls(1) == 1 && kernel_stub_calls(2) == 1,
+          "both stubbed kernel calls arrived from game code, with the stack left balanced");
+    check(g_head_after == EXCEPTION_CHAIN_END,
+          "the game's epilogue restored the chain (head 0x" + std::to_string(g_head_after) + ")");
+}
+
+int main()
+{
+    printf("BLACK loader -- Phase 1 boot path (synthetic XBE)\n");
+
+    test_export_table();
+    test_resolve();
+    test_boot_execution();
+
+    printf("\n%d checks, %d failures\n", g_checks, g_failures);
+    return g_failures ? 1 : 0;
+}

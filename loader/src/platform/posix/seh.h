@@ -10,14 +10,24 @@
 //
 // What the game emits, and what we must honour
 // --------------------------------------------
-// MSVC installs a handler by pushing the handler, then the old head, then storing esp into fs:[0]:
+// MSVC installs a handler by pushing the handler, then the old chain head, then storing esp into
+// fs:[0]:
 //
 //     push  handler
 //     push  dword [fs:0]
 //     mov   dword [fs:0], esp
 //
-// so the registration record is { handler, prev } with prev at +4, and fs:[0] points at the newest
-// record. That is the layout below, and it is why EstablisherFrame is simply the record address.
+// so the registration record is { prev, handler } -- the link at +0, the handler at +4 -- and fs:[0]
+// points at the newest record. That is why EstablisherFrame is simply the record address, and it is
+// the opposite of the { ExceptionHandler, Next } order the kernel-mode struct documents, which is
+// the kind of detail that costs a day when it is guessed. The evidence:
+//   * Wine's i386 nested-frame helper (dlls/ntdll/signal_i386.c, call_exception_handler) pushes the
+//     handler and then %fs:0, installs with `mov %fs:0, %esp` and *unlinks* with `mov %fs:0, %esp` --
+//     i.e. the chain link is the first dword of the record;
+//   * ReactOS's ntdll does the same thing in C: RtlUnwind unlinks a frame with RtlpSetExceptionList,
+//     whose i386 body is `mov ecx,[ecx]; mov fs:[TEB_EXCEPTION_LIST], ecx` -- again, record[0].
+// The synthetic boot fixture in tests/xbe_fixture.h is the same prologue, and reading it the other way
+// round makes the dispatcher call the previous chain head as if it were a handler.
 //
 // Dispatch walks the chain from the head, calling each handler with the 4-argument prototype and the
 // NT disposition set. A chain that runs out is the signal that the fault was nobody's fault, and the
@@ -98,12 +108,15 @@ static_assert(offsetof(ExceptionRecord, exception_address) == 0x0C, "ExceptionAd
 static_assert(offsetof(ExceptionRecord, exception_information) == 0x14,
               "ExceptionInformation sits at 0x14 on x86");
 
-// One link of the chain. Must match the layout the game's prologue builds: handler first, prev at +4.
+// One link of the chain. Must match the layout the game's prologue builds: prev (the old chain head)
+// first, handler at +4 -- see the note at the top of this file.
 struct ExceptionRegistration {
-    void *handler;
     struct ExceptionRegistration *prev;
+    void *handler;
 };
 static_assert(sizeof(ExceptionRegistration) == 8, "registration record must be 8 bytes");
+static_assert(offsetof(ExceptionRegistration, prev) == 0, "the chain link sits at 0x00");
+static_assert(offsetof(ExceptionRegistration, handler) == 4, "the handler sits at 0x04");
 
 // Handler return values: the NT EXCEPTION_DISPOSITION set, which is what the frame handlers the
 // game's CRT installs (_except_handler3 and friends) return. NOT the filter vocabulary
@@ -167,10 +180,17 @@ struct SehDispatch {
 // is it for the reported-instead-of-raised misbehaviours described at the top of this file.
 long seh_dispatch(ExceptionRecord *record, Context *context, SehDispatch *out);
 
-// Raise as the Xbox ordinal 302 would. Walks the chain; on ExceptionContinueExecution the caller
-// must resume from *context as the handler left it. Returns true if some handler took
-// responsibility; otherwise the exception has been reported.
+// Raise as the Xbox ordinal 302 would, and report whether some handler took responsibility. Walks the
+// chain; on ExceptionContinueExecution the caller must resume from *context as the handler left it.
+// This is the internal helper: it takes a context the caller supplies.
 bool seh_raise(ExceptionRecord *record, Context *context);
+
+// The ordinal 302 entry point itself -- NTSTATUS RtlRaiseException(PEXCEPTION_RECORD). __stdcall,
+// because the game pushes the argument and the callee has to pop it: binding a cdecl function here
+// leaves every raise four bytes off the game's stack. The boot test found that the hard way (the entry
+// returned into the address of the frame handler). The context it dispatches with is the caller's own,
+// captured the same way seh_unwind does.
+extern "C" __attribute__((stdcall)) uint32_t seh_raise_entry(ExceptionRecord *record);
 
 // Unwind as the Xbox ordinal 312 (ntdll!RtlUnwind) would. The i386 contract below is the one NT's
 // own RtlUnwind implements (WRK rtl/i386/exdsptch.c) and Wine's ntdll reproduces; Wine's test suite,

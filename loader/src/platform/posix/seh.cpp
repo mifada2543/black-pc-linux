@@ -144,29 +144,41 @@ bool seh_raise(ExceptionRecord *record, Context *context)
     return false;
 }
 
+// The caller's register state as an entry point sees it, which is what an exception handler expects to
+// find: [ebp] is the caller's EBP, the return address is where this call will come back to, and after
+// the stdcall return the caller's ESP sits arg_bytes above its frame. NT's RtlpCaptureContext computes
+// the same thing in the raising function (WRK rtl/i386/exdsptch.c).
+static void caller_context(Context *context, const void *frame, const void *return_address, uint32_t eax_value,
+                           uint32_t arg_bytes)
+{
+    memset(context, 0, sizeof *context);
+    context->context_flags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    context->eax = eax_value;
+    context->ebp = *(const uint32_t *)frame;
+    context->eip = (uint32_t)(uintptr_t)return_address;
+    context->esp = (uint32_t)(uintptr_t)frame + 4 + 4 + arg_bytes; // saved EBP, return address, arguments
+    uint32_t eflags;
+    __asm__ __volatile__("pushfl; popl %0" : "=r"(eflags));
+    context->eflags = eflags;
+}
+
+extern "C" __attribute__((stdcall, noinline)) uint32_t seh_raise_entry(ExceptionRecord *record)
+{
+    // The raise site itself, as a handler would see it: Eip is where this call returns to, and the
+    // caller resumes with its stack exactly as it left it.
+    Context context;
+    caller_context(&context, __builtin_frame_address(0), __builtin_return_address(0), 0, 4);
+
+    return seh_raise(record, &context) ? 1u : 0u;
+}
+
 extern "C" __attribute__((stdcall, noinline)) uint32_t seh_unwind(void *target_frame, void *target_ip,
                                                                    ExceptionRecord *record, uint32_t return_value)
 {
     (void)target_ip; // ignored on i386; see the contract in seh.h
 
-    // The caller-frame arithmetic promised in seh.h. __builtin_frame_address forces the frame
-    // pointer, which makes [ebp] the caller's EBP and [ebp+4] this call's return address; the
-    // caller's ESP once this stdcall has returned is ebp + 4 (saved EBP) + 4 (return address) +
-    // 16 (four arguments). NT computes the same +24 from RtlUnwind's frame.
-    const uintptr_t ebp = (uintptr_t)(const void *)__builtin_frame_address(0);
-
     Context context;
-    memset(&context, 0, sizeof context);
-    context.context_flags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-    context.eax = return_value; // the running value handlers may edit
-    context.ebp = *(const uint32_t *)ebp;
-    context.eip = (uint32_t)(uintptr_t)__builtin_return_address(0);
-    context.esp = (uint32_t)(ebp + 4 + 4 + 16);
-    {
-        uint32_t eflags;
-        __asm__ __volatile__("pushfl; popl %0" : "=r"(eflags));
-        context.eflags = eflags;
-    }
+    caller_context(&context, __builtin_frame_address(0), __builtin_return_address(0), return_value, 16);
 
     ExceptionRecord local;
     if (!record) {

@@ -26,7 +26,8 @@ if(UNIX)
     src/platform/posix/xfile.cpp
     src/platform/posix/xbe.cpp
     src/platform/posix/image.cpp
-    src/platform/posix/xsync.cpp)
+    src/platform/posix/xsync.cpp
+    src/kernel/ktable_posix.cpp)
   target_include_directories(blackcore PUBLIC src)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
   target_compile_definitions(blackcore PUBLIC _FILE_OFFSET_BITS=64)
@@ -56,6 +57,12 @@ if(UNIX)
   add_executable(test_xsync tests/test_xsync.cpp)
   target_link_libraries(test_xsync PRIVATE blackcore)
   add_test(NAME xsync COMMAND test_xsync)
+
+  # The Phase 1 boot path against a synthetic image: map, copy, patch, resolve 115 imports, then run
+  # the image's entry point on a real thread. This is the gate the real XBE will have to pass too.
+  add_executable(test_boot tests/test_boot.cpp)
+  target_link_libraries(test_boot PRIVATE blackcore)
+  add_test(NAME boot COMMAND test_boot)
 
   # Proves Vulkan works from a 32-bit process and records which features the backend may rely on.
   find_package(Vulkan QUIET)

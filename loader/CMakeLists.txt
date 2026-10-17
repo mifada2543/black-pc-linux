@@ -27,12 +27,19 @@ if(UNIX)
     src/platform/posix/xbe.cpp
     src/platform/posix/image.cpp
     src/platform/posix/xsync.cpp
+    src/platform/posix/log.cpp
+    src/platform/posix/boot.cpp
     src/kernel/ktable_posix.cpp)
   target_include_directories(blackcore PUBLIC src)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
   target_compile_definitions(blackcore PUBLIC _FILE_OFFSET_BITS=64)
   target_compile_options(blackcore PRIVATE -Wall -Wextra -Wno-unused-parameter)
   target_link_libraries(blackcore PUBLIC pthread)
+
+  # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
+  # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).
+  add_executable(blacklinux src/platform/posix/main.cpp)
+  target_link_libraries(blacklinux PRIVATE blackcore)
 
   # Platform layer tests. These need no XBE: they exercise the TEB anchor, the fs->gs patcher and the
   # SEH chain directly.

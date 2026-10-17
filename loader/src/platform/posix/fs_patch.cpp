@@ -1,5 +1,7 @@
 #include "platform/posix/fs_patch.h"
 
+#include "platform/posix/log.h"
+
 #include "platform/posix/teb.h"
 
 #include <stdio.h>
@@ -101,7 +103,7 @@ FsPatchStats patch_fs_to_gs(uint8_t *code, uint32_t size)
             // Not one of ours. Leave the bytes alone; log small offsets because those are the ones
             // that would be a missing entry in teb.cpp's table.
             if (disp < 0x100) {
-                fprintf(stderr, "fs patch: unhandled fs:[0x%x] at +0x%x, left as is\n", disp, i);
+                logf("fs patch: unhandled fs:[0x%x] at +0x%x, left as is", disp, i);
                 st.unknown++;
             }
             continue;
@@ -116,8 +118,7 @@ FsPatchStats patch_fs_to_gs(uint8_t *code, uint32_t size)
         st.prefixes++;
 
         memcpy(code + i + disp_off, &patched_disp, 4);
-        fprintf(stderr, "fs patch: +0x%06x fs:[0x%02x] -> gs:[0x%08x]  %s\n", i, disp, patched_disp,
-                teb_field_name(disp));
+        logf("fs patch: +0x%06x fs:[0x%02x] -> gs:[0x%08x]  %s", i, disp, patched_disp, teb_field_name(disp));
         st.patched++;
 
         // Resume after the last displacement byte. classify() returns an offset relative to the

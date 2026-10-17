@@ -12,6 +12,7 @@
 //
 // Expected noise on stderr: two "[k] UNIMPLEMENTED" lines, one per stub the boot stub calls on purpose.
 #include "kernel/ktable_posix.h"
+#include "platform/posix/boot.h"
 #include "platform/posix/image.h"
 #include "platform/posix/seh.h"
 #include "platform/posix/teb.h"
@@ -21,8 +22,10 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <string>
+#include <vector>
 
 using namespace bootfix;
 
@@ -208,6 +211,107 @@ static void test_boot_execution()
           "the game's epilogue restored the chain (head 0x" + std::to_string(g_head_after) + ")");
 }
 
+// --- the same path the program takes ---------------------------------------------------------------------
+//
+// The library tests above hand the parser a buffer. The program hands it a path, and that path -- open,
+// seek, read, size -- had no coverage at all until now, which is the kind of gap that only shows up on
+// the one file that matters.
+
+static bool write_temp_xbe(std::string &path_out, const std::vector<uint8_t> &bytes)
+{
+    char tmpl[] = "/tmp/blackbootXXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return false;
+    size_t done = 0;
+    while (done < bytes.size()) {
+        ssize_t n = write(fd, bytes.data() + done, bytes.size() - done);
+        if (n <= 0) {
+            close(fd);
+            return false;
+        }
+        done += (size_t)n;
+    }
+    close(fd);
+    path_out = tmpl;
+    return true;
+}
+
+static void test_boot_from_file()
+{
+    printf("\nboot from a file on disk\n");
+
+    std::string path;
+    if (!write_temp_xbe(path, build())) {
+        check(false, "wrote the fixture to a temporary file");
+        return;
+    }
+
+    // --info: parse, report, no mapping.
+    XbePosix x;
+    BootReport rep;
+    std::string err;
+    bool ok = boot_inspect(path, x, rep, err);
+    check(ok, "boot_inspect read the file: " + (ok ? std::string("ok") : err));
+    if (ok) {
+        check(rep.ordinals.size() == kKernelImportCount, "the import list came through the file path");
+        check(rep.entry == ENTRY_VA && rep.base == BASE, "the header fields match the buffer path");
+        check(rep.sections.size() == 3 && rep.sections[0].name == ".text", "the section table parsed");
+        check(!rep.title.empty(), "the certificate title came through");
+    }
+
+    // The real boot sequence, then the entry point on a thread, through the same functions main() calls.
+    XbeImage img;
+    ok = boot_prepare(path, x, img, rep, err);
+    check(ok, "boot_prepare mapped, patched and resolved: " + (ok ? std::string("ok") : err));
+    if (ok) {
+        check(rep.fs_patched >= 4, "the fs->gs patch ran over the mapped image (" +
+                                       std::to_string(rep.fs_patched) + " sites)");
+        check(rep.thunks.imports == kKernelImportCount, "every import resolved through the boot path");
+
+        uint32_t stack_top = 0;
+        const BootOutcome outcome = boot_run_entry(rep.entry, rep.stack_commit, 5000, &stack_top);
+        check(outcome == BootOutcome::Returned, "the entry point returned inside the timeout");
+        check(stack_top != 0, "the boot thread recorded its stack top for the crash report");
+        check(read_va(HANDLER_RAN_VA) == 0xC0DE, "the same SEH round trip happened through the file path");
+        check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "and the unwind returned the running ReturnValue");
+        check(kernel_stub_calls(1) == 2 && kernel_stub_calls(2) == 2,
+              "the stub call counters accumulated across both runs (" + std::to_string(kernel_stub_calls(1)) +
+                  " and " + std::to_string(kernel_stub_calls(2)) + ")");
+    }
+
+    // A file that is not an XBE must be refused with a reason, not half-parsed.
+    {
+        char tmpl[] = "/tmp/blackbootXXXXXX";
+        int fd = mkstemp(tmpl);
+        const char junk[] = "not an xbe at all, just some bytes to read";
+        if (fd >= 0) {
+            ssize_t ignored = write(fd, junk, sizeof junk - 1);
+            (void)ignored;
+            close(fd);
+            XbePosix bad;
+            BootReport badrep;
+            std::string baderr;
+            // Sequenced, not folded into one call: the failure text has to be read after the call, and
+            // the order C++ evaluates a call's arguments is unspecified.
+            const bool refused = !boot_inspect(tmpl, bad, badrep, baderr);
+            check(refused && !baderr.empty(), "a non-XBE file is refused with a reason: " + baderr);
+            unlink(tmpl);
+        }
+    }
+
+    // A path that is not there at all: the program must say so plainly.
+    {
+        XbePosix missing;
+        BootReport missingrep;
+        std::string missingerr;
+        const bool refused = !boot_inspect("/tmp/definitely-not-here.xbe", missing, missingrep, missingerr);
+        check(refused && missingerr.find("cannot open") != std::string::npos,
+              "a missing file is refused: " + missingerr);
+    }
+
+    unlink(path.c_str());
+}
+
 int main()
 {
     printf("BLACK loader -- Phase 1 boot path (synthetic XBE)\n");
@@ -215,6 +319,7 @@ int main()
     test_export_table();
     test_resolve();
     test_boot_execution();
+    test_boot_from_file();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

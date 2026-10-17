@@ -1,5 +1,7 @@
 #include "platform/posix/teb.h"
 
+#include "platform/posix/log.h"
+
 #include "platform/posix/seh.h" // EXCEPTION_CHAIN_END
 
 #include <stdio.h>
@@ -39,9 +41,8 @@ static uint32_t compute_k()
     if (!g_k_valid) {
         g_k = (uint32_t)(uintptr_t)&g_xteb - teb_thread_pointer();
         g_k_valid = true;
-        fprintf(stderr,
-                "teb: %%gs:0 = 0x%08x  &xteb = 0x%08x  K = 0x%08x (signed %d)\n",
-                teb_thread_pointer(), (uint32_t)(uintptr_t)&g_xteb, g_k, (int)g_k);
+        logf("teb: %%gs:0 = 0x%08x  &xteb = 0x%08x  K = 0x%08x (signed %d)", teb_thread_pointer(),
+             (uint32_t)(uintptr_t)&g_xteb, g_k, (int)g_k);
     }
     return g_k;
 }
@@ -54,7 +55,7 @@ bool teb_k_matches_here()
 {
     uint32_t here = (uint32_t)(uintptr_t)&g_xteb - teb_thread_pointer();
     if (here == g_k) return true;
-    fprintf(stderr, "teb: K mismatch: process K = 0x%08x, this thread = 0x%08x\n", g_k, here);
+    logc("teb: K mismatch: process K = 0x%08x, this thread = 0x%08x", g_k, here);
     return false;
 }
 

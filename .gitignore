@@ -44,3 +44,4 @@ perf/
 dist/
 # The port's rebuilt front-end files (made at start from the user's game files)
 cache/
+blacklinux.log

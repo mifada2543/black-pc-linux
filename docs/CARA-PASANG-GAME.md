@@ -12,15 +12,16 @@ mesin ini kecuali bagian yang ditandai **belum terverifikasi** — yaitu bagian 
 
 | Bisa | Belum |
 |---|---|
-| Loader native 32-bit boot image XBE: parse, map, patch `fs:` → `gs:`, resolve 115 import | **Grafis belum ada sama sekali** (Fase 3) — tidak ada window, tidak ada render |
+| Loader native 32-bit boot image XBE: parse, map, patch `fs:` → `gs:`, resolve 115 import | **Belum ada D3D8/game loop** — device Vulkan sudah ada, tapi belum ada yang menggambar game |
 | HLE kernel: memori, file, sync/IRQL, Rtl, thread, AV/HAL, crypto | **DPC/timer thread belum** (`KeSetTimer` & 5 ordinal lain masih stub) |
+| Device Vulkan: target, depth, texture, sampler, pipeline, clear, readback, PNG | **Gambar belum ada**: driver 32-bit di mesin ini tidak merasterisasi apa pun (lihat §8) |
 | SDL2 host, audio, input | Audio & input belum |
-| 14 suite test, 828 check, hijau | Verifikasi terhadap image asli (menunggu `default.xbe`) |
+| 15 suite test, 854 check, hijau | Verifikasi terhadap image asli (menunggu `default.xbe`) |
 
 Artinya: begitu `default.xbe` ada, loader akan menjalankan kode game sedekat mungkin sampai panggilan
 grafis pertama — dan di situlah belum ada apa pun. Klaim yang tidak bisa dibuat hari ini: game-nya
 sampai mana, dan apakah boot-nya benar. Yang bisa diverifikasi tanpa file asli sudah diverifikasi
-(14 suite, 828 check).
+(15 suite, 854 check).
 
 ---
 
@@ -35,10 +36,10 @@ sudo apt install build-essential gcc-multilib g++-multilib cmake ninja-build
 # Wajib untuk menjalankan: pustaka 32-bit (libc6-dev-i386 sudah ikut gcc-multilib)
 sudo apt install libc6-dev-i386
 
-# Opsional sekarang: probe Vulkan 32-bit. Graphis belum di-port, jadi ini belum dipakai game --
-# tapi suite test_vulkan memakainya, dan itu satu-satunya bukti bahwa Vulkan bisa dipakai dari proses
-# 32-bit di mesin ini.
-sudo apt install libvulkan1 mesa-vulkan-drivers mesa-vulkan-drivers:i386 vulkan-tools
+# Untuk graphics: Vulkan 32-bit + driver Mesa 32-bit + kompilator GLSL ke SPIR-V. Lapisan device sudah
+# ada (src/gfx/), jadi tiga paket ini bukan lagi opsional. glslang-tools dipakai saat build untuk
+# mengubah shader jadi SPIR-V yang ditanam di dalam loader.
+sudo apt install libvulkan1 libvulkan-dev:i386 mesa-vulkan-drivers:i386 glslang-tools vulkan-tools
 ```
 
 Cek cepat bahwa semuanya ada:
@@ -59,7 +60,7 @@ itu warning saat configure, bukan error.
 cd loader
 cmake --preset linux
 cmake --build --preset linux
-ctest --preset linux          # 14 suite, 828 check
+ctest --preset linux          # 15 suite, 854 check
 ```
 
 Hasilnya `build/linux/blacklinux` (ELF 32-bit, PIE, link ke `/lib/i386-linux-gnu`).
@@ -171,7 +172,38 @@ Kode ini diuji oleh `tests/test_exit.cpp`, jadi bukan hasil kebetulan.
 
 ---
 
-## 8. Tanpa XBE: fixture
+## 8. Grafis: yang sudah jalan dan yang tidak
+
+Lapisan device Vulkan sudah ada (`src/gfx/`) dan teruji headless, tanpa window dan tanpa XBE:
+
+```sh
+./loader/build/linux/test_gfx          # 26 check, 2 di-skip (lihat bawah)
+```
+
+Yang terbukti di sini: device & queue, target warna dan depth, texture, sampler dari deskripsi D3DTSS,
+pipeline dari SPIR-V yang dikompilasi saat build, clear (penuh dan persegi), readback byte-exact, dan PNG
+valid. Yang **belum** terbukti: gambarnya, karena **proses 32-bit di mesin ini tidak bisa merasterisasi
+apa pun**:
+
+| Driver 32-bit | Hasil (diukur dengan program dari nol) |
+|---|---|
+| Intel (ANV) | segfault di `vkQueueSubmit`, untuk command buffer apa pun |
+| llvmpipe (Mesa) | submit sukses, lalu **0 fragmen** dari 3072 piksel; `vkAllocateDescriptorSets` segfault |
+| loader 32-bit | tidak mengekspos push descriptors |
+
+Karena itu loader **mem-probe tiap GPU di child process** dan melewati yang mati (bisa dilihat di log:
+`gfx: Vulkan device '...' skipped -- its driver died on submit (signal 11)`), dan `test_gfx` **mengukur
+dulu** apakah ada fragmen sebelum mengklaim apa-apa — kalau tidak ada, check-nya di-`skip` dengan alasannya,
+bukan dilaporkan lulus. Suite itu jujur, bukan apa pun yang tidak diukur.
+
+Bisa memaksa device:
+
+```sh
+BLACKLINUX_VK_DEVICE=llvmpipe ./loader/build/linux/blacklinux ...   # pilih berdasarkan nama
+BLACKLINUX_VK_PROBE=0  ./loader/build/linux/blacklinux ...          # lewati probe (untuk menelusuri probe)
+```
+
+## 9. Tanpa XBE: fixture
 
 Supaya loader bisa dijalankan dan diperiksa tanpa file asli:
 
@@ -198,13 +230,15 @@ dirukun compile-time.
 
 ---
 
-## 9. Setelah XBE masuk
+## 10. Setelah XBE masuk
 
 Urutan yang sudah direncanakan:
 
 1. `--probe --trace` → baca `UNIMPLEMENTED ... call #1` untuk ordinal apa pun, itu urutan kerja.
 2. `k_dpc` (thread timer/DPC) — 6 stub terakhir, dan DPC sering dibutuhkan sebelum game bisa lanjut.
-3. Fase 2 (SDL2: window/input/audio) lalu Fase 3 (Vulkan) — supaya ada gambar.
-4. `KeSet/QueryBasePriorityThread` sudah selesai di `k_thread`.
+3. D3D8 di atas device Vulkan yang sudah ada: device object, resource, draw, hook `.d3d` di image.
+4. Shader nv2a → SPIR-V (bagian yang benar-benar butuh image asli: format microcode-nya belum pernah dilihat).
+5. Fase 2 (SDL2: window/input/audio) supaya ada jendela dan kontrol.
+6. `KeSet/QueryBasePriorityThread` sudah selesai di `k_thread`.
 
 Rencana lengkap: `.agents/plan.md`.

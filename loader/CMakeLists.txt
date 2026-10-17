@@ -37,11 +37,73 @@ if(UNIX)
     src/kernel/k_file_posix.cpp
     src/kernel/k_thread_posix.cpp
     src/sha1.cpp)
-  target_include_directories(blackcore PUBLIC src)
+  target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
   target_compile_definitions(blackcore PUBLIC _FILE_OFFSET_BITS=64)
   target_compile_options(blackcore PRIVATE -Wall -Wextra -Wno-unused-parameter)
   target_link_libraries(blackcore PUBLIC pthread)
+
+  # ---- graphics: the Vulkan device the D3D8 layer will draw with, and the PNG writer ----
+  #
+  # Vulkan is found from the i386 development package, so the loader links the same 32-bit loader the game
+  # runs against. There is no software fallback: a machine with no Vulkan driver cannot draw, and saying so
+  # once at start-up is better than a black window.
+  find_package(Vulkan REQUIRED)
+  message(STATUS "Vulkan ${Vulkan_VERSION} -- the graphics layer will link ${Vulkan_LIBRARIES}")
+
+  add_library(gfx STATIC
+    src/gfx/gfx_vulkan.cpp
+    src/gfx/png.cpp)
+  target_include_directories(gfx PUBLIC src)
+  target_link_libraries(gfx PUBLIC Vulkan::Vulkan)
+  target_compile_options(gfx PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  target_link_libraries(blackcore PUBLIC gfx)
+
+  # Shaders are compiled at build time and embedded, so the loader ships with its SPIR-V inside it and needs
+  # nothing installed to run. glslangValidator comes from glslang-tools; without it the graphics suite is
+  # skipped rather than failing the build, because everything else here does not need a shader.
+  find_program(GLSLANG glslangValidator)
+  set(SPV_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders)
+  if(GLSLANG)
+    file(MAKE_DIRECTORY ${SPV_DIR})
+    # SPIR-V 1.0 / Vulkan 1.0 is the target, not the newest the compiler can emit: llvmpipe's shader JIT on
+    # this machine (Mesa 24.x, 32-bit) segfaults inside vkCreateGraphicsPipelines on SPIR-V from a
+    # vulkan1.3 target, and nothing in the port needs an instruction newer than 1.0. A shader that works on
+    # the software rasteriser works everywhere.
+    set(SPIRV_TARGET_ENV vulkan1.0)
+    # GLSL -> SPIR-V -> a C header of uint32 words. Both steps are build steps with declared outputs, so
+    # ninja knows the header is older than the shader and rebuilds it; reading the SPIR-V during configure
+    # instead would need the .spv to exist in a clean tree, which it never does.
+    # One custom command per shader *file*, because the stages are not a fixed pair: the textured probe's
+    # fragment shader is a third file, and it exists separately precisely because it needs descriptors.
+    # One custom command per shader file, with the C symbol spelled out next to it. Doing this by string
+    # surgery on the file name produced "kProbevert" the first time, and the compiler caught it.
+    set(SPV_HEADERS)
+    set(SPV_LIST "probe.vert|kProbeVert" "probe.frag|kProbeFrag" "probe_tex.frag|kProbeTexFrag")
+    foreach(entry ${SPV_LIST})
+      string(REPLACE "|" ";" parts ${entry})
+      list(GET parts 0 stem)
+      list(GET parts 1 name)
+      string(REPLACE "." "_" sym ${stem})
+      set(spv ${SPV_DIR}/${stem}.spv)
+      set(hdr ${SPV_DIR}/${sym}_spirv.h)
+      add_custom_command(
+        OUTPUT ${hdr}
+        COMMAND ${GLSLANG} -V --target-env ${SPIRV_TARGET_ENV} -o ${spv}
+                ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${stem}
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${spv} -DOUTPUT=${hdr} -DNAME=${name}Spv
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gen_spirv_header.cmake
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${stem}
+                ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gen_spirv_header.cmake
+        COMMENT "GLSL to SPIR-V to header: ${stem}")
+      list(APPEND SPV_HEADERS ${hdr})
+    endforeach()
+    add_custom_target(blackshaders DEPENDS ${SPV_HEADERS})
+    add_library(blackshaders_headers INTERFACE)
+    target_include_directories(blackshaders_headers INTERFACE ${SPV_DIR})
+  else()
+    message(WARNING "glslangValidator not found -- the headless graphics suite will be skipped")
+  endif()
 
   # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
   # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).
@@ -66,6 +128,16 @@ if(UNIX)
   add_executable(test_xbe tests/test_xbe.cpp)
   target_link_libraries(test_xbe PRIVATE blackcore)
   add_test(NAME xbe COMMAND test_xbe)
+
+  # The graphics device, headless: a real device, a real pipeline, real shaders, and a PNG written from the
+  # result. This is the gate that says the Vulkan path works at all on this machine -- with no window and no
+  # XBE, which is the only way it can be run before the image arrives.
+  if(GLSLANG)
+    add_executable(test_gfx tests/test_gfx.cpp)
+    target_link_libraries(test_gfx PRIVATE blackcore blackshaders_headers)
+    add_dependencies(test_gfx blackshaders)
+    add_test(NAME gfx COMMAND test_gfx)
+  endif()
 
   # How a run ends and what the exit code says: halt, bugcheck, --strict, and the ordinary case. Each
   # scenario forks, because the exit request is process-wide and one-shot by design.

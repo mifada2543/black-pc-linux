@@ -10,7 +10,10 @@
 // run means the boot path is sound, not that default.xbe would boot. Every fixture assumption gets
 // checked against the real file when it arrives.
 //
-// Expected noise on stderr: two "[k] UNIMPLEMENTED" lines, one per stub the boot stub calls on purpose.
+// Expected noise on stderr: two "[k] UNIMPLEMENTED" lines, one per stub the boot stub calls on purpose
+// (ordinals 129 and 149, which the HLE layers leave unimplemented on purpose).
+#include "kernel/k_memory_posix.h"
+#include "kernel/k_misc_posix.h"
 #include "kernel/ktable_posix.h"
 #include "platform/posix/boot.h"
 #include "platform/posix/image.h"
@@ -110,7 +113,11 @@ static void test_resolve()
         const KernelThunkStats &st = kernel_thunk_stats();
         check(st.imports == kKernelImportCount,
               "every import filled (" + std::to_string(st.imports) + "/" + std::to_string(kKernelImportCount) + ")");
-        check(st.implemented == 2, "exactly the two SEH ordinals have real implementations");
+        // The implemented set grows as HLE modules land, so this says what must be in it rather than
+        // counting it: the two SEH ordinals (checked by address just below) and the memory layer's.
+        check(st.implemented >= 2 && st.implemented < st.imports,
+              "some ordinals are implemented and the rest are stubs (" + std::to_string(st.implemented) + " of " +
+                  std::to_string(st.imports) + ")");
         check(st.implemented + st.data_exports + st.stubbed == st.imports, "every import is accounted for");
         check(!st.stub_names.empty(), "the rest are logging stubs: " + st.stub_names.substr(0, 60) + "...");
 
@@ -123,13 +130,22 @@ static void test_resolve()
               "ordinal 302 points at this port's RtlRaiseException");
         check(slot_at(b.img, THUNK_VA, SLOT_UNWIND) == (uint32_t)(uintptr_t)&seh_unwind,
               "ordinal 312 points at this port's RtlUnwind");
+        check(slot_at(b.img, THUNK_VA, SLOT_POOL) == (uint32_t)(uintptr_t)&ExAllocatePoolWithTag &&
+                  slot_at(b.img, THUNK_VA, SLOT_NTALLOC) == (uint32_t)(uintptr_t)&NtAllocateVirtualMemory,
+              "the memory layer's ordinals are bound to its implementations, not to stubs");
 
-        // A data export must not be handed a code address: the game reads the slot and dereferences it.
+        // A data export must not be handed a code address: the game reads the slot and dereferences it,
+        // so the slot has to hold the address of storage. It is the difference between a working XAPI
+        // startup and a jump to address zero on the first read.
         const int slot_data = 6; // ordinal 16, ExEventObjectType
         uint32_t cell = slot_at(b.img, THUNK_VA, slot_data);
-        check(cell != 0 && cell != slot_at(b.img, THUNK_VA, SLOT_ORD1),
-              "a data export is bound to its own cell, not to a thunk");
-        check(cell != 0 && *(uint32_t *)(uintptr_t)cell == 0, "the data export cell starts zeroed");
+        check(cell == (uint32_t)(uintptr_t)ExEventObjectType,
+              "a data export points at real storage, not at a thunk");
+        check(cell != slot_at(b.img, THUNK_VA, SLOT_RAISE), "and that storage is not a code address");
+        bool zeroed = true;
+        for (size_t i = 0; i < sizeof ExEventObjectType; i++)
+            if (((const uint8_t *)(uintptr_t)cell)[i]) zeroed = false;
+        check(zeroed, "the object-type storage reads as zeros, as it should");
     }
 
     // An ordinal nobody knows must stop the boot rather than be bound to something arbitrary. This
@@ -205,7 +221,9 @@ static void test_boot_execution()
     check(read_va(RAISE_EAX_VA) == 1, "RtlRaiseException returned true, so the exception was handled");
     check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "RtlUnwind returned the running ReturnValue");
 
-    check(kernel_stub_calls(1) == 1 && kernel_stub_calls(2) == 1,
+    // Ordinals 129 and 149 are the two the fixture calls on purpose and that the HLE layers deliberately
+    // do not implement: one stdcall with no arguments, one with four. Each stub must drop exactly its own.
+    check(kernel_stub_calls(129) == 1 && kernel_stub_calls(149) == 1,
           "both stubbed kernel calls arrived from game code, with the stack left balanced");
     check(g_head_after == EXCEPTION_CHAIN_END,
           "the game's epilogue restored the chain (head 0x" + std::to_string(g_head_after) + ")");
@@ -274,9 +292,9 @@ static void test_boot_from_file()
         check(stack_top != 0, "the boot thread recorded its stack top for the crash report");
         check(read_va(HANDLER_RAN_VA) == 0xC0DE, "the same SEH round trip happened through the file path");
         check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "and the unwind returned the running ReturnValue");
-        check(kernel_stub_calls(1) == 2 && kernel_stub_calls(2) == 2,
-              "the stub call counters accumulated across both runs (" + std::to_string(kernel_stub_calls(1)) +
-                  " and " + std::to_string(kernel_stub_calls(2)) + ")");
+        check(kernel_stub_calls(129) == 2 && kernel_stub_calls(149) == 2,
+              "the stub call counters accumulated across both runs (" + std::to_string(kernel_stub_calls(129)) +
+                  " and " + std::to_string(kernel_stub_calls(149)) + ")");
     }
 
     // A file that is not an XBE must be refused with a reason, not half-parsed.

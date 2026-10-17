@@ -10,8 +10,8 @@
 int main()
 {
     using namespace bootfix;
-    printf("THUNK0 0x%08x\n"
-           "THUNK1 0x%08x\n"
+    printf("THUNK_STUB0 0x%08x\n"
+           "THUNK_STUB1 0x%08x\n"
            "THUNK_RAISE 0x%08x\n"
            "THUNK_UNWIND 0x%08x\n"
            "RECORD 0x%08x\n"
@@ -21,7 +21,7 @@ int main()
            "OUT_HEIP 0x%08x\n"
            "OUT_HRAN 0x%08x\n"
            "HANDLER 0x%08x\n",
-           THUNK_VA, THUNK_VA + 4, THUNK_VA + SLOT_RAISE * 4, THUNK_VA + SLOT_UNWIND * 4, RECORD_VA,
+           THUNK_VA + SLOT_STUB0 * 4, THUNK_VA + SLOT_STUB1 * 4, THUNK_VA + SLOT_RAISE * 4, THUNK_VA + SLOT_UNWIND * 4, RECORD_VA,
            RAISE_EAX_VA, UNWIND_EAX_VA, HANDLER_CODE_VA, HANDLER_EIP_VA, HANDLER_RAN_VA, HANDLER_VA);
     return 0;
 }

@@ -29,7 +29,10 @@ if(UNIX)
     src/platform/posix/xsync.cpp
     src/platform/posix/log.cpp
     src/platform/posix/boot.cpp
-    src/kernel/ktable_posix.cpp)
+    src/kernel/ktable_posix.cpp
+    src/kernel/k_memory_posix.cpp
+    src/kernel/k_misc_posix.cpp
+    src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
   target_compile_definitions(blackcore PUBLIC _FILE_OFFSET_BITS=64)
@@ -70,6 +73,19 @@ if(UNIX)
   add_executable(test_boot tests/test_boot.cpp)
   target_link_libraries(test_boot PRIVATE blackcore)
   add_test(NAME boot COMMAND test_boot)
+
+  # The Xbox memory layer: pool, contiguous memory, virtual memory. Includes a deliberate fault on a
+  # protected page, so it exercises the fault bridge as well.
+  add_executable(test_memory tests/test_memory.cpp)
+  target_link_libraries(test_memory PRIVATE blackcore)
+  add_test(NAME memory COMMAND test_memory)
+
+  # The AV/HAL/interrupt/settings/section/crypto exports, the data exports, DbgPrint's format
+  # translation, and the three calls that have to end the run (checked in a forked child, so a bugcheck
+  # cannot take the suite with it).
+  add_executable(test_misc tests/test_misc.cpp)
+  target_link_libraries(test_misc PRIVATE blackcore)
+  add_test(NAME misc COMMAND test_misc)
 
   # Proves Vulkan works from a 32-bit process and records which features the backend may rely on.
   find_package(Vulkan QUIET)

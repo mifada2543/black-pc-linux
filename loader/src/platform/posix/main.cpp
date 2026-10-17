@@ -132,7 +132,7 @@ int run(const Options &o)
     }
     boot_print_report(rep);
 
-    logc("not yet implemented: kernel memory allocation, boot-thread TLS slots, DPC/timer thread, graphics");
+    logc("not yet implemented: boot-thread TLS slots, the DPC/timer thread, and graphics");
     logc("starting XBE entry point 0x%08x", rep.entry);
 
     uint32_t stack_top = 0;
@@ -148,6 +148,13 @@ int run(const Options &o)
         // The normal state for the real game: it is inside its own main loop. Say where the boot thread's
         // stack was, because that is the first thing anyone wants when a crash happens later.
         logc("boot: still inside the game after %u s; boot thread stack top 0x%08x", o.timeout_s, stack_top);
+        break;
+    case BootOutcome::Exited:
+        // The game asked to leave: HalReturnToFirmware, HalInitiateShutdown or KeBugCheck. Its exit code
+        // is the reason, so a bugcheck does not look like a clean run and a clean leave does not look
+        // like a crash.
+        code = boot_exit_code();
+        logc("boot: the game ended the run itself: %s", boot_exit_reason());
         break;
     case BootOutcome::FailedToStart:
         logc("boot: could not create the boot thread");

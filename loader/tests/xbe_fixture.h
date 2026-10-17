@@ -100,12 +100,16 @@ constexpr int kKernelImportCount = (int)(sizeof(kKernelOrdinals) / sizeof(kKerne
 
 // Slot offsets the assembled code uses, recomputed here so the test can check the numbers rather than
 // trust the transcription.
-constexpr int SLOT_ORD1 = 0;    // ordinal 1,  AvGetSavedDataAddress, argc 0
-constexpr int SLOT_ORD2 = 1;    // ordinal 2,  AvSendTVEncoderOption, argc 4
-constexpr int SLOT_RAISE = 95;  // ordinal 302, RtlRaiseException
-constexpr int SLOT_UNWIND = 99; // ordinal 312, RtlUnwind
-static_assert(kKernelOrdinals[SLOT_ORD1] == 1, "slot 0 must be ordinal 1");
-static_assert(kKernelOrdinals[SLOT_ORD2] == 2, "slot 1 must be ordinal 2");
+constexpr int SLOT_STUB0 = 30;    // ordinal 129, KeRaiseIrqlToDpcLevel, argc 0
+constexpr int SLOT_STUB1 = 36;    // ordinal 149, KeSetTimer, argc 4
+constexpr int SLOT_POOL = 5;      // ordinal 15,  ExAllocatePoolWithTag
+constexpr int SLOT_NTALLOC = 54;  // ordinal 184, NtAllocateVirtualMemory
+constexpr int SLOT_RAISE = 95;    // ordinal 302, RtlRaiseException
+constexpr int SLOT_UNWIND = 99;   // ordinal 312, RtlUnwind
+static_assert(kKernelOrdinals[SLOT_STUB0] == 129, "slot 30 must be ordinal 129");
+static_assert(kKernelOrdinals[SLOT_STUB1] == 149, "slot 36 must be ordinal 149");
+static_assert(kKernelOrdinals[SLOT_POOL] == 15, "slot 5 must be ordinal 15");
+static_assert(kKernelOrdinals[SLOT_NTALLOC] == 184, "slot 54 must be ordinal 184");
 static_assert(kKernelOrdinals[SLOT_RAISE] == 302, "slot 95 must be ordinal 302");
 static_assert(kKernelOrdinals[SLOT_UNWIND] == 312, "slot 99 must be ordinal 312");
 
@@ -153,13 +157,13 @@ constexpr uint32_t RAISE_RETURN_OFF = 0x35;
 // MSVC try/except prologue actually emits.
 // ---------------------------------------------------------------------------
 constexpr uint8_t kBootCode[] = {
-    0xA1, 0x00, 0x20, 0x10, 0x00,                // 00  mov    eax,ds:0x102000
+    0xA1, 0x78, 0x20, 0x10, 0x00,                // 00  mov    eax,ds:0x102078
     0xFF, 0xD0,                                  // 05  call   eax
     0x6A, 0x00,                                  // 07  push   0x0
     0x6A, 0x00,                                  // 09  push   0x0
     0x6A, 0x00,                                  // 0B  push   0x0
     0x6A, 0x00,                                  // 0D  push   0x0
-    0xA1, 0x04, 0x20, 0x10, 0x00,                // 0F  mov    eax,ds:0x102004
+    0xA1, 0x90, 0x20, 0x10, 0x00,                // 0F  mov    eax,ds:0x102090
     0xFF, 0xD0,                                  // 14  call   eax
     0x68, 0x64, 0x10, 0x10, 0x00,                // 16  push   0x101064
     0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00,    // 1B  push   DWORD PTR fs:0x0
@@ -195,9 +199,14 @@ constexpr uint32_t BOOT_ENTRY_LEN = 0x64; // boot_handler starts here
 // The immediates below must agree with the constants they were generated from, or the stub silently
 // reads the wrong memory -- the section table lives at 0x10180 and looks enough like code to call.
 static_assert(sizeof kBootCode == BOOT_ENTRY_LEN + 0x27, "the handler follows the entry at 0x64 and runs to 0x8A");
-static_assert(kBootCode[0x00] == 0xA1 && kBootCode[0x01] == (uint8_t)(THUNK_VA & 0xFF) &&
-                  kBootCode[0x04] == (uint8_t)((THUNK_VA >> 24) & 0xFF),
-              "boot_entry reads the first thunk slot");
+constexpr uint32_t STUB0_VA = THUNK_VA + SLOT_STUB0 * 4;
+constexpr uint32_t STUB1_VA = THUNK_VA + SLOT_STUB1 * 4;
+static_assert(kBootCode[0x00] == 0xA1 && kBootCode[0x01] == (uint8_t)(STUB0_VA & 0xFF) &&
+                  kBootCode[0x04] == (uint8_t)((STUB0_VA >> 24) & 0xFF),
+              "boot_entry reads the thunk slot for ordinal 129");
+static_assert(kBootCode[0x0F] == 0xA1 && kBootCode[0x10] == (uint8_t)(STUB1_VA & 0xFF) &&
+                  kBootCode[0x13] == (uint8_t)((STUB1_VA >> 24) & 0xFF),
+              "and then the one for ordinal 149");
 static_assert(kBootCode[0x16] == 0x68 && kBootCode[0x17] == (uint8_t)(HANDLER_VA & 0xFF) &&
                   kBootCode[0x1A] == (uint8_t)((HANDLER_VA >> 24) & 0xFF),
               "the prologue pushes the handler that actually exists in this image");

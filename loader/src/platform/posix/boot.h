@@ -8,7 +8,7 @@
 //
 //   settings_load          not yet -- black.ini comes with the settings port
 //   xbe.load               done (xbe.cpp)
-//   kmem_init              NOT YET -- the first kernel call the game makes is an allocation
+//   kmem_init              done (k_memory_posix.cpp; the contiguous block was already mapped by image.cpp)
 //   xthread_init_slots     NOT YET -- TLS slots for the boot thread
 //   image_map              done (image.cpp)
 //   patch_fs_accesses      done (fs_patch.cpp, via XbeImage::patch_fs)
@@ -62,6 +62,11 @@ struct BootReport {
     int fs_unknown = 0;
     int fs_no_disp = 0;
     KernelThunkStats thunks;
+
+    // What the memory layer ended up with.
+    uint32_t mem_contiguous_base = 0;
+    uint32_t mem_contiguous_free = 0;
+    uint32_t mem_virtual_regions = 0;
 };
 
 // Parse only. Fills `rep` and prints the header/section/import summary through logc. Safe to call on
@@ -73,11 +78,22 @@ bool boot_inspect(const std::string &path, XbePosix &x, BootReport &rep, std::st
 bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootReport &rep, std::string &err);
 
 // Enter the image's entry point on a real thread and wait. The entry point is game code that may never
-// return, so this returns when the thread returns or when `timeout_ms` expires (0 = wait forever).
-// `returned` reports which of the two happened; `stack_top` is the boot thread's stack pointer at
-// entry, which is what a crashed game frame points back into.
-enum class BootOutcome { Returned, TimedOut, FailedToStart };
+// return, so this returns when the thread returns, when `timeout_ms` expires (0 = wait forever), or when
+// a kernel call asked to end the run. `stack_top` is the boot thread's stack pointer at entry, which is
+// what a crashed game frame points back into.
+enum class BootOutcome { Returned, TimedOut, Exited, FailedToStart };
 BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeout_ms, uint32_t *stack_top);
+
+// End the run from inside a kernel call. On the console HalReturnToFirmware and KeBugCheck end the
+// session; here they set this request and park the calling thread, and boot_run_entry notices it and
+// returns Exited. `why` must be a string literal: it is stored by pointer and printed later.
+//
+// The codes are the ones the exit path already uses elsewhere in the port: 0 normal, 1 a fatal error the
+// game reported itself, 4 a bugcheck.
+void boot_request_exit(int code, const char *why);
+bool boot_exit_requested();
+int boot_exit_code();
+const char *boot_exit_reason();
 
 // The stdout dump --info and --probe share. Written to stderr so it interleaves with the log lines in a
 // terminal and stays next to them in a redirect.

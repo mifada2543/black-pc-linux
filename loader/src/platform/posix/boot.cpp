@@ -1,5 +1,7 @@
 #include "platform/posix/boot.h"
 
+#include "kernel/k_memory_posix.h"
+#include "kernel/k_misc_posix.h"
 #include "platform/posix/fs_patch.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
@@ -8,6 +10,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#include <atomic>
 
 namespace {
 
@@ -76,7 +80,25 @@ void *boot_thread(void *arg)
     return nullptr; // game entry points do not return; if this one did, so be it
 }
 
+std::atomic<int> g_exit_code{-1}; // negative = no exit requested
+const char *g_exit_why = "unspecified";
+
 } // namespace
+
+void boot_request_exit(int code, const char *why)
+{
+    // Only the first request is logged: HalReturnToFirmware and KeBugCheck both park their thread, so a
+    // second call can only come from somewhere that did not notice.
+    int expected = -1;
+    if (g_exit_code.compare_exchange_strong(expected, code)) {
+        g_exit_why = why ? why : "unspecified";
+        logc("exit requested: %s (code %d)", g_exit_why, code);
+    }
+}
+
+bool boot_exit_requested() { return g_exit_code.load() >= 0; }
+int boot_exit_code() { return g_exit_code.load(); }
+const char *boot_exit_reason() { return g_exit_why; }
 
 void boot_print_report(const BootReport &rep)
 {
@@ -126,6 +148,13 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
 {
     if (!boot_inspect(path, x, rep, err)) return false;
 
+    // Kernel memory first: the game's first instructions allocate, and the contiguous block is what
+    // MmGetPhysicalAddress's arithmetic is defined against.
+    if (!kmem_init()) {
+        err = "cannot map the contiguous memory block (see the log)";
+        return false;
+    }
+
     if (!img.map(x, err)) return false;
     if (!img.copy_sections(err)) {
         img.unmap();
@@ -143,10 +172,25 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     }
     rep.thunks = kernel_thunk_stats();
 
+    // Kernel memory before anything can allocate: the game allocates in its first instructions, and the
+    // contiguous block is also what MmGetPhysicalAddress's arithmetic is defined against.
+    uint32_t contig_free = 0, contig_used = 0, contig_reserved = 0;
+    kmem_contiguous_stats(&contig_free, &contig_used, &contig_reserved);
+    rep.mem_contiguous_base = contiguous_base();
+    rep.mem_contiguous_free = contig_free;
+    rep.mem_virtual_regions = kmem_virtual_regions();
+    const uint32_t free_mb = contig_free >> 20;
+
+    // The section loader is told which image is running, so XeLoadSection can recognise the section
+    // header the game hands it and copy the section where it belongs.
+    kmisc_set_image(&img, &x);
+
     // The bridge is installed before anything can fault: from here on a fault becomes an exception the
     // game's own handlers get to see, instead of a process that dies where it stands.
     seh_install_signal_bridge();
 
+    logc("memory: contiguous RAM at 0x%08x, %u MB, %u MB free after the reserved ends", contiguous_base(),
+         contiguous_size() >> 20, free_mb);
     logc("xbe: '%s' %s build, base 0x%08x size 0x%x, entry 0x%08x, %zu sections, %zu kernel imports", rep.title.c_str(),
          rep.kind.c_str(), rep.base, rep.size_of_image, rep.entry, rep.sections.size(), rep.ordinals.size());
     logc("fs: %d instructions rewritten to gs, %d unrecognised", rep.fs_patched, rep.fs_unknown);
@@ -191,6 +235,14 @@ BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeo
                 logc("boot: the entry point returned after %u ms", waited);
                 return BootOutcome::Returned;
             }
+            // A kernel call asked to end the run. The thread that asked is parked and will not finish, so
+            // it is detached rather than joined, the same as a game that never returns.
+            if (boot_exit_requested()) {
+                pthread_detach(thread);
+                if (stack_top) *stack_top = boot.stack_top;
+                logc("boot: the run ended on request (%s)", boot_exit_reason());
+                return BootOutcome::Exited;
+            }
             struct timespec ts = {0, (long)slice_ms * 1000 * 1000};
             nanosleep(&ts, nullptr);
         }
@@ -199,6 +251,13 @@ BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeo
         return BootOutcome::TimedOut;
     }
 
+    // Waiting forever still has to stop if the game asks to leave.
+    if (boot_exit_requested()) {
+        pthread_detach(thread);
+        if (stack_top) *stack_top = boot.stack_top;
+        logc("boot: the run ended on request (%s)", boot_exit_reason());
+        return BootOutcome::Exited;
+    }
     pthread_join(thread, nullptr);
     if (stack_top) *stack_top = boot.stack_top;
     return BootOutcome::Returned;

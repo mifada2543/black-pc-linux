@@ -37,6 +37,8 @@ uint32_t kernel_stub_calls(uint32_t ordinal);
 void kernel_set_trace(bool on);
 
 // For the HLE modules that land later: give an ordinal a real target, or point a data export's cell at
-// an address. Both take effect the next time kernel_resolve_thunks runs.
+// an address. kernel_resolve_thunks calls kernel_bind_implemented() first, which is where a new module
+// registers its ordinals; kernel_bind_export is for anything that needs to happen later than that.
 bool kernel_bind_export(uint32_t ordinal, void *target);
+void kernel_bind_implemented();
 bool kernel_bind_variable(uint32_t ordinal, void *address);

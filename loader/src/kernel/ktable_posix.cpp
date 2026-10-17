@@ -27,6 +27,8 @@
 #include "kernel/ktable_posix.h"
 
 #include "platform/posix/image.h"
+#include "kernel/k_memory_posix.h"
+#include "kernel/k_misc_posix.h"
 #include "platform/posix/seh.h"
 
 #include <stdio.h>
@@ -231,6 +233,81 @@ KernelThunkStats g_stats;
 
 } // namespace
 
+// Everything the HLE layers have implemented so far. Adding a module means adding its entries here and
+// nowhere else: the table above still carries the names, conventions and argument counts, and a
+// function that is not listed keeps its logging stub, which is how the boot log says what to do next.
+void kernel_bind_implemented()
+{
+    // k_memory_posix.cpp: pool, contiguous memory, virtual memory.
+    static const struct {
+        uint32_t ordinal;
+        void *target;
+    } bindings[] = {
+        {15, (void *)&ExAllocatePoolWithTag},
+        {17, (void *)&ExFreePool},
+        {23, (void *)&ExQueryPoolBlockSize},
+        {165, (void *)&MmAllocateContiguousMemory},
+        {166, (void *)&MmAllocateContiguousMemoryEx},
+        {168, (void *)&MmClaimGpuInstanceMemory},
+        {171, (void *)&MmFreeContiguousMemory},
+        {173, (void *)&MmGetPhysicalAddress},
+        {175, (void *)&MmLockUnlockBufferPages},
+        {176, (void *)&MmLockUnlockPhysicalPage},
+        {178, (void *)&MmPersistContiguousMemory},
+        {179, (void *)&MmQueryAddressProtect},
+        {180, (void *)&MmQueryAllocationSize},
+        {182, (void *)&MmSetAddressProtect},
+        {184, (void *)&NtAllocateVirtualMemory},
+        {199, (void *)&NtFreeVirtualMemory},
+        {217, (void *)&NtQueryVirtualMemory},
+
+        // k_misc_posix.cpp: AV, HAL, interrupts, non-volatile settings, sections, crypto, DbgPrint.
+        {1, (void *)&AvGetSavedDataAddress},
+        {2, (void *)&AvSendTVEncoderOption},
+        {3, (void *)&AvSetDisplayMode},
+        {4, (void *)&AvSetSavedDataAddress},
+        {8, (void *)&DbgPrint},
+        {24, (void *)&ExQueryNonVolatileSetting},
+        {44, (void *)&HalGetInterruptVector},
+        {46, (void *)&HalReadWritePCISpace},
+        {47, (void *)&HalRegisterShutdownNotification},
+        {49, (void *)&HalReturnToFirmware},
+        {87, (void *)&IofCompleteRequest},
+        {95, (void *)&KeBugCheck},
+        {98, (void *)&KeConnectInterrupt},
+        {100, (void *)&KeDisconnectInterrupt},
+        {109, (void *)&KeInitializeInterrupt},
+        {128, (void *)&KeQuerySystemTime},
+        {139, (void *)&KeRestoreFloatingPointState},
+        {142, (void *)&KeSaveFloatingPointState},
+        {153, (void *)&KeSynchronizeExecution},
+        {327, (void *)&XeLoadSection},
+        {328, (void *)&XeUnloadSection},
+        {335, (void *)&XcSHAInit},
+        {336, (void *)&XcSHAUpdate},
+        {337, (void *)&XcSHAFinal},
+        {340, (void *)&XcHMAC},
+        {360, (void *)&HalInitiateShutdown},
+
+        // The data exports are not calls: the game reads the slot and dereferences it, so each slot gets
+        // the address of real storage instead of the null cell a bound-nothing export would leave.
+        {16, (void *)ExEventObjectType},
+        {40, (void *)&HalDiskCachePartitionCount},
+        {71, (void *)IoFileObjectType},
+        {164, (void *)&LaunchDataPage},
+        {259, (void *)PsThreadObjectType},
+        {322, (void *)&XboxHardwareInfo},
+        {323, (void *)XboxHDKey},
+        {324, (void *)&XboxKrnlVersion},
+        {325, (void *)XboxSignatureKey},
+        {326, (void *)&XeImageFileName},
+        {354, (void *)XboxAlternateSignatureKeys},
+        {356, (void *)&HalBootSMCVideoMode},
+        {357, (void *)IdexChannelObject},
+    };
+    for (const auto &b : bindings) kernel_bind_export(b.ordinal, b.target);
+}
+
 // Called from the generated thunk, with the ordinal it was built for. cdecl on purpose: the thunk
 // restores the stack itself, from the byte count returned in edx.
 extern "C" uint64_t blackrt_stub_called_posix(uint32_t ordinal, const uint32_t *args, uint32_t ecx, uint32_t edx)
@@ -321,6 +398,7 @@ bool kernel_resolve_thunks(const XbePosix &x, XbeImage &img, std::string &err)
         err = "the image has no kernel import table";
         return false;
     }
+    kernel_bind_implemented(); // the HLE modules that exist; see k_memory_posix.cpp and friends
 
     // A run of 32-bit slots terminated by a zero entry. Bounded by the image size so a truncated table
     // cannot walk into the next section looking for the terminator.

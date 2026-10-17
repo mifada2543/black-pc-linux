@@ -1,0 +1,387 @@
+Program: default.xbe  functions: 7696
+
+Functions per section (total / named / body bytes)
+  .text        6538    269   1666676
+  D3D           214     91     57733
+  DSOUND        432    139     44158
+  WMADEC        143      3     47295
+  XGRPH          31      4      6524
+  XMV            64      6     33541
+  XPP           173     12     22132
+
+Callers of watched D3D functions
+  D3DDevice_BeginPush_4 @ 0026d110: 3 refs; 3 game(.text) callers, 0 SDK-internal callers
+      game: FUN_0002bac0@0002bac0
+      game: FUN_00037e90@00037e90
+      game: FUN_0003e1b0@0003e1b0
+  D3DDevice_EndPush @ 0026d170: 3 refs; 3 game(.text) callers, 0 SDK-internal callers
+      game: FUN_0002bac0@0002bac0
+      game: FUN_00037e90@00037e90
+      game: FUN_0003e1b0@0003e1b0
+  D3DDevice_CreateVertexShader @ 00269480: 28 refs; 5 game(.text) callers, 0 SDK-internal callers
+      game: FUN_00035fe0@00035fe0
+      game: FUN_00045f50@00045f50
+      game: FUN_000c66c0@000c66c0
+      game: FUN_001781a0@001781a0
+      game: FUN_00178350@00178350
+  D3DDevice_SetPixelShader @ 0026bd00: 5 refs; 3 game(.text) callers, 2 SDK-internal callers
+      game: <no function>@0002c5a5
+      game: FUN_0002df30@0002df30
+      game: FUN_0002f430@0002f430
+      sdk:  FUN_00276530@00276530
+      sdk:  FUN_002767b0@002767b0
+  D3DDevice_SetPixelShaderConstant_4__LTCG_ecx1_eax3 @ 0026bf10: 12 refs; 7 game(.text) callers, 0 SDK-internal callers
+      game: FUN_0016e280@0016e280
+      game: FUN_0016f070@0016f070
+      game: FUN_001709c0@001709c0
+      game: FUN_00171a10@00171a10
+      game: FUN_00171c60@00171c60
+      game: FUN_00173c30@00173c30
+      game: FUN_001772e0@001772e0
+  D3DDevice_DrawVerticesUP @ 00269c90: 2 refs; 2 game(.text) callers, 0 SDK-internal callers
+      game: <no function>@00036472
+      game: FUN_0002ac00@0002ac00
+  D3DDevice_DrawVertices @ 00269e40: 1 refs; 1 game(.text) callers, 0 SDK-internal callers
+      game: FUN_0002abe0@0002abe0
+  D3DDevice_DrawIndexedVertices @ 00269f10: 3 refs; 3 game(.text) callers, 0 SDK-internal callers
+      game: FUN_0002abc0@0002abc0
+      game: FUN_00036480@00036480
+      game: FUN_00047f10@00047f10
+  D3DDevice_DrawVerticesUP @ 00269c90: 2 refs; 2 game(.text) callers, 0 SDK-internal callers
+      game: <no function>@00036472
+      game: FUN_0002ac00@0002ac00
+  D3DDevice_Swap @ 002773a0: 1 refs; 1 game(.text) callers, 0 SDK-internal callers
+      game: <no function>@0002bab2
+  Direct3D_CreateDevice @ 0026c620: 2 refs; 1 game(.text) callers, 1 SDK-internal callers
+      game: FUN_0002b610@0002b610
+      sdk:  <no function>@0058799c
+
+D3D-section entry points called from game code (.text): call sites
+  (70 distinct functions)
+  D3DCubeTexture_GetCubeMapSurface2                            @ 0026c800  game call sites=4
+  D3DCubeTexture_LockRect                                      @ 0026c850  game call sites=1
+  D3DDevice_BeginPush_4                                        @ 0026d110  game call sites=3
+  D3DDevice_Clear                                              @ 00268880  game call sites=15
+  D3DDevice_CopyRects                                          @ 0026a730  game call sites=1
+  D3DDevice_CreateTexture2                                     @ 0026c6d0  game call sites=1
+  D3DDevice_CreateVertexBuffer2                                @ 0026c1e0  game call sites=1
+  D3DDevice_CreateVertexShader                                 @ 00269480  game call sites=28
+  D3DDevice_DeletePixelShader                                  @ 0026bce0  game call sites=1
+  D3DDevice_DeleteVertexShader                                 @ 002695d0  game call sites=4
+  D3DDevice_DrawIndexedVertices                                @ 00269f10  game call sites=3
+  D3DDevice_DrawVertices                                       @ 00269e40  game call sites=1
+  D3DDevice_DrawVerticesUP                                     @ 00269c90  game call sites=2
+  D3DDevice_End                                                @ 0026a1f0  game call sites=6
+  D3DDevice_EndPush                                            @ 0026d170  game call sites=3
+  D3DDevice_GetDepthStencilSurface2                            @ 0026aaa0  game call sites=1
+  D3DDevice_GetRenderTarget2                                   @ 0026aa60  game call sites=3
+  D3DDevice_GetViewportOffsetAndScale                          @ 0026e9c0  game call sites=2
+  D3DDevice_IsFencePending                                     @ 0026d0f0  game call sites=3
+  D3DDevice_LightEnable                                        @ 0026b210  game call sites=3
+  D3DDevice_Release                                            @ 0026b5d0  game call sites=1
+  D3DDevice_SetLight                                           @ 0026ae50  game call sites=2
+  D3DDevice_SetMaterial                                        @ 0026ae20  game call sites=2
+  D3DDevice_SetPalette                                         @ 0026b530  game call sites=21
+  D3DDevice_SetPixelShader                                     @ 0026bd00  game call sites=3
+  D3DDevice_SetPixelShaderConstant_4__LTCG_ecx1_eax3           @ 0026bf10  game call sites=12
+  D3DDevice_SetRenderStateNotInline                            @ 0026e5e0  game call sites=95
+  D3DDevice_SetRenderState_NormalizeNormals                    @ 0026dd60  game call sites=2
+  D3DDevice_SetRenderState_Simple                              @ 0026e5b0  game call sites=7
+  D3DDevice_SetRenderState_StencilEnable                       @ 0026de50  game call sites=1
+  D3DDevice_SetRenderState_StencilFail                         @ 0026df00  game call sites=1
+  D3DDevice_SetRenderState_TextureFactor                       @ 0026df80  game call sites=2
+  D3DDevice_SetRenderTarget                                    @ 0026a420  game call sites=26
+  D3DDevice_SetScissors                                        @ 0026b720  game call sites=6
+  D3DDevice_SetStreamSource                                    @ 00268de0  game call sites=16
+  D3DDevice_SetTexture                                         @ 0026b370  game call sites=3
+  D3DDevice_SetTextureStageStateNotInline                      @ 0026e860  game call sites=64
+  D3DDevice_SetTransform                                       @ 0026aae0  game call sites=5
+  D3DDevice_SetVertexShader                                    @ 00269710  game call sites=3
+  D3DDevice_SetVertexShaderConstant1                           @ 00269880  game call sites=56
+  D3DDevice_SetVertexShaderConstant1Fast                       @ 002698e0  game call sites=4
+  D3DDevice_SetVertexShaderConstant4                           @ 00269930  game call sites=25
+  D3DDevice_SetVertexShaderConstantNotInlineFast               @ 002699e0  game call sites=7
+  D3DDevice_SetViewport                                        @ 0026ac00  game call sites=4
+  D3DDevice_Swap                                               @ 002773a0  game call sites=1
+  D3DPalette_Lock2                                             @ 0026c2c0  game call sites=1
+  D3DResource_AddRef                                           @ 0026c470  game call sites=16
+  D3DResource_BlockUntilNotBusy                                @ 0026c610  game call sites=5
+  D3DResource_Release                                          @ 0026c4b0  game call sites=32
+  D3DSurface_LockRect                                          @ 00269be0  game call sites=1
+  D3DTexture_GetSurfaceLevel2                                  @ 0026c780  game call sites=5
+  D3DTexture_LockRect                                          @ 0026c7d0  game call sites=1
+  D3DVertexBuffer_Lock2                                        @ 0026c230  game call sites=7
+  D3D_BlockOnTime                                              @ 0026cc10  game call sites=1
+  D3D_DestroyResource_0__LTCG_edi1                             @ 0026c360  game call sites=16
+  D3D_MakeRequestedSpace_4__LTCG_eax2                          @ 0026cdc0  game call sites=71
+  D3D_SetFence                                                 @ 0026c920  game call sites=1
+  Direct3D_CreateDevice                                        @ 0026c620  game call sites=1
+  Direct3D_EnumAdapterModes                                    @ 00277640  game call sites=4
+  Direct3D_GetAdapterModeCount                                 @ 00277580  game call sites=1
+  FUN_002690c0                                                 @ 002690c0  game call sites=1
+  FUN_002695f0                                                 @ 002695f0  game call sites=2
+  FUN_00269ac0                                                 @ 00269ac0  game call sites=1
+  FUN_00269b30                                                 @ 00269b30  game call sites=2
+  FUN_0026d6d0                                                 @ 0026d6d0  game call sites=1
+  FUN_0026eaf0                                                 @ 0026eaf0  game call sites=2
+  FUN_002709a0                                                 @ 002709a0  game call sites=7
+  FUN_00277490                                                 @ 00277490  game call sites=2
+  FUN_00277570                                                 @ 00277570  game call sites=1
+  Get2DSurfaceDesc_0__LTCG_edi1_ebx2_esi3                      @ 0026d630  game call sites=2
+
+Named SDK functions: reference counts
+  D3D      CDevice_FreeFrameBuffers_4 @ 00272730  refs=1
+  D3D      CDevice_InitializeFrameBuffers_4__LTCG_edi1 @ 00272940  refs=1
+  D3D      CDevice_KickOff_0__LTCG_edx1 @ 0026cf10  refs=5
+  D3D      CDevice_SetStateUP_0__LTCG_esi1 @ 00270bf0  refs=1
+  D3D      CDevice_SetStateVB_8 @ 00270a40  refs=3
+  D3D      CMiniport_GetDisplayCapabilities @ 002744c9  refs=2
+  D3D      CMiniport_InitHardware_4 @ 00272f35  refs=1
+  D3D      D3DCubeTexture_GetCubeMapSurface2 @ 0026c800  refs=5
+  D3D      D3DCubeTexture_LockRect @ 0026c850  refs=2
+  D3D      D3DDevice_BeginPush_4 @ 0026d110  refs=3
+  D3D      D3DDevice_Clear @ 00268880  refs=16
+  D3D      D3DDevice_CopyRects @ 0026a730  refs=1
+  D3D      D3DDevice_CreateTexture2 @ 0026c6d0  refs=1
+  D3D      D3DDevice_CreateVertexBuffer2 @ 0026c1e0  refs=1
+  D3D      D3DDevice_CreateVertexShader @ 00269480  refs=28
+  D3D      D3DDevice_DeletePixelShader @ 0026bce0  refs=1
+  D3D      D3DDevice_DeleteVertexShader @ 002695d0  refs=4
+  D3D      D3DDevice_DrawIndexedVertices @ 00269f10  refs=3
+  D3D      D3DDevice_DrawVertices @ 00269e40  refs=1
+  D3D      D3DDevice_DrawVerticesUP @ 00269c90  refs=2
+  D3D      D3DDevice_End @ 0026a1f0  refs=7
+  D3D      D3DDevice_EndPush @ 0026d170  refs=3
+  D3D      D3DDevice_GetDepthStencilSurface2 @ 0026aaa0  refs=1
+  D3D      D3DDevice_GetDisplayFieldStatus @ 0026b610  refs=1
+  D3D      D3DDevice_GetDisplayMode @ 0026a320  refs=1
+  D3D      D3DDevice_GetRenderTarget2 @ 0026aa60  refs=3
+  D3D      D3DDevice_GetViewportOffsetAndScale @ 0026e9c0  refs=3
+  D3D      D3DDevice_IsFencePending @ 0026d0f0  refs=3
+  D3D      D3DDevice_LightEnable @ 0026b210  refs=3
+  D3D      D3DDevice_LoadVertexShader_4__LTCG_eax1 @ 00268f80  refs=1
+  D3D      D3DDevice_MakeSpace @ 0026cf00  refs=6
+  D3D      D3DDevice_Release @ 0026b5d0  refs=1
+  D3D      D3DDevice_SelectVertexShader_0__LTCG_eax1_ebx2 @ 00269010  refs=1
+  D3D      D3DDevice_SetFlickerFilter_0__LTCG_esi1 @ 0026ba10  refs=1
+  D3D      D3DDevice_SetLight @ 0026ae50  refs=3
+  D3D      D3DDevice_SetMaterial @ 0026ae20  refs=2
+  D3D      D3DDevice_SetPalette @ 0026b530  refs=21
+  D3D      D3DDevice_SetPixelShader @ 0026bd00  refs=5
+  D3D      D3DDevice_SetPixelShaderConstant_4__LTCG_ecx1_eax3 @ 0026bf10  refs=12
+  D3D      D3DDevice_SetRenderStateNotInline @ 0026e5e0  refs=95
+  D3D      D3DDevice_SetRenderState_Dxt1NoiseEnable @ 0026e060  refs=2
+  D3D      D3DDevice_SetRenderState_FillMode @ 0026e460  refs=5
+  D3D      D3DDevice_SetRenderState_LineWidth @ 0026dff0  refs=1
+  D3D      D3DDevice_SetRenderState_NormalizeNormals @ 0026dd60  refs=3
+  D3D      D3DDevice_SetRenderState_PSTextureModes @ 0026e580  refs=2
+  D3D      D3DDevice_SetRenderState_Simple @ 0026e5b0  refs=18
+  D3D      D3DDevice_SetRenderState_StencilEnable @ 0026de50  refs=2
+  D3D      D3DDevice_SetRenderState_StencilFail @ 0026df00  refs=2
+  D3D      D3DDevice_SetRenderState_TextureFactor @ 0026df80  refs=4
+  D3D      D3DDevice_SetRenderState_ZEnable @ 0026ddb0  refs=2
+  D3D      D3DDevice_SetRenderTarget @ 0026a420  refs=30
+  D3D      D3DDevice_SetScissors @ 0026b720  refs=7
+  D3D      D3DDevice_SetStreamSource @ 00268de0  refs=16
+  D3D      D3DDevice_SetTexture @ 0026b370  refs=9
+  D3D      D3DDevice_SetTextureStageStateNotInline @ 0026e860  refs=67
+  D3D      D3DDevice_SetTextureState_BorderColor @ 0026e7c0  refs=1
+  D3D      D3DDevice_SetTextureState_BumpEnv @ 0026e750  refs=1
+  D3D      D3DDevice_SetTextureState_ColorKeyColor @ 0026e810  refs=1
+  D3D      D3DDevice_SetTextureState_TexCoordIndex @ 0026e640  refs=2
+  D3D      D3DDevice_SetTransform @ 0026aae0  refs=6
+  D3D      D3DDevice_SetVertexShader @ 00269710  refs=5
+  D3D      D3DDevice_SetVertexShaderConstant1 @ 00269880  refs=56
+  D3D      D3DDevice_SetVertexShaderConstant1Fast @ 002698e0  refs=5
+  D3D      D3DDevice_SetVertexShaderConstant4 @ 00269930  refs=26
+  D3D      D3DDevice_SetVertexShaderConstantNotInlineFast @ 002699e0  refs=7
+  D3D      D3DDevice_SetViewport @ 0026ac00  refs=6
+  D3D      D3DDevice_Swap @ 002773a0  refs=1
+  D3D      D3DPalette_Lock2 @ 0026c2c0  refs=2
+  D3D      D3DResource_AddRef @ 0026c470  refs=28
+  D3D      D3DResource_BlockUntilNotBusy @ 0026c610  refs=6
+  D3D      D3DResource_GetType_0__LTCG_ecx1 @ 0026c500  refs=2
+  D3D      D3DResource_Release @ 0026c4b0  refs=41
+  D3D      D3DSurface_GetDesc @ 00269bc0  refs=2
+  D3D      D3DSurface_LockRect @ 00269be0  refs=3
+  D3D      D3DTexture_GetSurfaceLevel2 @ 0026c780  refs=6
+  D3D      D3DTexture_LockRect @ 0026c7d0  refs=2
+  D3D      D3DVertexBuffer_Lock2 @ 0026c230  refs=8
+  D3D      D3D_BlockOnResource_0__LTCG_eax1 @ 0026d030  refs=3
+  D3D      D3D_BlockOnTime @ 0026cc10  refs=14
+  D3D      D3D_CommonSetDebugRegisters @ 0026eda0  refs=3
+  D3D      D3D_CommonSetMultiSampleModeAndScale_4__LTCG_eax1 @ 0026ee80  refs=3
+  D3D      D3D_DestroyResource_0__LTCG_edi1 @ 0026c360  refs=30
+  D3D      D3D_MakeRequestedSpace_4__LTCG_eax2 @ 0026cdc0  refs=161
+  D3D      D3D_SetFence @ 0026c920  refs=10
+  D3D      D3D_SetTileNoWait_0__LTCG_eax1_ecx2 @ 0026b650  refs=2
+  D3D      D3D_UpdateProjectionViewportTransform @ 0026f1a0  refs=3
+  D3D      Direct3D_CreateDevice @ 0026c620  refs=2
+  D3D      Direct3D_EnumAdapterModes @ 00277640  refs=5
+  D3D      Direct3D_GetAdapterModeCount @ 00277580  refs=2
+  D3D      Get2DSurfaceDesc_0__LTCG_edi1_ebx2_esi3 @ 0026d630  refs=3
+  D3D      Lock2DSurface_16__LTCG_esi4_eax5 @ 0026d910  refs=3
+  DSOUND   CDirectSound3DCalculator_Calculate3D @ 0021a553  refs=2
+  DSOUND   CDirectSound3DCalculator_GetVoiceData @ 00219074  refs=1
+  DSOUND   CDirectSoundBufferSettings_SetBufferData @ 0021a3f4  refs=4
+  DSOUND   CDirectSoundBuffer_GetCurrentPosition @ 00218c79  refs=1
+  DSOUND   CDirectSoundBuffer_GetStatus @ 00218ba3  refs=1
+  DSOUND   CDirectSoundBuffer_Play @ 00218aaa  refs=1
+  DSOUND   CDirectSoundBuffer_SetAllParameters @ 00219feb  refs=1
+  DSOUND   CDirectSoundBuffer_SetBufferData @ 0021a480  refs=1
+  DSOUND   CDirectSoundBuffer_SetCurrentPosition @ 00218cce  refs=1
+  DSOUND   CDirectSoundBuffer_SetFilter @ 00219403  refs=1
+  DSOUND   CDirectSoundBuffer_SetFormat @ 0021a793  refs=1
+  DSOUND   CDirectSoundBuffer_SetFrequency @ 00219f01  refs=1
+  DSOUND   CDirectSoundBuffer_SetHeadroom @ 00219451  refs=1
+  DSOUND   CDirectSoundBuffer_SetI3DL2Source @ 0021a093  refs=1
+  DSOUND   CDirectSoundBuffer_SetLoopRegion @ 00218bf4  refs=1
+  DSOUND   CDirectSoundBuffer_SetMixBinVolumes_8 @ 0021949f  refs=1
+  DSOUND   CDirectSoundBuffer_SetMixBins @ 00219f9d  refs=1
+  DSOUND   CDirectSoundBuffer_SetOutputBuffer @ 00219f4f  refs=1
+  DSOUND   CDirectSoundBuffer_SetPlayRegion @ 00219e66  refs=1
+  DSOUND   CDirectSoundBuffer_SetRolloffCurve @ 0021a03d  refs=1
+  DSOUND   CDirectSoundBuffer_SetVolume @ 002193b5  refs=1
+  DSOUND   CDirectSoundBuffer_Stop @ 00218afb  refs=1
+  DSOUND   CDirectSoundBuffer_StopEx @ 00218b4a  refs=1
+  DSOUND   CDirectSoundStream_Constructor @ 0021a52e  refs=1
+  DSOUND   CDirectSoundStream_FlushEx @ 0021900a  refs=1
+  DSOUND   CDirectSoundStream_Pause @ 00218fb9  refs=1
+  DSOUND   CDirectSoundStream_Process @ 00218f42  refs=1
+  DSOUND   CDirectSoundStream_SetHeadroom @ 0021953f  refs=1
+  DSOUND   CDirectSoundStream_SetMixBinVolumes_8 @ 00219591  refs=1
+  DSOUND   CDirectSoundStream_SetMixBins @ 0021a0e5  refs=1
+  DSOUND   CDirectSoundStream_SetVolume @ 002194ed  refs=1
+  DSOUND   CDirectSoundVoiceSettings_SetMixBinVolumes @ 002187df  refs=1
+  DSOUND   CDirectSoundVoice_CommitDeferredSettings @ 00218947  refs=4
+  DSOUND   CDirectSoundVoice_SetAllParameters @ 00219bca  refs=1
+  DSOUND   CDirectSoundVoice_SetFilter @ 002188f4  refs=1
+  DSOUND   CDirectSoundVoice_SetFormat @ 0021a3b0  refs=1
+  DSOUND   CDirectSoundVoice_SetFrequency @ 00219b35  refs=1
+  DSOUND   CDirectSoundVoice_SetHeadroom @ 00218907  refs=2
+  DSOUND   CDirectSoundVoice_SetI3DL2Source @ 00219d45  refs=1
+  DSOUND   CDirectSoundVoice_SetMixBinVolumes_8 @ 0021892a  refs=2
+  DSOUND   CDirectSoundVoice_SetMixBins @ 00219bad  refs=2
+  DSOUND   CDirectSoundVoice_SetOutputBuffer @ 00219b59  refs=1
+  DSOUND   CDirectSoundVoice_SetPitch @ 002188bf  refs=1
+  DSOUND   CDirectSoundVoice_SetRolloffCurve @ 00219d02  refs=1
+  DSOUND   CDirectSoundVoice_SetVolume @ 002188d8  refs=2
+  DSOUND   CDirectSound_CommitDeferredSettings @ 0021a8c8  refs=8
+  DSOUND   CDirectSound_CommitEffectData @ 00218551  refs=1
+  DSOUND   CDirectSound_CreateSoundBuffer @ 0021ad0c  refs=2
+  DSOUND   CDirectSound_CreateSoundStream @ 0021ada8  refs=1
+  DSOUND   CDirectSound_DoWork @ 00218693  refs=2
+  DSOUND   CDirectSound_DownloadEffectsImage @ 0021842c  refs=1
+  DSOUND   CDirectSound_EnableHeadphones @ 002186c4  refs=1
+  DSOUND   CDirectSound_GetEffectData @ 002184f2  refs=1
+  DSOUND   CDirectSound_GetOutputLevels @ 00218600  refs=5
+  DSOUND   CDirectSound_GetSpeakerConfig @ 002183df  refs=1
+  DSOUND   CDirectSound_SetDistanceFactor @ 0021ae39  refs=1
+  DSOUND   CDirectSound_SetDopplerFactor @ 0021ae98  refs=1
+  DSOUND   CDirectSound_SetEffectData @ 00218490  refs=1
+  DSOUND   CDirectSound_SetI3DL2Listener @ 0021b0c9  refs=1
+  DSOUND   CDirectSound_SetMixBinHeadroom @ 002185a1  refs=1
+  DSOUND   CDirectSound_SetOrientation @ 0021af56  refs=1
+  DSOUND   CDirectSound_SetPosition @ 0021afe3  refs=1
+  DSOUND   CDirectSound_SetRolloffFactor @ 0021aef7  refs=1
+  DSOUND   CDirectSound_SetVelocity @ 0021b056  refs=1
+  DSOUND   CDirectSound_SynchPlayback @ 00218646  refs=1
+  DSOUND   CHRTFSource_SetLightHRTF5Channel @ 0021be83  refs=1
+  DSOUND   CLightHRTFSource_GetCenterVolume @ 0021bda0  refs=0
+  DSOUND   CMcpxAPU_ServiceDeferredCommandsLow @ 0021c948  refs=1
+  DSOUND   CMcpxAPU_SetMixBinHeadroom_4 @ 0021ca27  refs=2
+  DSOUND   CMcpxAPU_SynchPlayback @ 0021cafd  refs=1
+  DSOUND   CMcpxBuffer_GetCurrentPosition @ 0022027e  refs=3
+  DSOUND   CMcpxBuffer_GetStatus @ 0022023c  refs=1
+  DSOUND   CMcpxBuffer_Pause @ 002201c9  refs=1
+  DSOUND   CMcpxBuffer_Play @ 00220688  refs=7
+  DSOUND   CMcpxBuffer_SetBufferData @ 0022094b  refs=1
+  DSOUND   CMcpxBuffer_SetCurrentPosition @ 00220831  refs=1
+  DSOUND   CMcpxBuffer_Stop @ 002207a1  refs=7
+  DSOUND   CMcpxBuffer_Stop_Ex @ 00220a0a  refs=1
+  DSOUND   CMcpxStream_Discontinuity @ 0021d8c4  refs=1
+  DSOUND   CMcpxStream_Flush @ 0021d9b4  refs=6
+  DSOUND   CMcpxStream_GetStatus @ 0021d347  refs=2
+  DSOUND   CMcpxStream_Pause @ 0021de2a  refs=2
+  DSOUND   CMcpxStream_Stop @ 0021d2d5  refs=3
+  DSOUND   CMcpxStream_Stop_Ex @ 0021d786  refs=1
+  DSOUND   CMcpxVoiceClient_Commit3dSettings_0 @ 0021f998  refs=2
+  DSOUND   CMcpxVoiceClient_SetFilter @ 0021f205  refs=2
+  DSOUND   CMcpxVoiceClient_SetMixBins @ 0021f589  refs=2
+  DSOUND   CMcpxVoiceClient_SetPitch @ 0021f6e2  refs=4
+  DSOUND   CMcpxVoiceClient_SetVolume @ 0021f64a  refs=4
+  DSOUND   DSound_CMemoryManager_PoolAlloc @ 0021b594  refs=2
+  DSOUND   DSound_CRefCount_Release @ 0021808a  refs=14
+  DSOUND   DirectSoundCreate @ 0021b4f6  refs=3
+  DSOUND   DirectSoundCreateStream @ 0021b53d  refs=2
+  DSOUND   DirectSoundDoWork @ 00219877  refs=5
+  DSOUND   DirectSoundEnterCriticalSection @ 002181fe  refs=59
+  DSOUND   DirectSoundUseLightHRTF @ 002182b6  refs=2
+  DSOUND   IDirectSoundBuffer_GetCurrentPosition @ 0021980f  refs=2
+  DSOUND   IDirectSoundBuffer_GetStatus @ 002197f3  refs=4
+  DSOUND   IDirectSoundBuffer_Play @ 00219773  refs=3
+  DSOUND   IDirectSoundBuffer_Release @ 002182a0  refs=7
+  DSOUND   IDirectSoundBuffer_SetAllParameters @ 0021a18b  refs=2
+  DSOUND   IDirectSoundBuffer_SetBufferData @ 0021a7fd  refs=3
+  DSOUND   IDirectSoundBuffer_SetCurrentPosition @ 0021982f  refs=3
+  DSOUND   IDirectSoundBuffer_SetFilter @ 0021971f  refs=2
+  DSOUND   IDirectSoundBuffer_SetFormat @ 0021a7e1  refs=2
+  DSOUND   IDirectSoundBuffer_SetFrequency @ 0021a137  refs=2
+  DSOUND   IDirectSoundBuffer_SetHeadroom @ 0021973b  refs=3
+  DSOUND   IDirectSoundBuffer_SetI3DL2Source @ 0021a1cf  refs=2
+  DSOUND   IDirectSoundBuffer_SetLoopRegion @ 002197d3  refs=2
+  DSOUND   IDirectSoundBuffer_SetMixBinVolumes_8 @ 00219757  refs=5
+  DSOUND   IDirectSoundBuffer_SetMixBins @ 0021a16f  refs=3
+  DSOUND   IDirectSoundBuffer_SetOutputBuffer @ 0021a153  refs=2
+  DSOUND   IDirectSoundBuffer_SetPlayRegion @ 0021a1ef  refs=2
+  DSOUND   IDirectSoundBuffer_SetRolloffCurve @ 0021a1ab  refs=2
+  DSOUND   IDirectSoundBuffer_SetVolume @ 00219703  refs=2
+  DSOUND   IDirectSoundBuffer_Stop @ 00219797  refs=2
+  DSOUND   IDirectSoundBuffer_StopEx @ 002197af  refs=3
+  DSOUND   IDirectSoundStream_FlushEx @ 0021985f  refs=4
+  DSOUND   IDirectSoundStream_Pause @ 0021985a  refs=5
+  DSOUND   IDirectSoundStream_SetHeadroom @ 00219850  refs=2
+  DSOUND   IDirectSoundStream_SetMixBinVolumes_8 @ 00219855  refs=2
+  DSOUND   IDirectSoundStream_SetMixBins @ 0021a20f  refs=2
+  DSOUND   IDirectSoundStream_SetVolume @ 0021984b  refs=3
+  DSOUND   IDirectSound_CommitDeferredSettings @ 0021acf4  refs=2
+  DSOUND   IDirectSound_CreateSoundBuffer @ 0021b1ec  refs=3
+  DSOUND   IDirectSound_DownloadEffectsImage @ 002195ff  refs=2
+  DSOUND   IDirectSound_EnableHeadphones @ 0021968f  refs=2
+  DSOUND   IDirectSound_GetEffectData @ 00219626  refs=2
+  DSOUND   IDirectSound_GetOutputLevels @ 002196cb  refs=2
+  DSOUND   IDirectSound_GetSpeakerConfig @ 002195e3  refs=2
+  DSOUND   IDirectSound_Release @ 0021828a  refs=3
+  DSOUND   IDirectSound_SetDopplerFactor @ 0021b234  refs=2
+  DSOUND   IDirectSound_SetEffectData @ 0021964d  refs=2
+  DSOUND   IDirectSound_SetMixBinHeadroom @ 002196ab  refs=2
+  DSOUND   IDirectSound_SetOrientation @ 0021b258  refs=2
+  DSOUND   IDirectSound_SetPosition @ 0021b2a2  refs=1
+  DSOUND   IDirectSound_SetVelocity @ 0021b2fb  refs=2
+  DSOUND   IDirectSound_SynchPlayback @ 002196eb  refs=2
+  DSOUND   XAudioCalculatePitch @ 002182d5  refs=3
+  WMADEC   WmaCreateDecoder @ 002262cd  refs=2
+  WMADEC   WmaCreateDecoderEx @ 00226343  refs=2
+  WMADEC   XWmaDecoderCreateMediaObject @ 00226271  refs=2
+  XGRPH    XGSetPaletteHeader @ 00266abd  refs=2
+  XGRPH    XGSetTextureHeader @ 00266a93  refs=2
+  XGRPH    XGSwizzleRect @ 00267200  refs=2
+  XGRPH    XGUnswizzleRect @ 00267960  refs=2
+  XMV      XMVDecoder_CloseDecoder @ 0023f191  refs=2
+  XMV      XMVDecoder_CreateDecoderForFile @ 0023ec4d  refs=2
+  XMV      XMVDecoder_CreateDecoderForPackets @ 0023ee7a  refs=2
+  XMV      XMVDecoder_GetNextFrame @ 0023f45c  refs=2
+  XMV      XMVDecoder_GetVideoDescriptor @ 0023f275  refs=2
+  XMV      XMVDecoder_TerminateImmediately @ 0023f291  refs=2
+  XPP      GetTypeInformation @ 0027ded5  refs=1
+  XPP      GetTypeInformation2 @ 0027de9e  refs=3
+  XPP      IUsbInit_GetMaxDeviceTypeCount @ 0027d5c5  refs=1
+  XPP      XGetDeviceChanges @ 0027dd29  refs=2
+  XPP      XID_fCloseDevice @ 0027e818  refs=2
+  XPP      XInitDevices @ 0027d058  refs=1
+  XPP      XInitDevices @ 0027dd24  refs=2
+  XPP      XInputClose @ 0027ddec  refs=2
+  XPP      XInputGetState @ 0027ddf8  refs=2
+  XPP      XInputOpen @ 0027dd96  refs=2
+  XPP      XInputSetState @ 0027de6b  refs=4
+  XPP      thunk_FUN_0027fb80 @ 0027fce6  refs=4

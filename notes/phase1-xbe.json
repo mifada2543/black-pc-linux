@@ -1,0 +1,668 @@
+{
+ "kind": "retail",
+ "base": 65536,
+ "entry": 154175,
+ "thunk": 2633696,
+ "image_size": 5732928,
+ "timedate": 1136830943,
+ "certificate": {
+  "size": 492,
+  "timedate": 1138078894,
+  "title_id": 1161887875,
+  "title": "Black",
+  "allowed_media": 514,
+  "region": 1,
+  "region_names": [
+   "NA"
+  ],
+  "ratings": 2,
+  "disk_number": 0,
+  "version": 2
+ },
+ "sections": [
+  {
+   "index": 0,
+   "name": ".text",
+   "flags": 22,
+   "vaddr": 69632,
+   "vsize": 2125740,
+   "raw_addr": 4096,
+   "raw_size": 2125740
+  },
+  {
+   "index": 1,
+   "name": "DSOUND",
+   "flags": 7,
+   "vaddr": 2195392,
+   "vsize": 52980,
+   "raw_addr": 2129920,
+   "raw_size": 52356
+  },
+  {
+   "index": 2,
+   "name": "WMADEC",
+   "flags": 7,
+   "vaddr": 2248384,
+   "vsize": 105580,
+   "raw_addr": 2183168,
+   "raw_size": 105580
+  },
+  {
+   "index": 3,
+   "name": "XMV",
+   "flags": 7,
+   "vaddr": 2353984,
+   "vsize": 163124,
+   "raw_addr": 2289664,
+   "raw_size": 163108
+  },
+  {
+   "index": 4,
+   "name": "XGRPH",
+   "flags": 7,
+   "vaddr": 2517120,
+   "vsize": 8188,
+   "raw_addr": 2453504,
+   "raw_size": 8188
+  },
+  {
+   "index": 5,
+   "name": "D3D",
+   "flags": 7,
+   "vaddr": 2525312,
+   "vsize": 83592,
+   "raw_addr": 2461696,
+   "raw_size": 69052
+  },
+  {
+   "index": 6,
+   "name": "XPP",
+   "flags": 7,
+   "vaddr": 2608928,
+   "vsize": 24760,
+   "raw_addr": 2531328,
+   "raw_size": 24760
+  },
+  {
+   "index": 7,
+   "name": ".rdata",
+   "flags": 6,
+   "vaddr": 2633696,
+   "vsize": 79080,
+   "raw_addr": 2560000,
+   "raw_size": 79064
+  },
+  {
+   "index": 8,
+   "name": ".data",
+   "flags": 7,
+   "vaddr": 2712800,
+   "vsize": 3040696,
+   "raw_addr": 2641920,
+   "raw_size": 115280
+  },
+  {
+   "index": 9,
+   "name": "DOLBY",
+   "flags": 38,
+   "vaddr": 5753504,
+   "vsize": 29056,
+   "raw_addr": 2760704,
+   "raw_size": 29036
+  },
+  {
+   "index": 10,
+   "name": "$$XTIMAGE",
+   "flags": 56,
+   "vaddr": 5782560,
+   "vsize": 10240,
+   "raw_addr": 2793472,
+   "raw_size": 10240
+  },
+  {
+   "index": 11,
+   "name": "$$XSIMAGE",
+   "flags": 56,
+   "vaddr": 5792800,
+   "vsize": 4096,
+   "raw_addr": 2805760,
+   "raw_size": 4096
+  },
+  {
+   "index": 12,
+   "name": ".XTLID",
+   "flags": 56,
+   "vaddr": 5796896,
+   "vsize": 1544,
+   "raw_addr": 2809856,
+   "raw_size": 1544
+  }
+ ],
+ "tls": {
+  "data_start": 0,
+  "data_end": 0,
+  "index_addr": 2828280,
+  "callbacks": 0,
+  "zero_fill": 144
+ },
+ "libraries": [
+  {
+   "name": "XAPILIB",
+   "version": "1.0.5849",
+   "flags": 16385,
+   "approved": 2,
+   "qfe": 1
+  },
+  {
+   "name": "DSOUND",
+   "version": "1.0.5849",
+   "flags": 16395,
+   "approved": 2,
+   "qfe": 11
+  },
+  {
+   "name": "XBOXKRNL",
+   "version": "1.0.5849",
+   "flags": 16385,
+   "approved": 2,
+   "qfe": 1
+  },
+  {
+   "name": "XMV",
+   "version": "1.0.5849",
+   "flags": 16385,
+   "approved": 2,
+   "qfe": 1
+  },
+  {
+   "name": "LIBCMT",
+   "version": "1.0.5849",
+   "flags": 16385,
+   "approved": 2,
+   "qfe": 1
+  },
+  {
+   "name": "LIBCPMT",
+   "version": "1.0.5849",
+   "flags": 16385,
+   "approved": 2,
+   "qfe": 1
+  },
+  {
+   "name": "D3D8LTCG",
+   "version": "1.0.5849",
+   "flags": 16399,
+   "approved": 2,
+   "qfe": 15
+  },
+  {
+   "name": "XGRAPHCL",
+   "version": "1.0.5849",
+   "flags": 16393,
+   "approved": 2,
+   "qfe": 9
+  }
+ ],
+ "kernel_imports": [
+  {
+   "ordinal": 187,
+   "name": "NtClose"
+  },
+  {
+   "ordinal": 218,
+   "name": "NtQueryVolumeInformationFile"
+  },
+  {
+   "ordinal": 202,
+   "name": "NtOpenFile"
+  },
+  {
+   "ordinal": 289,
+   "name": "RtlInitAnsiString"
+  },
+  {
+   "ordinal": 236,
+   "name": "NtWriteFile"
+  },
+  {
+   "ordinal": 40,
+   "name": "HalDiskCachePartitionCount"
+  },
+  {
+   "ordinal": 219,
+   "name": "NtReadFile"
+  },
+  {
+   "ordinal": 67,
+   "name": "IoCreateSymbolicLink"
+  },
+  {
+   "ordinal": 215,
+   "name": "NtQuerySymbolicLinkObject"
+  },
+  {
+   "ordinal": 203,
+   "name": "NtOpenSymbolicLinkObject"
+  },
+  {
+   "ordinal": 69,
+   "name": "IoDeleteSymbolicLink"
+  },
+  {
+   "ordinal": 301,
+   "name": "RtlNtStatusToDosError"
+  },
+  {
+   "ordinal": 200,
+   "name": "NtFsControlFile"
+  },
+  {
+   "ordinal": 24,
+   "name": "ExQueryNonVolatileSetting"
+  },
+  {
+   "ordinal": 166,
+   "name": "MmAllocateContiguousMemoryEx"
+  },
+  {
+   "ordinal": 180,
+   "name": "MmQueryAllocationSize"
+  },
+  {
+   "ordinal": 182,
+   "name": "MmSetAddressProtect"
+  },
+  {
+   "ordinal": 171,
+   "name": "MmFreeContiguousMemory"
+  },
+  {
+   "ordinal": 179,
+   "name": "MmQueryAddressProtect"
+  },
+  {
+   "ordinal": 178,
+   "name": "MmPersistContiguousMemory"
+  },
+  {
+   "ordinal": 165,
+   "name": "MmAllocateContiguousMemory"
+  },
+  {
+   "ordinal": 164,
+   "name": "LaunchDataPage"
+  },
+  {
+   "ordinal": 49,
+   "name": "HalReturnToFirmware"
+  },
+  {
+   "ordinal": 189,
+   "name": "NtCreateEvent"
+  },
+  {
+   "ordinal": 16,
+   "name": "ExEventObjectType"
+  },
+  {
+   "ordinal": 225,
+   "name": "NtSetEvent"
+  },
+  {
+   "ordinal": 193,
+   "name": "NtCreateSemaphore"
+  },
+  {
+   "ordinal": 222,
+   "name": "NtReleaseSemaphore"
+  },
+  {
+   "ordinal": 234,
+   "name": "NtWaitForSingleObjectEx"
+  },
+  {
+   "ordinal": 99,
+   "name": "KeDelayExecutionThread"
+  },
+  {
+   "ordinal": 336,
+   "name": "XcSHAUpdate"
+  },
+  {
+   "ordinal": 335,
+   "name": "XcSHAInit"
+  },
+  {
+   "ordinal": 337,
+   "name": "XcSHAFinal"
+  },
+  {
+   "ordinal": 323,
+   "name": "XboxHDKey"
+  },
+  {
+   "ordinal": 325,
+   "name": "XboxSignatureKey"
+  },
+  {
+   "ordinal": 354,
+   "name": "XboxAlternateSignatureKeys"
+  },
+  {
+   "ordinal": 128,
+   "name": "KeQuerySystemTime"
+  },
+  {
+   "ordinal": 356,
+   "name": "HalBootSMCVideoMode"
+  },
+  {
+   "ordinal": 190,
+   "name": "NtCreateFile"
+  },
+  {
+   "ordinal": 226,
+   "name": "NtSetInformationFile"
+  },
+  {
+   "ordinal": 211,
+   "name": "NtQueryInformationFile"
+  },
+  {
+   "ordinal": 233,
+   "name": "NtWaitForSingleObject"
+  },
+  {
+   "ordinal": 198,
+   "name": "NtFlushBuffersFile"
+  },
+  {
+   "ordinal": 196,
+   "name": "NtDeviceIoControlFile"
+  },
+  {
+   "ordinal": 250,
+   "name": "ObfDereferenceObject"
+  },
+  {
+   "ordinal": 246,
+   "name": "ObReferenceObjectByHandle"
+  },
+  {
+   "ordinal": 71,
+   "name": "IoFileObjectType"
+  },
+  {
+   "ordinal": 161,
+   "name": "KfLowerIrql"
+  },
+  {
+   "ordinal": 129,
+   "name": "KeRaiseIrqlToDpcLevel"
+  },
+  {
+   "ordinal": 305,
+   "name": "RtlTimeToTimeFields"
+  },
+  {
+   "ordinal": 304,
+   "name": "RtlTimeFieldsToTime"
+  },
+  {
+   "ordinal": 210,
+   "name": "NtQueryFullAttributesFile"
+  },
+  {
+   "ordinal": 207,
+   "name": "NtQueryDirectoryFile"
+  },
+  {
+   "ordinal": 260,
+   "name": "RtlAnsiStringToUnicodeString"
+  },
+  {
+   "ordinal": 308,
+   "name": "RtlUnicodeStringToAnsiString"
+  },
+  {
+   "ordinal": 294,
+   "name": "RtlLeaveCriticalSection"
+  },
+  {
+   "ordinal": 277,
+   "name": "RtlEnterCriticalSection"
+  },
+  {
+   "ordinal": 143,
+   "name": "KeSetBasePriorityThread"
+  },
+  {
+   "ordinal": 259,
+   "name": "PsThreadObjectType"
+  },
+  {
+   "ordinal": 124,
+   "name": "KeQueryBasePriorityThread"
+  },
+  {
+   "ordinal": 231,
+   "name": "NtSuspendThread"
+  },
+  {
+   "ordinal": 224,
+   "name": "NtResumeThread"
+  },
+  {
+   "ordinal": 302,
+   "name": "RtlRaiseException"
+  },
+  {
+   "ordinal": 238,
+   "name": "NtYieldExecution"
+  },
+  {
+   "ordinal": 258,
+   "name": "PsTerminateSystemThread"
+  },
+  {
+   "ordinal": 255,
+   "name": "PsCreateSystemThreadEx"
+  },
+  {
+   "ordinal": 197,
+   "name": "NtDuplicateObject"
+  },
+  {
+   "ordinal": 322,
+   "name": "XboxHardwareInfo"
+  },
+  {
+   "ordinal": 47,
+   "name": "HalRegisterShutdownNotification"
+  },
+  {
+   "ordinal": 326,
+   "name": "XeImageFileName"
+  },
+  {
+   "ordinal": 113,
+   "name": "KeInitializeTimerEx"
+  },
+  {
+   "ordinal": 149,
+   "name": "KeSetTimer"
+  },
+  {
+   "ordinal": 97,
+   "name": "KeCancelTimer"
+  },
+  {
+   "ordinal": 145,
+   "name": "KeSetEvent"
+  },
+  {
+   "ordinal": 159,
+   "name": "KeWaitForSingleObject"
+  },
+  {
+   "ordinal": 107,
+   "name": "KeInitializeDpc"
+  },
+  {
+   "ordinal": 324,
+   "name": "XboxKrnlVersion"
+  },
+  {
+   "ordinal": 279,
+   "name": "RtlEqualString"
+  },
+  {
+   "ordinal": 327,
+   "name": "XeLoadSection"
+  },
+  {
+   "ordinal": 328,
+   "name": "XeUnloadSection"
+  },
+  {
+   "ordinal": 199,
+   "name": "NtFreeVirtualMemory"
+  },
+  {
+   "ordinal": 184,
+   "name": "NtAllocateVirtualMemory"
+  },
+  {
+   "ordinal": 269,
+   "name": "RtlCompareMemoryUlong"
+  },
+  {
+   "ordinal": 291,
+   "name": "RtlInitializeCriticalSection"
+  },
+  {
+   "ordinal": 217,
+   "name": "NtQueryVirtualMemory"
+  },
+  {
+   "ordinal": 360,
+   "name": "HalInitiateShutdown"
+  },
+  {
+   "ordinal": 357,
+   "name": "IdexChannelObject"
+  },
+  {
+   "ordinal": 340,
+   "name": "XcHMAC"
+  },
+  {
+   "ordinal": 44,
+   "name": "HalGetInterruptVector"
+  },
+  {
+   "ordinal": 160,
+   "name": "KfRaiseIrql"
+  },
+  {
+   "ordinal": 98,
+   "name": "KeConnectInterrupt"
+  },
+  {
+   "ordinal": 109,
+   "name": "KeInitializeInterrupt"
+  },
+  {
+   "ordinal": 151,
+   "name": "KeStallExecutionProcessor"
+  },
+  {
+   "ordinal": 15,
+   "name": "ExAllocatePoolWithTag"
+  },
+  {
+   "ordinal": 17,
+   "name": "ExFreePool"
+  },
+  {
+   "ordinal": 173,
+   "name": "MmGetPhysicalAddress"
+  },
+  {
+   "ordinal": 175,
+   "name": "MmLockUnlockBufferPages"
+  },
+  {
+   "ordinal": 119,
+   "name": "KeInsertQueueDpc"
+  },
+  {
+   "ordinal": 176,
+   "name": "MmLockUnlockPhysicalPage"
+  },
+  {
+   "ordinal": 1,
+   "name": "AvGetSavedDataAddress"
+  },
+  {
+   "ordinal": 2,
+   "name": "AvSendTVEncoderOption"
+  },
+  {
+   "ordinal": 4,
+   "name": "AvSetSavedDataAddress"
+  },
+  {
+   "ordinal": 3,
+   "name": "AvSetDisplayMode"
+  },
+  {
+   "ordinal": 100,
+   "name": "KeDisconnectInterrupt"
+  },
+  {
+   "ordinal": 46,
+   "name": "HalReadWritePCISpace"
+  },
+  {
+   "ordinal": 168,
+   "name": "MmClaimGpuInstanceMemory"
+  },
+  {
+   "ordinal": 8,
+   "name": "DbgPrint"
+  },
+  {
+   "ordinal": 142,
+   "name": "KeSaveFloatingPointState"
+  },
+  {
+   "ordinal": 139,
+   "name": "KeRestoreFloatingPointState"
+  },
+  {
+   "ordinal": 23,
+   "name": "ExQueryPoolBlockSize"
+  },
+  {
+   "ordinal": 137,
+   "name": "KeRemoveQueueDpc"
+  },
+  {
+   "ordinal": 153,
+   "name": "KeSynchronizeExecution"
+  },
+  {
+   "ordinal": 312,
+   "name": "RtlUnwind"
+  },
+  {
+   "ordinal": 95,
+   "name": "KeBugCheck"
+  },
+  {
+   "ordinal": 87,
+   "name": "IofCompleteRequest"
+  }
+ ]
+}

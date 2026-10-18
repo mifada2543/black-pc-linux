@@ -18,6 +18,47 @@ if(UNIX)
   if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "The loader must be 32-bit: configure with -DCMAKE_CXX_FLAGS=-m32 (the 'linux' preset does this).")
   endif()
+  # ---- the window: SDL2, i386 ----
+  #
+  # Found by path rather than by pkg-config, because pkg-config on this machine answers with the amd64
+  # package: a 64-bit libSDL2 is invisible to a 32-bit process, and the failure that comes from that is a
+  # link error about SDL_Init in a build that "found" the library.
+  #
+  # Not required. The kernel layer, the D3D8 ABI and the two dozen tests that have nothing to do with
+  # windows all build without it; only --window and the window test need it, and window_stub.cpp refuses
+  # them by name when it is absent. That is the same trade the glslang block below makes, for the same
+  # reason: a machine missing one package should still be able to run the suites that do not need it.
+  find_path(SDL2_INCLUDE_DIR SDL.h
+            PATHS /usr/include/SDL2 /usr/include/i386-linux-gnu/SDL2
+            NO_CMAKE_FIND_ROOT_PATH)
+  find_library(SDL2_LIBRARY NAMES SDL2 SDL2-2.0
+               PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib
+               NO_CMAKE_FIND_ROOT_PATH)
+  # find_library caches, so a package that is removed since the last configure leaves the path behind and
+  # the build goes on believing in a file that is no longer there -- and then fails to link with a message
+  # about SDL_Init. Re-checking the file is one line.
+  if(SDL2_LIBRARY AND NOT EXISTS "${SDL2_LIBRARY}")
+    message(STATUS "the SDL2 library was removed since the last configure -- not using the cached path")
+    unset(SDL2_LIBRARY CACHE)
+  endif()
+  if(SDL2_INCLUDE_DIR AND SDL2_LIBRARY)
+    message(STATUS "SDL2 ${SDL2_LIBRARY} -- the window path will be built")
+    set(BLACKLINUX_WINDOW_SRC src/platform/posix/window.cpp src/platform/posix/timing.cpp)
+    add_library(blacklinux_sdl INTERFACE)
+    target_include_directories(blacklinux_sdl INTERFACE ${SDL2_INCLUDE_DIR})
+    target_link_libraries(blacklinux_sdl INTERFACE ${SDL2_LIBRARY} ${CMAKE_DL_LIBS})
+    # The whole block below is appended in one piece so that the source list and the link libraries cannot
+    # disagree about whether the window exists.
+    set(BLACKLINUX_SDL_TARGET blacklinux_sdl)
+  else()
+    message(WARNING
+      "libsdl2-dev:i386 was not found, so the window path is disabled and --window refuses by name.\n"
+      "  Install it with:  sudo apt install libsdl2-dev:i386\n"
+      "  The x86-64 package does not help: this loader is a 32-bit process.\n"
+      "  Everything else here builds and tests without it.")
+    set(BLACKLINUX_WINDOW_SRC src/platform/posix/window_stub.cpp)
+    set(BLACKLINUX_SDL_TARGET "")
+  endif()
   add_library(blackcore STATIC
     src/platform/posix/teb.cpp
     src/platform/posix/seh.cpp
@@ -28,6 +69,7 @@ if(UNIX)
     src/platform/posix/xsync.cpp
     src/platform/posix/log.cpp
     src/platform/posix/boot.cpp
+    ${BLACKLINUX_WINDOW_SRC}
     src/kernel/ktable_posix.cpp
     src/kernel/k_memory_posix.cpp
     src/kernel/k_misc_posix.cpp
@@ -55,6 +97,10 @@ if(UNIX)
   target_compile_definitions(blackcore PUBLIC _FILE_OFFSET_BITS=64)
   target_compile_options(blackcore PRIVATE -Wall -Wextra -Wno-unused-parameter)
   target_link_libraries(blackcore PUBLIC pthread)
+  # Only when SDL2 was found; empty otherwise, which is what the stub was written for.
+  if(BLACKLINUX_SDL_TARGET)
+    target_link_libraries(blackcore PUBLIC ${BLACKLINUX_SDL_TARGET})
+  endif()
   # ---- graphics: the Vulkan device the D3D8 layer will draw with, and the PNG writer ----
   #
   # Vulkan is found from the i386 development package, so the loader links the same 32-bit loader the game
@@ -198,7 +244,7 @@ if(UNIX)
   endif()
   # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
   # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).
-  add_executable(blacklinux src/platform/posix/main.cpp src/platform/posix/doctor.cpp)
+  add_executable(blacklinux src/platform/posix/main.cpp src/platform/posix/doctor.cpp src/platform/posix/window.cpp)
   target_link_libraries(blacklinux PRIVATE blackcore)
   # Platform layer tests. These need no XBE: they exercise the TEB anchor, the fs->gs patcher and the
   # SEH chain directly.
@@ -284,6 +330,11 @@ if(UNIX)
     add_executable(test_draw_posix tests/test_draw_posix.cpp)
     target_link_libraries(test_draw_posix PRIVATE blackcore)
     add_test(NAME draw_posix COMMAND test_draw_posix)
+
+    add_executable(test_device_gpu tests/test_device_gpu.cpp)
+    target_link_libraries(test_device_gpu PRIVATE blackcore)
+    add_test(NAME device_gpu COMMAND test_device_gpu)
+    set_tests_properties(device_gpu PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
   else()
     message(STATUS "libglslang absent -- the shader runtime test is not registered")
   endif()
@@ -331,6 +382,12 @@ if(UNIX)
   add_executable(test_exit tests/test_exit.cpp)
   target_link_libraries(test_exit PRIVATE blackcore)
   add_test(NAME exit COMMAND test_exit)
+  # The window and the present path: a real SDL2 window, a real surface, a real swapchain, and frames that
+  # are acquired, cleared, submitted and presented -- then the same again after a resize, with the pixels
+  # of the presented drawable read back where the surface allows it. Labelled `gpu` with 77 as the skip
+  # code because every one of those needs a display and a Vulkan device, and a machine without either has
+  # to record "skipped" rather than fail. Needs no XBE, which is the point: this is the path that can be
+  # finished before the image arrives.
   # Not a test: writes the same synthetic image to a file, so the program itself can be run against it.
   add_executable(fixture_dump tests/fixture_dump.cpp)
   target_link_libraries(fixture_dump PRIVATE blackcore)

@@ -11,6 +11,7 @@
 //     --xbe <path>    the XBE to run          (default game/default.xbe)
 //     --log <path>    where to write the log  (default blacklinux.log)
 //     --probe         prepare, enter the entry point, wait up to --timeout, then exit
+//     --window        open a window and present frames into it, then exit (no XBE needed)
 //     --info          parse and print the image, then exit without mapping anything
 //     --timeout <s>   seconds before --probe gives up and reports where the boot thread is
 //     --trace         every stub call and every detail line on the console as well as in the log
@@ -20,12 +21,17 @@
 // What it does not do yet, and says so at boot time: no kernel memory allocation, no TLS slots for the
 // boot thread, no DPC/timer thread, no graphics. The first kernel calls the game makes are logged as
 // stubs, which is exactly the list that says what to implement next.
+#include "d3d/device_posix.h"
 #include "kernel/ktable_posix.h"
 #include "platform/posix/boot.h"
 #include "platform/posix/doctor.h"
 
 #include "platform/posix/log.h"
+#include "platform/posix/window.h"
+#include "platform/posix/timing.h"
+#include "gfx/gfx_vulkan.h"
 
+#include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -41,12 +47,19 @@ struct Options {
     std::string hdd;
     bool doctor = false;
     bool probe = false;
+    bool window = false;
     bool info = false;
     bool trace = false;
     bool strict = false;
     bool help = false;
     bool version = false;
     uint32_t timeout_s = 15;
+    // --window's frame budget and size. The size defaults to whatever the device state says the back
+    // buffer is (640x480 until the game asks for something else), which is the same number GetDisplayMode
+    // reports and therefore the same number the game sizes its back buffer from.
+    uint32_t frames = 60;
+    uint32_t window_width = 0;
+    uint32_t window_height = 0;
 };
 
 void usage()
@@ -60,11 +73,33 @@ void usage()
             "  --doctor        report what this machine can and cannot do, then exit\n"
             "  --probe         enter the entry point, wait --timeout seconds, then report how far it got\n"
             "                  (set BLACKLINUX_TRACE=1 to record which D3D entries it called)\n"
+            "  --window        open a window, present --frames frames into it, then exit\n"
+            "  --frames <n>    frames to present in --window mode (default 60)\n"
+            "  --size <WxH>    window size for --window (default: the back buffer the game asked for)\n"
             "  --info          print the image and exit without mapping it\n"
             "  --timeout <s>   --probe timeout in seconds (default 15)\n"
             "  --trace         detail lines and every stub call on the console too\n"
             "  --strict        an unimplemented kernel call is fatal instead of logged\n"
             "  --version, --help\n");
+}
+
+// "1920x1080". Returns false on anything else, having said why. Written out rather than with sscanf
+// because sscanf("1920x1080", "%ux%u") also accepts "1920xyz1080", and a size that came out as 1920 and 0
+// is a window of nothing.
+bool parse_size(const char *text, uint32_t &w, uint32_t &h)
+{
+    const char *x = strchr(text, 'x');
+    if (!x || x == text) {
+        fprintf(stderr, "blacklinux: --size wants WxH, e.g. 1280x720 (got '%s')\n", text);
+        return false;
+    }
+    w = (uint32_t)atoi(text);
+    h = (uint32_t)atoi(x + 1);
+    if (w < 1 || h < 1) {
+        fprintf(stderr, "blacklinux: --size wants two numbers above zero (got '%s')\n", text);
+        return false;
+    }
+    return true;
 }
 
 // Returns false on a bad argument, having said why.
@@ -99,6 +134,16 @@ bool parse_args(int argc, char **argv, Options &o)
             o.doctor = true;
         } else if (!strcmp(a, "--probe")) {
             o.probe = true;
+        } else if (!strcmp(a, "--window")) {
+            o.window = true;
+        } else if (!strcmp(a, "--frames")) {
+            const char *v = need("--frames");
+            if (!v) return false;
+            o.frames = (uint32_t)atoi(v);
+        } else if (!strcmp(a, "--size")) {
+            const char *v = need("--size");
+            if (!v) return false;
+            if (!parse_size(v, o.window_width, o.window_height)) return false;
         } else if (!strcmp(a, "--info")) {
             o.info = true;
         } else if (!strcmp(a, "--trace")) {
@@ -117,6 +162,85 @@ bool parse_args(int argc, char **argv, Options &o)
     return true;
 }
 
+// --window: open a window, present frames into it, exit. This is the whole window path with nothing drawn
+// in it but a colour that changes, and it is here because the game image is not on this machine yet: the
+// present path is finished long before the D3D8 layer is, and "finished" has to mean more than "compiles".
+//
+// The size comes from the device state -- the same display_width/display_height that GetDisplayMode
+// reports to the game, which is what the game then sizes its back buffer from. Using it here means the
+// window is the size the game will draw into rather than a size picked for this mode, and --size overrides
+// it for looking at something else.
+int run_window(const Options &o)
+{
+    const uint32_t want_w = o.window_width ? o.window_width : xd3d::state().display_width;
+    const uint32_t want_h = o.window_height ? o.window_height : xd3d::state().display_height;
+    logc("window: asked for %ux%u, %u frame(s)", want_w, want_h, o.frames);
+
+    if (!platform::window_open(want_w, want_h, "BLACK")) {
+        // A refusal here is not a crash and not a bug report: it is a machine with no display, no Vulkan
+        // device, or no SDL2, and the sentence names which. Exit 1 because --window was asked for.
+        logc("window: %s", platform::window_last_error());
+        fprintf(stderr, "blacklinux: %s\n", platform::window_last_error());
+        return 1;
+    }
+    // The surface creator was registered in window_open, now initialise gfx (which creates the surface)
+    logc("window: calling gfx::init()...");
+    if (!gfx::init()) {
+        logc("window: gfx::init failed: %s", gfx::last_error());
+        logc("window: gfx::init failed: %s", gfx::last_error());
+        platform::window_close();
+        return 1;
+    }
+    logc("window: gfx::init() succeeded");
+    // swapchain info will be logged after first frame begins
+
+    // Initialise timing: Xbox 59.94 Hz vblank, 733 MHz counter, CPU pinning.
+    if (!platform::timing_init()) {
+        logc("window: timing init failed (non-fatal, continuing)");
+    } else {
+        logc("window: timing initialised (pinned=%d, host TSC %llu Hz)",
+             platform::timing_cpu_pinned(), platform::timing_host_tsc_frequency());
+    }
+
+    uint32_t presented = 0, skipped = 0;
+    for (uint32_t frame = 0; frame < o.frames; frame++) {
+        platform::timing_mark_frame_start();
+        if (!platform::window_begin_frame()) {
+            // A frame with no drawable is a minimised window or a surface that went away, not a failure:
+            // it is counted and the loop carries on, which is what the real game loop does.
+            skipped++;
+            logf("[window] frame %u skipped: %s\n", frame, platform::window_last_error());
+            SDL_Delay(16);
+            continue;
+        }
+        if (presented == 0) {
+            logc("window: swapchain %ux%u, %s, %u image(s)",
+                 gfx::swapchain_width(), gfx::swapchain_height(),
+                 gfx::swapchain_present_mode_name(), gfx::swapchain_image_count());
+        }
+        // A colour that changes every frame, so a person watching the window can see it is alive and can
+        // see it is *this* program presenting. Not a gradient and not a pattern: a pattern would need a
+        // draw, and a draw on 32-bit llvmpipe produces no fragments (measured), which would make the
+        // window look broken for a reason that has nothing to do with the present path.
+        const float t = o.frames > 1 ? (float)frame / (float)(o.frames - 1) : 1.0f;
+        const float colour[4] = {t, 0.25f, 1.0f - t, 1.0f};
+        gfx::clear_color(colour);
+        if (platform::window_end_frame()) presented++;
+        else {
+            skipped++;
+            logf("[window] frame %u not presented: %s\n", frame, platform::window_last_error());
+        }
+        // Wait for vblank: Xbox 59.94 Hz pacing. This replaces the crude SDL_Delay(16).
+        const uint32_t waited = platform::timing_wait_vblank();
+        (void)waited;
+    }
+
+    logc("window: %u frame(s) presented, %u skipped", presented, skipped);
+    platform::timing_shutdown();
+    platform::window_close();
+    return presented ? 0 : 1;
+}
+
 int run(const Options &o)
 {
     log_init(o.log.c_str(), o.trace);
@@ -127,6 +251,10 @@ int run(const Options &o)
     // to be able to say so, and a report that dies at the first missing thing cannot: it would report the
     // first failure and never the second, which is exactly what a reader needs to see.
     if (o.doctor) return xd3d::run_doctor(o.xbe.c_str(), o.hdd.c_str());
+
+    // --window next, and for the same reason: it is the one mode that needs no image at all, so it has to be
+    // runnable on a machine that has none.
+    if (o.window) return run_window(o);
 
     logc("BLACK loader %s -- XBE %s, log %s", kVersion, o.xbe.c_str(), log_path() ? log_path() : "(none)");
 

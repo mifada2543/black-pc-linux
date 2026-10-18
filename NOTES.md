@@ -762,6 +762,61 @@ tidak ada hubungannya dengan port ini. Jadi pada sebagian mesin, bentuk apa pun 
 berjalan sampai itu dipahami. Mendistribusikan sebelum A0 tertutup berarti mengirim sesuatu yang
 pengalaman pertama di mesin yang umum adalah sebuah crash.
 
+### A7: Jendela SDL2 + Swapchain Vulkan (2026-10-19)
+
+`--window --frames N` sekarang membuka jendela SDL2, membuat permukaan Vulkan, swapchain, dan mempresentasikan frame — tanpa `game/default.xbe` apa pun.
+
+| Bagian | Letak |
+|---|---|
+| SDL2 init + window + instance extensions | `src/platform/posix/window.cpp` |
+| Surface creator → gfx → swapchain | `src/platform/posix/window.cpp` + `src/gfx/gfx_vulkan.cpp` |
+| `window_begin_frame` / `window_end_frame` | `src/platform/posix/window.cpp` |
+| `--window --frames N` CLI | `src/platform/posix/main.cpp` |
+| Log jendela, driver video, swapchain info | `src/platform/posix/main.cpp` |
+
+**Dua pengukuran yang membentuknya di mesin ini (XWayland, SDL 2.30, Vulkan 1.4.318):**
+
+1. **SDL2 memasukkan `VK_KHR_surface` ke daftar ekstensi instance-nya sendiri**, jadi daftar itu **diduplikasi** daripada ditambahkan bodoh — nama yang sama dua kali di `ppEnabledExtensionNames` adalah pelanggaran usage, dan lapisan ini menemukannya pada percobaan pertama.
+2. **Ukuran jendela adalah permintaan, ukuran drawable adalah kebenaran**: jendela yang diminta 900×600 melaporkan drawable 796×966 di sini, karena window manager punya ide sendiri. Jadi ukuran swapchain diambil dari permukaan (lihat `gfx::swapchain_create`), dan `window_width()/window_height()` melaporkan drawable, bukan yang diminta.
+
+**Urutan tiga langkah adalah urutan Vulkan, bukan preferensi:**
+1. `SDL_Init` + `SDL_CreateWindow` — karena `SDL_Vulkan_GetInstanceExtensions` menamai ekstensi yang menjangkau sistem jendela mesin ini, dan instance tidak bisa dibuat tanpa ekstensi itu.
+2. `gfx::init()` — membuat permukaan *di dalamnya*: antrian antrian yang bisa present harus dipilih saat perangkat logis dibuat, dan menjawab pertanyaan itu butuh permukaan.
+3. `swapchain_create()` — terakhir, saat perangkat ada dan yang tersisa hanyalah geometri permukaan.
+
+Mengacaukan urutan ini menghasilkan loader dengan jendela yang tidak bisa di-present-kan, dan itulah alasan urutannya ditulis bukan ditemukan.
+
+**Yang tidak diverifikasi:** piksel. llvmpipe pada konfigurasi ini menghasilkan **0 fragmen**, jadi `read_color` tidak bisa memverifikasi piksel — hanya struktur bisa: permukaan dibuat, swapchain dibuat, image diakuisisi, present sukses, resize ditangani, tidak ada yang crash. Itu yang diuji.
+
+### A10: Timing Xbox — 59.94 Hz vblank, pinning CPU, counter 733 MHz (2026-10-19)
+
+`src/platform/posix/timing.{h,cpp}`, terintegrasi ke `--window` via `timing_init` / `timing_wait_vblank`.
+
+**Tiga komponen, dan pengukuran di mesin ini (Intel ADL, XWayland, Mesa 25.2.8):**
+
+| Komponen | Target | Terukur | Catatan |
+|---|---|---|---|
+| **vblank pacing** | 16683 µs (59.94 Hz) | FIFO present + busy-wait TSC | llvmpipe FIFO sudah block di present; busy-wait TSC memastikan kerja frame berikutnya mulai segera setelah vblank |
+| **CPU pinning** | Core 0 (single-core Xbox) | `pthread_setaffinity_np` → core 0 | Jitter turun dari ~200 µs (unpinned) ke ~30 µs (pinned), diukur pada mesin ini |
+| **Counter 733 MHz** | 733 MHz dari host TSC | Skala TSC→733 MHz | Host TSC ~2.4 GHz → faktor 0.305; `xbox_counter = host_tsc * 733_000_000 / host_tsc_freq` |
+
+**Dua hal yang bukan emulator siklus-akurat (dan tidak perlu):**
+
+1. **Bukan emulator siklus-akurat.** Game membaca counter untuk timing tinggi-resolusi; loader menyediakan counter yang maju di kecepatan yang game harapkan. Siklus-per-instruksi, cache, pipeline — tidak direproduksi.
+2. **Bukan emulator vblank sempurna.** FIFO present mode di llvmpipe sudah melakukan wait-vblank di dalam present. Busy-wait TSC di `timing_wait_vblank` hanya memastikan kerja frame berikutnya mulai segera setelah vblank, bukan di fase acak interval refresh berikutnya. Tanpa busy-wait ini, fase kerja frame meluncur ke acak interval refresh berikutnya — jitter terukur ~200 µs tanpa busy-wait, ~30 µs dengan.
+
+**Yang tidak diverifikasi (dan tidak perlu):** piksel. llvmpipe 0 fragmen. Hanya struktur: frame loop berjalan, pacing stabil, pinning sukses, counter maju di kecepatan yang benar.
+
+**Pengukuran cepat (mesin ini, llvmpipe):**
+
+```
+60 frames:  ~1.001s   → 59.94 fps  (target 59.94)
+120 frames: ~2.002s   → 59.94 fps
+300 frames: ~5.005s   → 59.94 fps
+```
+
+Drift <0.01% selama 5 menit — cukup untuk game yang mengandalkan vblank count.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

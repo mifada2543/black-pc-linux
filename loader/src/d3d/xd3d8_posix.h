@@ -186,6 +186,17 @@ struct Viewport { // D3DVIEWPORT8
 };
 static_assert(sizeof(Viewport) == 24, "four dwords and two floats");
 
+// D3DRECT, the console's rectangle. Four longs in this order, which is not recalled from a Windows header:
+// the invoice indexes it as pRects[i].x1/.y1/.x2/.y2 and hands x1 and y1 to a scale together as a pair, which
+// is only consistent with the four longs being consecutive in that order.
+//
+// It is a separate type from RECT because it is a separate type in D3D8's own headers, and the two are not
+// interchangeable even at the same width.
+struct D3DRect {
+    int32_t x1, y1, x2, y2;
+};
+static_assert(sizeof(D3DRect) == 16, "four longs");
+
 // A 4x4 matrix in row-major order, which is how the Xbox keeps it and how the game fills it: 16 floats, no
 // padding. (The Windows port used D3DMATRIX from d3d9.h, which happens to have the same layout -- but not
 // because d3d9.h exists here.)

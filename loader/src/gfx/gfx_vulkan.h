@@ -322,6 +322,111 @@ struct TextureSlot {
 // pool that grows with every bind is a pool that runs out in the middle of a frame.
 bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count);
 
+// ---- the window: surface and swapchain ----
+//
+// The surface and the swapchain are the only part of this layer that belongs to something outside the
+// process. The window system knows what it needs and this layer cannot know it -- the extension that
+// reaches an X11 drawable is not the one that reaches a Wayland surface, and neither is in Vulkan's
+// headers -- so both ends are supplied from above rather than guessed from here:
+//
+//   * `vulkan_add_instance_extension` for the names, asked of the window system *before* the instance
+//     exists, because an instance cannot be created with an extension it was not given;
+//   * `vulkan_set_surface_creator` for the call that turns a platform window into a VkSurfaceKHR, since
+//     the window is not a Vulkan object and this file cannot see the type of one.
+//
+// init() then does the rest in the only order Vulkan allows: instance with those extensions, surface from
+// the creator, and only then the logical device -- because the queue family that can present is chosen at
+// device creation, and a swapchain needs one. That ordering is the whole reason the surface is made before
+// the device rather than after, and it is why swapchain_create() is a separate call: by then the device
+// exists and the only thing left is the surface's own geometry.
+
+// Add an instance extension before init(). Duplicates are harmless and are removed: SDL2 answers with
+// VK_KHR_surface already in its list on this machine (measured, X11), and a name twice in
+// ppEnabledExtensionNames is invalid usage that some drivers answer with a confusing loader error.
+void vulkan_add_instance_extension(const char *name);
+
+// How the platform makes a VkSurfaceKHR. SDL2's SDL_Vulkan_CreateSurface, wrapped in a plain function
+// pointer so that this file never includes an SDL header.
+using CreateSurfaceFn = VkResult (*)(void *user, VkInstance instance, VkSurfaceKHR *out);
+void vulkan_set_surface_creator(CreateSurfaceFn fn, void *user);
+
+// Whether init() made a surface. False is not an error by itself: a loader that only draws offscreen
+// (every test but one) never asks for one.
+bool surface_ready();
+
+// Create the swapchain for the surface, at whatever size the surface currently is.
+//
+// **The extent comes from the surface, not from the caller.** Measured on this machine: a window asked
+// for 900x600 reports a drawable of 796x966, because the window manager had its own idea and because a
+// high-DPI drawable is not the window's size either. A size passed in here would be a second opinion
+// that is wrong in a way no error reports. `preferred_format` is a request, not a demand: the surface's
+// list wins, and the format actually used is what swapchain_format() returns.
+//
+// `immediate` asks for VK_PRESENT_MODE_IMMEDIATE_KHR, which is what the archived Windows port presented
+// with (D3D present interval 0x80000002, TWO_OR_IMMEDIATE, so the game runs at 30 fps without the host
+// adding a frame of latency). When the surface does not offer it the choice falls back to FIFO, which
+// Vulkan requires every implementation to have.
+//
+// False means there is no swapchain to draw into. last_error() says why by name -- including the case
+// that costs the most to discover, a minimised window, where the surface reports a zero extent and the
+// only correct answer is to keep the swapchain that is already there and try again later.
+bool swapchain_create(VkFormat preferred_format, bool immediate);
+
+// Throw the swapchain away and build another one at the surface's current size. This is the resize path
+// and the out-of-date path, and they are the same call because Vulkan treats them the same way. False
+// leaves the previous swapchain alone when the failure was "no drawable area", so a window being dragged
+// past the edge of a screen costs one skipped frame rather than the swapchain.
+bool swapchain_recreate();
+void swapchain_destroy();
+
+bool swapchain_alive();
+uint32_t swapchain_width();
+uint32_t swapchain_height();
+uint32_t swapchain_image_count();
+VkFormat swapchain_format();
+const char *swapchain_present_mode_name();
+
+// How many times the swapchain has been rebuilt. A counter rather than a handle because a caller has no
+// business holding a VkSwapchainKHR, and because "the swapchain was rebuilt" is a fact a test needs and a
+// handle comparison in a test cannot express across this layer's boundary.
+uint32_t swapchain_generation();
+
+// True once a caller has been told the swapchain is stale and has not rebuilt it yet. The stale flag is
+// sticky: SUBOPTIMAL_KHR is not an error, it is a warning that the surface is no longer a good match, and
+// the frame that got it is still a frame worth showing.
+bool swapchain_out_of_date();
+
+// Whether the drawables can be copied out of, which is `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` as the surface
+// and its format answered the question. It decides whether a test can check the presented frame's pixels
+// or only that it was presented; asking for a swapchain without it anyway is not possible, and pretending
+// the readback worked when the surface refused it is the failure this exists to prevent.
+bool swapchain_can_read_back();
+
+// Mark the swapchain as stale so the next frame rebuilds it. Called by the platform layer when the
+// window has been resized or the driver returned SUBOPTIMAL/OUT_OF_DATE.
+void swapchain_invalidate();
+
+// Ask gfx to add an instance extension to its list. Called by the platform layer before gfx::init().
+// Deduplicated against what gfx already asks for (e.g., VK_KHR_surface).
+void vulkan_want_instance_extension(const char *name);
+
+// The drawable to render into, as an Image so that set_render_target() takes it unchanged. Its memory
+// belongs to the swapchain, not to this layer: swapchain_destroy frees the views and lets
+// vkDestroySwapchainKHR free the rest. `index` is what acquire returned.
+Image *swapchain_image(uint32_t index);
+
+// Take the next drawable. False means there is nothing to draw into this frame and nothing was recorded.
+bool swapchain_acquire(uint32_t *index);
+
+// Submit the frame and hand the drawable to the presentation engine.
+//
+// The submission is this layer's own -- the same tail end_frame() has, with the two semaphores that move
+// the image from the presentation engine to the graphics queue and back -- so a caller that has drawn
+// does not have to end the frame itself and cannot end it twice. True means the frame was submitted and
+// presented; swapchain_out_of_date() afterwards is a request to rebuild, not a failure. False means the
+// drawable was not presented and last_error() says why.
+bool swapchain_present(uint32_t index);
+
 // ---- frames ----
 
 // Render targets for the frame in progress. The D3D8 layer calls this from SetRenderTarget, which is why it

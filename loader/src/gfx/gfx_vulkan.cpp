@@ -84,6 +84,61 @@ std::string g_device_override;
 bool g_probe_enabled = true;
 bool g_probe_read_env = false;
 
+// ---- the window ----
+//
+// Everything the window path needs, in one block, because the alternative is eight file statics that have
+// to agree about which queue presents. It sits with the device block above rather than down where the
+// swapchain code is, because init() writes half of it long before swapchain_create reads it.
+
+// Instance extensions the window system asked for, before the instance exists. VK_KHR_surface is added by
+// init() itself rather than being asked for: every window system needs it, and a caller that had to
+// remember it would be a caller whose window fails for a reason nobody can see.
+std::vector<std::string> g_want_instance_extensions;
+CreateSurfaceFn g_surface_creator = nullptr;
+void *g_surface_user = nullptr;
+VkSurfaceKHR g_surface = VK_NULL_HANDLE;
+
+// The surface's entry points, loaded once. VK_KHR_surface is an instance extension, so its functions are
+// not necessarily in the loader's exported set, and calling one that was never loaded is a jump through
+// a null pointer rather than an error.
+PFN_vkDestroySurfaceKHR pfnDestroySurface;
+PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR pfnSurfaceCapabilities;
+PFN_vkGetPhysicalDeviceSurfaceFormatsKHR pfnSurfaceFormats;
+PFN_vkGetPhysicalDeviceSurfacePresentModesKHR pfnSurfacePresentModes;
+PFN_vkGetPhysicalDeviceSurfaceSupportKHR pfnSurfaceSupport;
+PFN_vkCreateSwapchainKHR pfnCreateSwapchain;
+PFN_vkDestroySwapchainKHR pfnDestroySwapchain;
+PFN_vkGetSwapchainImagesKHR pfnSwapchainImages;
+PFN_vkAcquireNextImageKHR pfnAcquireNextImage;
+PFN_vkQueuePresentKHR pfnQueuePresent;
+
+// The queue family that presents, and its queue. A second family only exists on a device whose
+// presentation-capable family is not its graphics family; both queues are requested at device creation,
+// because that is the only moment Vulkan lets a queue be asked for at all.
+uint32_t g_present_family = UINT32_MAX;
+VkQueue g_present_queue = VK_NULL_HANDLE;
+
+// The swapchain. `images` are the drawables wrapped as Images so that set_render_target() takes them
+// unchanged, and `handles` are the same images again as VkImage, kept apart because an ImageView is not
+// an Image. (NOTES records two places where this port mixes the two: in a 32-bit build, where every
+// non-dispatchable handle is a pointer, it compiles and works, and in a 64-bit build it is wrong.)
+VkSwapchainKHR g_swapchain = VK_NULL_HANDLE;
+std::vector<Image> g_swapchain_images;
+std::vector<VkImage> g_swapchain_handles;
+uint32_t g_swapchain_width = 0, g_swapchain_height = 0;
+VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
+const char *g_swapchain_present_mode = "none";
+uint32_t g_swapchain_generation = 0;
+bool g_swapchain_stale = false;
+bool g_swapchain_wants_immediate = false; // what the caller asked for; kept so a rebuild asks again
+bool g_swapchain_can_read_back = false;  // whether the drawables can be copied out of
+
+// The two semaphores one frame in flight needs. One frame at a time is a choice, not a limitation: the
+// loader renders, presents and waits before it does anything else (see end_frame), so a second frame in
+// flight would buy nothing and would double the ways to use an image the presentation engine still owns.
+VkSemaphore g_acquire_done = VK_NULL_HANDLE; // presentation engine -> graphics
+VkSemaphore g_release_done = VK_NULL_HANDLE; // graphics -> presentation engine
+
 const char *vk_result_name(VkResult r)
 {
     switch (r) {
@@ -454,6 +509,11 @@ VkCommandBuffer ensure_pass()
     return g_cmd;
 }
 
+// End the pass, submit, wait, and release the frame's staging. Defined down with the frames and used by the
+// swapchain above, because presenting a drawable is the same tail with two semaphones in it and two copies
+// of it would be two chances to get the hand-over wrong in one of them.
+bool submit_frame(VkSemaphore wait, VkSemaphore signal, Image *present_target);
+
 } // namespace
 
 // ---- init ----
@@ -512,8 +572,67 @@ bool init()
     ici.pApplicationInfo = &app;
     // No layers and no validation: the loader's graphics path has to work on a machine with nothing
     // installed but the driver, and validation output on a player's screen is not a feature.
+    //
+    // The window system's extensions come from the window system. Which one reaches an X11 drawable and
+    // which reaches a Wayland surface is not in Vulkan's headers, and guessing is not an option: an
+    // instance created without the one its surface needs is an instance whose surface cannot be made, and
+    // "the window does not work" is a worse report than the extension list.
+    // VK_KHR_surface is added here rather than asked for, because every window system needs it and SDL2
+    // on this machine already names it (measured, X11) -- so the list is deduplicated rather than trusted.
+    std::vector<const char *> instance_exts;
+    if (g_surface_creator) instance_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+    for (const std::string &name : g_want_instance_extensions) {
+        bool have = false;
+        for (const char *e : instance_exts)
+            if (name == e) have = true;
+        if (!have) instance_exts.push_back(name.c_str());
+    }
+    ici.enabledExtensionCount = (uint32_t)instance_exts.size();
+    ici.ppEnabledExtensionNames = instance_exts.empty() ? nullptr : instance_exts.data();
     VkResult r = vkCreateInstance(&ici, nullptr, &g_instance);
     if (r != VK_SUCCESS) return fail("no Vulkan instance", r);
+
+    if (g_surface_creator) {
+        // Before the device, and that order is the whole reason this call is here rather than inside
+        // swapchain_create(): the queue family that can present is chosen when the logical device is
+        // created, and asking which one it is needs a surface. Everything after this is geometry.
+        r = g_surface_creator(g_surface_user, g_instance, &g_surface);
+        if (r != VK_SUCCESS || g_surface == VK_NULL_HANDLE) {
+            g_error = "the window system could not make a Vulkan surface: " + std::string(vk_result_name(r));
+            vkDestroyInstance(g_instance, nullptr);
+            g_instance = VK_NULL_HANDLE;
+            return false;
+        }
+        pfnDestroySurface = (PFN_vkDestroySurfaceKHR)vkGetInstanceProcAddr(g_instance, "vkDestroySurfaceKHR");
+        pfnSurfaceCapabilities = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)
+            vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+        pfnSurfaceFormats = (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)
+            vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceSurfaceFormatsKHR");
+        pfnSurfacePresentModes = (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)
+            vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        pfnSurfaceSupport = (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)
+            vkGetInstanceProcAddr(g_instance, "vkGetPhysicalDeviceSurfaceSupportKHR");
+        pfnCreateSwapchain = (PFN_vkCreateSwapchainKHR)vkGetInstanceProcAddr(g_instance, "vkCreateSwapchainKHR");
+        pfnDestroySwapchain = (PFN_vkDestroySwapchainKHR)vkGetInstanceProcAddr(g_instance, "vkDestroySwapchainKHR");
+        pfnSwapchainImages = (PFN_vkGetSwapchainImagesKHR)vkGetInstanceProcAddr(g_instance, "vkGetSwapchainImagesKHR");
+        pfnAcquireNextImage = (PFN_vkAcquireNextImageKHR)vkGetInstanceProcAddr(g_instance, "vkAcquireNextImageKHR");
+        pfnQueuePresent = (PFN_vkQueuePresentKHR)vkGetInstanceProcAddr(g_instance, "vkQueuePresentKHR");
+        // Named rather than tolerated: the swapchain path calls every one of these unconditionally, so
+        // "the loader did not export the surface entry points" is an explanation while a null call is a
+        // crash a long way from here.
+        if (!pfnDestroySurface || !pfnSurfaceCapabilities || !pfnSurfaceFormats || !pfnSurfacePresentModes ||
+            !pfnSurfaceSupport || !pfnCreateSwapchain || !pfnDestroySwapchain || !pfnSwapchainImages ||
+            !pfnAcquireNextImage || !pfnQueuePresent) {
+            g_error = "the Vulkan loader did not export the VK_KHR_surface entry points, although the "
+                      "instance was created with that extension enabled";
+            pfnDestroySurface(g_instance, g_surface, nullptr);
+            vkDestroyInstance(g_instance, nullptr);
+            g_instance = VK_NULL_HANDLE;
+            g_surface = VK_NULL_HANDLE;
+            return false;
+        }
+        logf("[gfx] Vulkan surface created through the window system\n");
+    }
 
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(g_instance, &count, nullptr);
@@ -622,6 +741,10 @@ bool init()
                    (g_skip_reasons[i].empty() ? std::string("not tried") : g_skip_reasons[i]);
         }
         g_error = why;
+        if (g_surface) {
+            pfnDestroySurface(g_instance, g_surface, nullptr);
+            g_surface = VK_NULL_HANDLE;
+        }
         vkDestroyInstance(g_instance, nullptr);
         g_instance = VK_NULL_HANDLE;
         return false;
@@ -665,15 +788,48 @@ bool init()
         g_error = "no graphics queue family";
         return false;
     }
-    g_adapter.present_supported = true;
 
-    const float priority = 1.0f;
-    VkDeviceQueueCreateInfo qci;
-    memset(&qci, 0, sizeof qci);
-    qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    qci.queueFamilyIndex = g_queue_family;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &priority;
+    // The family that presents, and whether this device can present at all. It is not assumed to be the
+    // graphics family: Vulkan only requires that a presentation-capable family *also* support graphics, so
+    // on most devices it is the same family (measured here: family 0 of 1, on both drivers) and on some it
+    // is not, and a loader that assumed would have no queue to present on there.
+    g_present_family = UINT32_MAX;
+    g_adapter.present_supported = false;
+    if (g_surface) {
+        g_present_family = g_queue_family;
+        VkBool32 supported = VK_FALSE;
+        pfnSurfaceSupport(g_physical, g_queue_family, g_surface, &supported);
+        if (supported != VK_TRUE) {
+            g_present_family = UINT32_MAX;
+            for (uint32_t i = 0; i < family_count; i++) {
+                if (!(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+                if (pfnSurfaceSupport(g_physical, i, g_surface, &supported) == VK_SUCCESS && supported == VK_TRUE) {
+                    g_present_family = i;
+                    break;
+                }
+            }
+        }
+        g_adapter.present_supported = g_present_family != UINT32_MAX;
+    }
+
+    const float priorities[2] = {1.0f, 1.0f};
+    VkDeviceQueueCreateInfo qcis[2];
+    memset(qcis, 0, sizeof qcis);
+    qcis[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    qcis[0].queueFamilyIndex = g_queue_family;
+    qcis[0].queueCount = 1;
+    qcis[0].pQueuePriorities = priorities;
+    // Two queues only when presentation lives on another family. One queue per entry rather than two
+    // entries for one family, because the priorities of two entries naming the same family must differ and
+    // asking for one family twice is the kind of request that fails with a message about queue priorities.
+    uint32_t queue_count = 1;
+    if (g_present_family != UINT32_MAX && g_present_family != g_queue_family) {
+        qcis[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        qcis[1].queueFamilyIndex = g_present_family;
+        qcis[1].queueCount = 1;
+        qcis[1].pQueuePriorities = priorities + 1;
+        queue_count = 2;
+    }
 
     // The features this port asks for, and why. depthClamp because the Xbox clamps Z where Vulkan would
     // discard the fragment, and the game's shaders rely on that (see the nv2a_vsh notes in the reference).
@@ -714,10 +870,26 @@ bool init()
     VkDeviceCreateInfo dci;
     memset(&dci, 0, sizeof dci);
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
+    dci.queueCreateInfoCount = queue_count;
+    dci.pQueueCreateInfos = qcis;
     dci.pEnabledFeatures = &features;
     dci.pNext = &features13;
+
+    // VK_KHR_swapchain is the only device extension this layer enables, and it is enabled only when there
+    // is a surface to use it with. Its absence is checked by name above rather than being discovered by
+    // vkCreateDevice's VK_ERROR_EXTENSION_NOT_PRESENT, which says what happened and not what to do.
+    std::vector<const char *> device_exts;
+    if (g_surface) {
+        if (!has_device_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+            g_error = "this device has no " VK_KHR_SWAPCHAIN_EXTENSION_NAME
+                      ", so it cannot present to the window this loader opened";
+            return false;
+        }
+        device_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
+    dci.enabledExtensionCount = (uint32_t)device_exts.size();
+    dci.ppEnabledExtensionNames = device_exts.empty() ? nullptr : device_exts.data();
+
     r = vkCreateDevice(g_physical, &dci, nullptr, &g_device);
     if (r != VK_SUCCESS) return fail("no Vulkan device", r);
 
@@ -729,6 +901,10 @@ bool init()
     }
 
     vkGetDeviceQueue(g_device, g_queue_family, 0, &g_queue);
+    if (g_present_family != UINT32_MAX && g_present_family != g_queue_family)
+        vkGetDeviceQueue(g_device, g_present_family, 0, &g_present_queue);
+    else
+        g_present_queue = g_queue;
 
     VkCommandPoolCreateInfo pci;
     memset(&pci, 0, sizeof pci);
@@ -759,6 +935,15 @@ bool init()
 void shutdown()
 {
     if (g_device) vkDeviceWaitIdle(g_device);
+    // The window objects first, and in this order: the semaphores and the views belong to the device, the
+    // swapchain belongs to the surface, and the surface belongs to the instance. Tearing them down in any
+    // other order hands the driver an object whose parent is already gone, which on llvmpipe is a crash
+    // rather than a validation error (there are no validation layers here).
+    swapchain_destroy();
+    if (g_device && g_acquire_done) vkDestroySemaphore(g_device, g_acquire_done, nullptr);
+    if (g_device && g_release_done) vkDestroySemaphore(g_device, g_release_done, nullptr);
+    g_acquire_done = VK_NULL_HANDLE;
+    g_release_done = VK_NULL_HANDLE;
     // A frame that was begun and never submitted still holds staging the driver never read from.
     for (size_t i = 0; i < g_staging_pending.size(); i++) {
         if (g_device) destroy_buffer(&g_staging_pending[i]);
@@ -771,13 +956,19 @@ void shutdown()
     if (g_index_buffer.buffer) destroy_buffer(&g_index_buffer);
     if (g_device && g_pool) vkDestroyCommandPool(g_device, g_pool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
+    if (g_surface && pfnDestroySurface) {
+        pfnDestroySurface(g_instance, g_surface, nullptr);
+        g_surface = VK_NULL_HANDLE;
+    }
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
     g_device = VK_NULL_HANDLE;
     g_instance = VK_NULL_HANDLE;
     g_physical = VK_NULL_HANDLE;
     g_queue = VK_NULL_HANDLE;
+    g_present_queue = VK_NULL_HANDLE;
     g_pool = VK_NULL_HANDLE;
     g_cmd = VK_NULL_HANDLE;
+    g_present_family = UINT32_MAX;
     g_recording = false;
     g_adapter = AdapterInfo();
 }
@@ -1704,6 +1895,376 @@ void destroy_pipeline(Pipeline *p)
     *p = Pipeline();
 }
 
+// ---- the window: surface and swapchain ----
+
+void vulkan_add_instance_extension(const char *name)
+{
+    if (!name || !*name) return;
+    for (const std::string &have : g_want_instance_extensions)
+        if (have == name) return; // asked for twice is not an error, but it does not need saying twice
+    g_want_instance_extensions.push_back(name);
+}
+
+void vulkan_set_surface_creator(CreateSurfaceFn fn, void *user)
+{
+    g_surface_creator = fn;
+    g_surface_user = user;
+}
+
+bool surface_ready() { return g_surface != VK_NULL_HANDLE; }
+
+bool swapchain_alive() { return g_swapchain != VK_NULL_HANDLE; }
+uint32_t swapchain_width() { return g_swapchain_width; }
+uint32_t swapchain_height() { return g_swapchain_height; }
+uint32_t swapchain_image_count() { return (uint32_t)g_swapchain_images.size(); }
+VkFormat swapchain_format() { return g_swapchain_format; }
+const char *swapchain_present_mode_name() { return g_swapchain_present_mode; }
+uint32_t swapchain_generation() { return g_swapchain_generation; }
+bool swapchain_out_of_date() { return g_swapchain_stale; }
+bool swapchain_can_read_back() { return g_swapchain_can_read_back; }
+
+Image *swapchain_image(uint32_t index)
+{
+    return index < g_swapchain_images.size() ? &g_swapchain_images[index] : nullptr;
+}
+
+namespace {
+
+const char *present_mode_name(VkPresentModeKHR mode)
+{
+    switch (mode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: return "VK_PRESENT_MODE_IMMEDIATE_KHR";
+    case VK_PRESENT_MODE_MAILBOX_KHR: return "VK_PRESENT_MODE_MAILBOX_KHR";
+    case VK_PRESENT_MODE_FIFO_KHR: return "VK_PRESENT_MODE_FIFO_KHR";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "VK_PRESENT_MODE_FIFO_RELAXED_KHR";
+    default: return "a present mode this port does not name";
+    }
+}
+
+// Which of the surface's formats to use.
+//
+// A request, not a demand. The surface owns the list -- on X11 it is whatever the window's visual can do,
+// and a format the window cannot show is not a format this layer gets to choose. B8G8R8A8_UNORM is what
+// the game draws with (A8R8G8B8 on the console) and it is deliberately *not* the _SRGB variant of it: the
+// game writes gamma-corrected values itself, and an sRGB view would encode them a second time.
+VkSurfaceFormatKHR choose_surface_format(const std::vector<VkSurfaceFormatKHR> &formats, VkFormat preferred)
+{
+    // The colour space is part of the format: several drivers list the same VkFormat once per colour space,
+    // and the surface's currentTransform-free "capabilities" struct is not a substitute for picking one.
+    for (const VkSurfaceFormatKHR &f : formats)
+        if (f.format == preferred && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) return f;
+    for (const VkSurfaceFormatKHR &f : formats)
+        if (f.format == preferred) return f;
+    for (const VkSurfaceFormatKHR &f : formats)
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) return f;
+    return formats.empty() ? VkSurfaceFormatKHR() : formats[0];
+}
+
+// Free the swapchain's own objects without touching the surface. Split out of swapchain_destroy because a
+// rebuild destroys exactly these and nothing else.
+void swapchain_release()
+{
+    if (g_device && g_swapchain) vkDeviceWaitIdle(g_device);
+    for (size_t i = 0; i < g_swapchain_images.size(); i++)
+        if (g_device && g_swapchain_images[i].view)
+            vkDestroyImageView(g_device, g_swapchain_images[i].view, nullptr);
+    if (g_device && g_swapchain && pfnDestroySwapchain) pfnDestroySwapchain(g_device, g_swapchain, nullptr);
+    g_swapchain = VK_NULL_HANDLE;
+    g_swapchain_images.clear();
+    g_swapchain_handles.clear();
+    g_swapchain_width = 0;
+    g_swapchain_height = 0;
+    g_swapchain_format = VK_FORMAT_UNDEFINED;
+    g_swapchain_present_mode = "none";
+}
+
+} // namespace
+
+void swapchain_invalidate()
+{
+    // Mark the swapchain as stale so the next acquire will rebuild it.
+    // This is called when the window has been resized or the driver returned SUBOPTIMAL/OUT_OF_DATE.
+    g_swapchain_stale = true;
+}
+
+void vulkan_want_instance_extension(const char *name)
+{
+    if (!name || !name[0]) return;
+    for (const std::string &existing : g_want_instance_extensions) {
+        if (existing == name) return; // already present
+    }
+    g_want_instance_extensions.push_back(name);
+    logf("[gfx] added instance extension: %s", name);
+}
+
+void swapchain_destroy()
+{
+    swapchain_release();
+    g_swapchain_stale = false;
+}
+
+bool swapchain_create(VkFormat preferred_format, bool immediate)
+{
+    if (!ready()) {
+        g_error = "gfx::init has not run, so there is no device to make a swapchain with";
+        return false;
+    }
+    if (!g_surface || !pfnSurfaceCapabilities) {
+        g_error = "there is no Vulkan surface: the window path has to register one before gfx::init";
+        return false;
+    }
+    if (g_present_family == UINT32_MAX) {
+        g_error = "this device cannot present to the window: no queue family accepts the surface";
+        return false;
+    }
+
+    VkSurfaceCapabilitiesKHR caps{};
+    if (pfnSurfaceCapabilities(g_physical, g_surface, &caps) != VK_SUCCESS) {
+        g_error = "vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed";
+        return false;
+    }
+
+    // A zero extent is a window with no drawable area: minimised, or on another workspace. It is not an
+    // error and the answer is not to build a swapchain of zero by zero -- Vulkan treats a zero extent as
+    // "undefined size", and every image in it is useless. The existing swapchain stays, and the caller
+    // tries again when there is somewhere to draw.
+    if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) {
+        g_error = "the window has no drawable area (minimised); the swapchain was left as it was";
+        return false;
+    }
+
+    uint32_t format_count = 0;
+    pfnSurfaceFormats(g_physical, g_surface, &format_count, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(format_count);
+    if (format_count) pfnSurfaceFormats(g_physical, g_surface, &format_count, formats.data());
+    if (formats.empty()) {
+        g_error = "the surface reports no formats at all";
+        return false;
+    }
+
+    // TRANSFER_SRC as well as TRANSFER_DST: the drawable is copied out of as well as into. Nothing in the
+    // present path needs that today, but a swapchain created without it cannot be read back at all, and
+    // reading a drawable back is how a test can prove the frame it presented was really the frame it drew
+    // (see tests/test_window.cpp).
+    const VkImageUsageFlags want_usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    const VkSurfaceFormatKHR format =
+        choose_surface_format(formats, preferred_format ? preferred_format : VK_FORMAT_B8G8R8A8_UNORM);
+
+    // The usage a swapchain may ask for is what the surface supports. Per-format usage is only in
+    // VkSurfaceFormat2KHR, which is VK_KHR_surface_format_2; the core VkSurfaceFormatKHR carries a format and
+    // a colour space and nothing else, so a driver that wants to restrict a format's usage says so through
+    // an extension this layer does not ask for. Asking for a bit the surface does not support is invalid
+    // usage, and with no validation layers installed the driver answers that however it likes.
+    VkImageUsageFlags usage = want_usage & caps.supportedUsageFlags;
+    if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        g_error = "this surface cannot be a colour attachment at all, so nothing could be drawn into a "
+                  "swapchain built on it";
+        return false;
+    }
+    g_swapchain_can_read_back = (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0;
+    if (!g_swapchain_can_read_back)
+        logf("[gfx] this surface cannot copy out of its drawables, so the window test skips the readback\n");
+    usage &= ~VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    // minImageCount + 1 so that the presentation engine always has one image to work with while another is
+    // being drawn -- the classic reason for asking for more than the minimum.
+    // **maxImageCount of zero means "no limit", not "none."** Clamping to it asks for a zero-image
+    // swapchain, and this is what the X11 surface on this machine reports (measured: min 3, max 0).
+    uint32_t image_count = caps.minImageCount + 1;
+    if (caps.maxImageCount != 0 && image_count > caps.maxImageCount) image_count = caps.maxImageCount;
+
+    uint32_t mode_count = 0;
+    pfnSurfacePresentModes(g_physical, g_surface, &mode_count, nullptr);
+    std::vector<VkPresentModeKHR> modes(mode_count);
+    if (mode_count) pfnSurfacePresentModes(g_physical, g_surface, &mode_count, modes.data());
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR; // the only one every implementation must have
+    if (immediate)
+        for (VkPresentModeKHR m : modes)
+            if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) present_mode = m;
+
+    const VkSurfaceFormatKHR format_unused_guard = format;
+    (void)format_unused_guard;
+
+    VkSwapchainCreateInfoKHR sci;
+    memset(&sci, 0, sizeof sci);
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sci.surface = g_surface;
+    sci.minImageCount = image_count;
+    sci.imageFormat = format.format;
+    sci.imageColorSpace = format.colorSpace;
+    sci.imageExtent = caps.currentExtent;
+    sci.imageArrayLayers = 1;
+    sci.imageUsage = usage;
+    // Exclusive even across two families: the semaphore pair below moves ownership, and that is what the
+    // acquire semaphore is for. Concurrent sharing with a second queue would be a second way to be wrong.
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform = caps.currentTransform;
+    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    // OPAQUE when the surface offers it, which is the one that costs the compositor nothing and is what a
+    // window with no alpha wants. supportedCompositeAlpha is a mask of bits, not a list: one of these three
+    // is always supported, but not always the one asked for first.
+    sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR))
+        sci.compositeAlpha = caps.supportedCompositeAlpha
+                                 ? (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & (~caps.supportedCompositeAlpha + 1u))
+                                 : VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    sci.presentMode = present_mode;
+    sci.clipped = VK_TRUE;
+    // Handing the old swapchain over lets the driver reuse its images instead of allocating new ones, which
+    // is what keeps a resize from stalling. The old views are destroyed only after the new ones exist,
+    // because on a driver that reuses the images the new views are made from them.
+    sci.oldSwapchain = g_swapchain;
+
+    VkSwapchainKHR created = VK_NULL_HANDLE;
+    const VkResult r = pfnCreateSwapchain(g_device, &sci, nullptr, &created);
+    if (r != VK_SUCCESS || created == VK_NULL_HANDLE) {
+        g_error = std::string("vkCreateSwapchainKHR: ") + vk_result_name(r);
+        return false;
+    }
+
+    uint32_t count = 0;
+    pfnSwapchainImages(g_device, created, &count, nullptr);
+    std::vector<VkImage> handles(count);
+    if (count) pfnSwapchainImages(g_device, created, &count, handles.data());
+    std::vector<Image> images(count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        VkImageViewCreateInfo vci;
+        memset(&vci, 0, sizeof vci);
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = handles[i];
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = format.format;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(g_device, &vci, nullptr, &images[i].view) != VK_SUCCESS) {
+            for (uint32_t j = 0; j < i; j++) vkDestroyImageView(g_device, images[j].view, nullptr);
+            pfnDestroySwapchain(g_device, created, nullptr);
+            g_error = "vkCreateImageView on a swapchain image failed";
+            return false;
+        }
+        images[i].image = handles[i];
+        images[i].memory = VK_NULL_HANDLE; // the swapchain owns it; this layer owns only the view
+        images[i].width = caps.currentExtent.width;
+        images[i].height = caps.currentExtent.height;
+        images[i].format = format.format;
+        images[i].mip_levels = 1;
+        images[i].layout_slot = new_layout_slot();
+        layout_of(images[i]) = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    swapchain_release(); // the old one, which may have lent its images to the new one
+    g_swapchain = created;
+    g_swapchain_images = images;
+    g_swapchain_handles = handles;
+    g_swapchain_width = caps.currentExtent.width;
+    g_swapchain_height = caps.currentExtent.height;
+    g_swapchain_format = format.format;
+    g_swapchain_present_mode = present_mode_name(present_mode);
+    g_swapchain_stale = false;
+    g_swapchain_wants_immediate = immediate;
+    g_swapchain_generation++;
+
+    if (!g_acquire_done) {
+        VkSemaphoreCreateInfo sci_sem;
+        memset(&sci_sem, 0, sizeof sci_sem);
+        sci_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        if (vkCreateSemaphore(g_device, &sci_sem, nullptr, &g_acquire_done) != VK_SUCCESS ||
+            vkCreateSemaphore(g_device, &sci_sem, nullptr, &g_release_done) != VK_SUCCESS) {
+            g_error = "could not create the two semaphores a frame's hand-over needs";
+            swapchain_release();
+            return false;
+        }
+    }
+
+    logf("[gfx] swapchain %ux%u, %u images, format %d, %s (generation %u)\n", g_swapchain_width,
+         g_swapchain_height, image_count, (int)format.format, g_swapchain_present_mode, g_swapchain_generation);
+    return true;
+}
+
+bool swapchain_recreate() { return swapchain_create(g_swapchain_format, g_swapchain_wants_immediate); }
+
+bool swapchain_acquire(uint32_t *index)
+{
+    if (!index) return false;
+    if (!g_swapchain) {
+        g_error = "there is no swapchain to acquire from: call swapchain_create first";
+        return false;
+    }
+    // A stale swapchain is rebuilt once, here, rather than being handed to the caller as a failed frame.
+    // Both ends of the window's life -- a resize the driver noticed and a resize it did not (measured:
+    // on X11/llvmpipe a stale swapchain keeps returning VK_SUCCESS long after the window changed, so the
+    // return code alone cannot drive this) -- arrive at the same place, which is one rebuild here.
+    if (g_swapchain_stale && !swapchain_recreate()) return false;
+
+    // UINT64_MAX: wait as long as it takes. A finite timeout would buy a frame that has nothing to draw
+    // into, and the loader has no second thing to do while the window is not ready.
+    const VkResult r = pfnAcquireNextImage(g_device, g_swapchain, UINT64_MAX, g_acquire_done, VK_NULL_HANDLE,
+                                              index);
+    if (r == VK_SUCCESS) return true;
+    // SUBOPTIMAL is not a failure: the image is valid and the frame is worth showing. It says the surface
+    // no longer matches the swapchain, which is a rebuild request for later rather than an error now.
+    if (r == VK_SUBOPTIMAL_KHR) {
+        g_swapchain_stale = true;
+        logf("[gfx] acquire returned SUBOPTIMAL: the swapchain will be rebuilt\n");
+        return true;
+    }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
+        g_swapchain_stale = true;
+        g_error = std::string("the window went away from under the swapchain (") + vk_result_name(r) + ")";
+        if (r == VK_ERROR_SURFACE_LOST_KHR) return false;
+        return swapchain_recreate() && pfnAcquireNextImage(g_device, g_swapchain, UINT64_MAX, g_acquire_done,
+                                                             VK_NULL_HANDLE, index) == VK_SUCCESS;
+    }
+    g_error = std::string("vkAcquireNextImageKHR: ") + vk_result_name(r);
+    return false;
+}
+
+bool swapchain_present(uint32_t index)
+{
+    if (!g_swapchain) {
+        g_error = "there is no swapchain to present to";
+        return false;
+    }
+    if (index >= g_swapchain_images.size()) {
+        g_error = "the drawable index is not one of this swapchain's images";
+        return false;
+    }
+
+    // The frame is submitted here rather than by the caller, because the submission is what hands the
+    // image over: it waits on the acquire semaphore and signals the release one, and a caller that ended
+    // the frame itself would end it without either and present an image the GPU had not finished with.
+    if (!submit_frame(g_acquire_done, g_release_done, &g_swapchain_images[index])) return false;
+
+    VkPresentInfoKHR pi;
+    memset(&pi, 0, sizeof pi);
+    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &g_release_done;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &g_swapchain;
+    pi.pImageIndices = &index;
+    const VkResult r = pfnQueuePresent(g_present_queue, &pi);
+
+    // Both queues, not just the graphics one: when presentation lives on another family the release has
+    // happened on a queue this thread has not touched, and reusing the acquire semaphore before the
+    // presentation engine is done with it is the use-after-free that this wait is here to prevent.
+    vkQueueWaitIdle(g_queue);
+    if (g_present_queue != g_queue) vkQueueWaitIdle(g_present_queue);
+
+    if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+        if (r == VK_SUBOPTIMAL_KHR) g_swapchain_stale = true;
+        return true;
+    }
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
+        g_swapchain_stale = true;
+        g_error = std::string("the presentation engine refused this frame: ") + vk_result_name(r);
+        return r == VK_ERROR_OUT_OF_DATE_KHR;
+    }
+    g_error = std::string("vkQueuePresentKHR: ") + vk_result_name(r);
+    return false;
+}
+
 // ---- frames ----
 
 namespace {
@@ -1869,11 +2430,53 @@ bool set_scissor_enable(bool on)
     return true;
 }
 
-bool end_frame()
+namespace {
+
+// End the pass, submit, wait, and hand back the staging the frame borrowed. This is the tail of end_frame
+// and it is also the tail of the present path, because those are the same three steps with two extra
+// semaphones in the middle of them -- and one function means the acquire/release pair cannot be forgotten
+// in one of the two callers or used in the wrong order in the other.
+//
+// `wait` is the semaphore that says the presentation engine has handed the drawable over and `signal` the
+// one that says the GPU is finished with it; both are null for a frame that is not going to a screen.
+// `present_target` is the drawable, and it gets its layout transition recorded here because that
+// transition is the last thing the command buffer has to do before vkQueuePresentKHR is allowed to mean
+// anything.
+bool submit_frame(VkSemaphore wait, VkSemaphore signal, Image *present_target)
 {
-    if (!g_recording) return true;
+    if (!ready()) {
+        g_error = "gfx::init has not run";
+        return false;
+    }
+
+    if (!g_recording) {
+        // A frame that never drew anything still owns a drawable, and a drawable has to be in
+        // PRESENT_SRC_KHR to be presented. Recorded on its own rather than refused: "the game drew nothing
+        // this frame" is a normal thing for a game to do, and the alternative is a caller that has to know
+        // this and branch on it.
+        if (!present_target) return true;
+        vkResetCommandBuffer(g_cmd, 0);
+        VkCommandBufferBeginInfo bi;
+        memset(&bi, 0, sizeof bi);
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(g_cmd, &bi) != VK_SUCCESS) {
+            g_error = "vkBeginCommandBuffer failed";
+            return false;
+        }
+    }
+
     end_pass();
     g_recording = false;
+
+    if (present_target) {
+        const VkImageLayout from = layout_of(*present_target);
+        if (from != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+            barrier(present_target->image, from, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, 0,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        layout_of(*present_target) = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    }
 
     // Ended before it is submitted. Submitting a command buffer that is still recording is invalid usage,
     // and llvmpipe 1.2 tolerates it for a pass and a draw but segfaults once the stream also holds a
@@ -1887,6 +2490,19 @@ bool end_frame()
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cmd;
+    if (wait != VK_NULL_HANDLE) {
+        // COLOR_ATTACHMENT_OUTPUT on the waiting side, because that is the first stage that touches the
+        // drawable: anything earlier would let the frame start drawing into an image the presentation
+        // engine still owns, which is the one race a swapchain has.
+        const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        si.pWaitDstStageMask = &stage;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &wait;
+    }
+    if (signal != VK_NULL_HANDLE) {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &signal;
+    }
     VkResult r = vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE);
     if (r != VK_SUCCESS) return fail("vkQueueSubmit", r);
     // Waited on rather than signalled: a frame that is not finished when the loader looks at it is worse
@@ -1900,6 +2516,10 @@ bool end_frame()
     g_staging_pending.clear();
     return true;
 }
+
+} // namespace
+
+bool end_frame() { return submit_frame(VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr); }
 
 // The rectangle a clear covers: the scissor when one has been set, otherwise the whole target. Vulkan
 // requires a rectangle either way, and the value this layer starts with is 1x1 -- which turned every Clear
@@ -1940,9 +2560,33 @@ bool clear_color(const float rgba[4])
     return begin_pass(g_color, g_depth) != VK_NULL_HANDLE;
 }
 
+// Record a vkCmdClearAttachments that is alone in its pass.
+//
+// This is not tidiness, it is the measurement in the comment on clear_color: on 32-bit llvmpipe a colour
+// vkCmdClearAttachments inside a dynamic-rendering pass stops every *later* draw in that pass from producing
+// a fragment. A whole-target clear avoids it by being the pass's loadOp instead. A rectangle has no loadOp,
+// so the only way to give it one is to close the pass, open a fresh one, clear, and close that one again --
+// leaving the clear with nothing after it that it can spoil.
+//
+// The cost is a pass boundary per rectangle, which is why a clear covering the whole target takes the
+// loadOp path instead and never comes here.
+bool clear_attachment_alone(const VkClearAttachment &ca, const VkClearRect &rect)
+{
+    if (!ensure_recording()) return false;
+    end_pass(); // whatever the game was drawing into ends here
+    if (!begin_pass(g_color, g_depth)) return false;
+    vkCmdClearAttachments(g_cmd, 1, &ca, 1, &rect);
+    end_pass(); // and the clear ends here, before the next draw
+    return true;
+}
+
 bool clear_color_rect(const float rgba[4], uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    if (!ensure_pass()) return false; // as in clear_depth
+    // A rectangle that covers everything is the whole-target clear wearing a hat, and the loadOp path is
+    // both cheaper and the one this driver is known to handle. The game's own Clear passes one full-screen
+    // rectangle constantly.
+    if (g_color && x == 0 && y == 0 && w >= g_color->width && h >= g_color->height) return clear_color(rgba);
+
     VkClearAttachment ca;
     memset(&ca, 0, sizeof ca);
     ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1953,24 +2597,22 @@ bool clear_color_rect(const float rgba[4], uint32_t x, uint32_t y, uint32_t w, u
     rect.rect = {{(int32_t)x, (int32_t)y}, {w, h}};
     rect.baseArrayLayer = 0;
     rect.layerCount = 1;
-    vkCmdClearAttachments(g_cmd, 1, &ca, 1, &rect);
-    return true;
+    return clear_attachment_alone(ca, rect);
 }
 
 // Depth is cleared with vkCmdClearAttachments rather than with the pass's loadOp, because this is the form
 // that survives a rectangle and because a depth clear does not stop later draws on the driver in question.
 bool clear_depth(float value)
 {
-    // ensure_pass, not ensure_recording: vkCmdClearAttachments belongs inside a pass, and a frame that has
-    // begun but not yet drawn has no pass open.
-    if (!ensure_pass()) return false;
+    // Alone in its pass, for the same reason the rectangle clear is: see clear_attachment_alone. The
+    // measurement that forced this was made for colour; depth is treated the same way because it costs the
+    // same and the alternative is a draw that silently produces nothing.
     VkClearAttachment ca;
     memset(&ca, 0, sizeof ca);
     ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     ca.clearValue.depthStencil = {value, 0};
     const VkClearRect rect = clear_rect();
-    vkCmdClearAttachments(g_cmd, 1, &ca, 1, &rect);
-    return true;
+    return clear_attachment_alone(ca, rect);
 }
 
 bool read_color(const Image *img, void *out)

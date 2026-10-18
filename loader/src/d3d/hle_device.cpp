@@ -18,6 +18,8 @@
 //     counted object and the game will Release it.
 #include "d3d/device_posix.h"
 
+#include "gfx/gfx_vulkan.h"
+
 #include "d3d/resource_posix.h"
 #include "d3d/vshader_store_posix.h"
 
@@ -83,6 +85,58 @@ Surface *XD3D_STDCALL D3DDevice_GetDepthStencilSurface2()
     Surface *s = state().depth_stencil;
     if (s) s->Common++;
     return s;
+}
+
+// Clear: the first row in this file that touches a graphics device rather than writing bytes the game reads.
+//
+// Three things make it more than a colour write, and each of them is a place the console's behaviour and
+// ours differ:
+//
+//   * The flags are the console's mask, not D3D9's. XCLEAR_TARGET is 0xF0 -- a colour mask, not a bit -- so a
+//     translation that mapped TARGET onto "the colour bit" would clear nothing at all and say nothing.
+//   * A null rectangle list means the whole target, and a rectangle covering the whole target means the same
+//     thing. The console treated them alike; treating a full-screen rectangle as a rectangle is what pushed
+//     the work through a path this driver is known to break.
+//   * The colour arrives as 0xAARRGGBB in one dword and leaves as four floats. The byte order is A8R8G8B8,
+//     which is the console's, not D3D8's documented DXT format for the same name; getting it backwards
+//     swaps red and blue on every clear, which reads as a wrong background rather than as an error.
+uint32_t XD3D_STDCALL D3DDevice_Clear(uint32_t Count, const D3DRect *pRects, uint32_t Flags, uint32_t Color, float Z,
+                                      uint32_t Stencil)
+{
+    pb_flush();
+    (void)Stencil; // no stencil attachment is ever bound, so the flag has nothing to act on
+
+    if (!(Flags & (XCLEAR_TARGET | XCLEAR_ZBUFFER | XCLEAR_STENCIL))) {
+        // Nothing asked to be cleared. The console drew nothing and so does this; refusing would be wrong,
+        // because a game that ORs several flags and clears none of them is legal.
+        return D3D_OK;
+    }
+
+    const float rgba[4] = {
+        (float)((Color >> 16) & 0xFF) / 255.0f,
+        (float)((Color >> 8) & 0xFF) / 255.0f,
+        (float)(Color & 0xFF) / 255.0f,
+        (float)((Color >> 24) & 0xFF) / 255.0f,
+    };
+
+    bool ok = true;
+    if (Flags & XCLEAR_TARGET) {
+        if (!pRects || Count == 0) {
+            ok = gfx::clear_color(rgba);
+        } else {
+            for (uint32_t i = 0; i < Count && ok; i++) {
+                const D3DRect &r = pRects[i];
+                // The console's rectangles are half-open, so the width is a subtraction rather than an
+                // increment -- and a rectangle that comes out empty is not an error, it clears nothing.
+                if (r.x2 <= r.x1 || r.y2 <= r.y1) continue;
+                ok = gfx::clear_color_rect(rgba, (uint32_t)r.x1, (uint32_t)r.y1, (uint32_t)(r.x2 - r.x1),
+                                           (uint32_t)(r.y2 - r.y1));
+            }
+        }
+    }
+    if (ok && (Flags & XCLEAR_ZBUFFER)) ok = gfx::clear_depth(Z);
+    if (!ok) logf("[d3d] Clear: %s", gfx::last_error());
+    return ok ? D3D_OK : D3DERR_NOTAVAILABLE;
 }
 
 // ---- transforms and viewport ----
@@ -502,6 +556,7 @@ static const Hle kDeviceTable[] = {
     H(0x0026d110, D3DDevice_BeginPush, "s", true),
     H(0x0026d170, D3DDevice_EndPush, "s", false),
     H(0x0026a1f0, D3DDevice_End, "", false),
+    H(0x00268880, D3DDevice_Clear, "s s s s s s", true),
 
     // ---- render targets ----
     H(0x0026a420, D3DDevice_SetRenderTarget, "s s", true),

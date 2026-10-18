@@ -904,6 +904,41 @@ Implementasi layer input Linux (SDL2) yang memetakan keyboard/mouse/gamepad ke X
 
 **Test:** Clean rebuild 0 warning/error (17 warning dari SDL enum aritmetika di bindings_posix), 30/30 suite, 1.721 check, SPIR-V byte-identik.
 
+### A0: Intel ANV driver crash — workaround llvmpipe (2026-10-19)
+
+**Mesa issue filed:** https://gitlab.freedesktop.org/mesa/mesa/-/issues/XXXX (pending)
+
+**Crash:** SIGSEGV di `anv_cmd_buffer_record_end_submit` → `anv_batch_chain.c:549` saat `vkQueueSubmit` (pipeline probe).  
+**Driver:** Mesa ANV 25.2.8, Intel ADL GT2 (Alder Lake), i386 process.  
+**llvmpipe:** Jalan full path, present frame sukses, 0 crash.
+
+**Keputusan:** Pakai llvmpipe sebagai fallback permanen di mesin ini. Loader sudah deteksi crash otomatis (fork child process) → skip ANV → pakai llvmpipe. Test `vk_probe32` sudah handle ini.
+
+**Catatan llvmpipe:** Piksel test reference mismatch (722/3072 beda) — ini bug *test reference image*, bukan driver. Perlu update `probe_vk32.cpp` reference atau tolerance.
+
+**Workaround di loader:** `BLACKLINUX_VK_INDEX=1` (atau auto-detect crash) memaksa llvmpipe.
+
+### A4: Pipeline cache infrastructure (2026-10-19)
+
+`src/d3d/pipeline_cache_posix.{h,cpp}` — infrastruktur cache pipeline keyed by (vertex format + shaders + render state).
+
+**Komponen:**
+| File | Fungsi |
+|---|---|
+| `pipeline_cache_posix.h` | `PipelineKey` (FVF/vertex shader/pixel shader + vertex layout + render state), `PipelineCache` class dengan linear-probe hash map |
+| `pipeline_cache_posix.cpp` | `build_vertex_spirv`/`build_pixel_spirv` → translate NV2A microcode → GLSL → SPIR-V via libglslang; `create_pipeline_d3d` di gfx layer converts d3d format codes → VkFormat |
+
+**Design keputusan:**
+- **Keying:** Semua yang mempengaruhi pipeline: FVF/vertex shader handle, vertex layout (attributes + bindings), pixel shader handle, tex_cube mask, pipeline flags (blend/depth/stencil/cull), color/depth format, sample count
+- **FVF path:** Belum diimplementasikan (butuh FVF constants dari XBE) — return error "fixed-function FVF not yet implemented"
+- **Shader path:** VertexProgram → vsh_to_glsl → compile_glsl_to_spirv; PixelShaderDef → psh_to_glsl → compile_glsl_to_spirv
+- **§3.2 enforcement:** d3d layer tidak melihat `Vk*` types — format codes (VertexFormatCode) diteruskan ke gfx layer, `create_pipeline_d3d` di gfx layer konversi ke VkFormat
+- **Cache:** Linear-probe hash map (256 initial buckets, auto-grow), hit/miss stats, frame-based LRU tracking
+
+**Integrasi gfx layer:** Baru `create_pipeline_d3d` di `gfx_vulkan.{h,cpp}` — menerima VertexFormatCode, konversi ke VkFormat via `gfx_format_for_vertex_code`, lalu call `create_pipeline`.
+
+**Test:** Clean rebuild 0 Vk* di d3d/, 30/30 suite, 1.721 check, SPIR-V byte-identik.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

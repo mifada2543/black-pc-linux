@@ -274,6 +274,17 @@ struct Pipeline {
 bool create_pipeline(Pipeline *p, const PipelineDesc &desc);
 void destroy_pipeline(Pipeline *p);
 
+// Build a pipeline from d3d-layer format codes (VertexFormatCode for vertex attributes,
+// and gfx::VertexFormatCode for color/depth). This keeps VkFormat out of the d3d layer.
+// color_format/depth_format are VertexFormatCode; 0 means no attachment.
+bool create_pipeline_d3d(Pipeline *p,
+                         const void *vertex_spirv, size_t vertex_spirv_size,
+                         const void *fragment_spirv, size_t fragment_spirv_size,
+                         uint32_t color_format, uint32_t depth_format,
+                         const VertexAttribute *attributes, uint32_t attribute_count,
+                         const VertexBinding *bindings, uint32_t binding_count,
+                         uint32_t flags, uint32_t sample_count);
+
 // ---- samplers and texture bindings ----
 //
 // One sampler per D3DTSS set. The Xbox's sampler state is address modes, filters and anisotropy, which maps

@@ -87,6 +87,7 @@ if(UNIX)
     src/d3d/hle_device.cpp
     src/d3d/resource_posix.cpp
     src/d3d/vshader_store_posix.cpp
+    src/d3d/pipeline_cache_posix.cpp
     src/d3d/draw_posix.cpp
     src/d3d/vertex_posix.cpp
     src/input/xinput_posix.cpp

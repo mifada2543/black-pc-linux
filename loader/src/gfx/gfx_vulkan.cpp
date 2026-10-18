@@ -1882,6 +1882,33 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
     return true;
 }
 
+// ---- d3d-layer pipeline creation (keeps VkFormat out of d3d layer) ----
+// color_format/depth_format are gfx::VertexFormatCode (0 = no attachment).
+// This function converts the d3d format codes to VkFormat and calls create_pipeline.
+bool create_pipeline_d3d(Pipeline *p,
+                         const void *vertex_spirv, size_t vertex_spirv_size,
+                         const void *fragment_spirv, size_t fragment_spirv_size,
+                         uint32_t color_format, uint32_t depth_format,
+                         const VertexAttribute *attributes, uint32_t attribute_count,
+                         const VertexBinding *bindings, uint32_t binding_count,
+                         uint32_t flags, uint32_t sample_count)
+{
+    gfx::PipelineDesc desc = {};
+    desc.vertex_spirv = vertex_spirv;
+    desc.vertex_spirv_size = vertex_spirv_size;
+    desc.fragment_spirv = fragment_spirv;
+    desc.fragment_spirv_size = fragment_spirv_size;
+    desc.color_format = gfx_format_for_vertex_code(color_format);
+    desc.depth_format = depth_format ? gfx_format_for_vertex_code(depth_format) : VK_FORMAT_UNDEFINED;
+    desc.attributes = attributes;
+    desc.attribute_count = attribute_count;
+    desc.bindings = bindings;
+    desc.binding_count = binding_count;
+    desc.flags = flags;
+    desc.sample_count = sample_count;
+    return create_pipeline(p, desc);
+}
+
 void destroy_pipeline(Pipeline *p)
 {
     if (!p || !g_device) return;

@@ -48,4 +48,13 @@ void pb_flush()
     // stub nobody remembered.
 }
 
+void pb_reset()
+{
+    // Same reasoning as pb_flush(), and the same reason to exist as a named function: the console
+    // rewinds its push buffer rather than growing it, and D3D_MakeRequestedSpace and D3DDevice_BeginPush
+    // both call this. When A4 gives the buffer a real implementation, the rewind has to move the device
+    // object's DEV_PUT cursor back to the base as well as reset the shadow -- which is why it is not left
+    // implicit in the two callers.
+}
+
 } // namespace xd3d

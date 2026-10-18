@@ -54,7 +54,8 @@ void usage()
             "  --xbe <path>    XBE to run (default game/default.xbe)\n"
             "  --log <path>    log file (default blacklinux.log)\n"
             "  --hdd <path>    writable folder for \\Device\\Harddisk0 (default $XDG_DATA_HOME/blacklinux)\n"
-            "  --probe         enter the entry point, wait --timeout seconds, then exit\n"
+            "  --probe         enter the entry point, wait --timeout seconds, then report how far it got\n"
+            "                  (set BLACKLINUX_TRACE=1 to record which D3D entries it called)\n"
             "  --info          print the image and exit without mapping it\n"
             "  --timeout <s>   --probe timeout in seconds (default 15)\n"
             "  --trace         detail lines and every stub call on the console too\n"
@@ -174,6 +175,11 @@ int run(const Options &o)
         code = 1;
         break;
     }
+
+    // --probe is a report as well as a run: after the timeout it says, by name, how far the game got. It
+    // is printed whether or not the run ended in a stop, because "it got all the way through D3D init and
+    // then sat in its own loop" and "it died on the fourth call" are both answers someone needs.
+    if (o.probe) boot_print_probe_report(rep);
 
     if (o.strict && rep.thunks.stubbed)
         logc("strict: %d kernel imports are logging stubs", rep.thunks.stubbed);

@@ -164,23 +164,375 @@ void XD3D_STDCALL D3DDevice_SetRenderState_Simple(uint32_t Method, uint32_t Valu
     (void)Value;
 }
 
+// ---- direct3d: adapters and modes ----
+
+uint32_t XD3D_STDCALL Direct3D_GetAdapterModeCount(uint32_t Adapter)
+{
+    // One adapter is one Xbox, so the count does not depend on which one was asked for. The argument is
+    // named in the table because the thunk must match the spec; the value is not used.
+    (void)Adapter;
+    return (uint32_t)(sizeof kModes / sizeof kModes[0]);
+}
+
+uint32_t XD3D_STDCALL Direct3D_EnumAdapterModes(uint32_t Adapter, uint32_t Mode, DisplayMode *pMode)
+{
+    (void)Adapter;
+    // Out of range is refused, not clamped: a caller that asked for mode 7 of a one-mode adapter has a
+    // bug, and handing it mode 0 would hide it until something else went wrong.
+    if (Mode >= sizeof kModes / sizeof kModes[0]) return D3DERR_INVALIDCALL;
+    if (!pMode) return D3D_E_POINTER;
+    *pMode = kModes[Mode];
+    return D3D_OK;
+}
+
+// ---- display ----
+
+// D3DFIELD_STATUS is {Field, VBlankCount}, and the fields alternate: 1 is odd, 2 is even. The count is
+// reported as the field number, which is what the console did -- a caller that only polls the parity
+// gets the same answer either way, and one that reads the count still gets a moving value.
+void XD3D_STDCALL D3DDevice_GetDisplayFieldStatus(uint32_t *pFieldStatus)
+{
+    if (!pFieldStatus) return;
+    const uint32_t vb = state().vblank_count;
+    pFieldStatus[0] = (vb & 1u) ? 1u : 2u;
+    pFieldStatus[1] = vb;
+}
+
+// Release on the device is a call the game makes once at shutdown. The device is the singleton at
+// ADDR_DEVICE_OBJECT and lives until the process ends, so there is nothing to free; returning 1 keeps
+// the reference count the caller expects without pretending otherwise.
+uint32_t XD3D_STDCALL D3DDevice_Release()
+{
+    return 1;
+}
+
+// ---- push buffer ----
+
+// MakeRequestedSpace: hand back where the caller may write. The HLE queues nothing, so the answer is
+// simply the write pointer -- but it is read from the device object rather than from our own shadow,
+// because that is where the game expects the cursor to live.
+uint32_t *XD3D_STDCALL D3D_MakeRequestedSpace(uint32_t MinimumSpace, uint32_t RequestedSpace)
+{
+    (void)MinimumSpace;
+    (void)RequestedSpace;
+    pb_flush();
+    pb_reset();
+    return dev_field<uint32_t *>(DEV_PUT);
+}
+
+// BeginPush asks the same question with room for a whole primitive. The threshold test is kept because it
+// is what decides whether the buffer is rewound first: a caller handed a pointer with less than
+// Count + 16 dwords left would run past the guard the console keeps there.
+uint32_t *XD3D_STDCALL D3DDevice_BeginPush(uint32_t Count)
+{
+    uint32_t *put = dev_field<uint32_t *>(DEV_PUT);
+    uint32_t *threshold = dev_field<uint32_t *>(DEV_THRESHOLD);
+    // Both are null until the device exists. Comparing them then would be a comparison of two unrelated
+    // pointers, so the test is skipped and the null pointer is handed back as the honest answer.
+    if (put && threshold && put + Count + 16 >= threshold) {
+        pb_flush();
+        pb_reset();
+        put = dev_field<uint32_t *>(DEV_PUT);
+    }
+    return put;
+}
+
+// EndPush: the caller's pointer IS the new write cursor, so it is stored before the flush. Flushing first
+// would emit whatever the previous primitive left behind, under a cursor the game has already moved.
+void XD3D_STDCALL D3DDevice_EndPush(uint32_t *pPush)
+{
+    dev_field<uint32_t *>(DEV_PUT) = pPush;
+    pb_flush();
+}
+
+void XD3D_STDCALL D3DDevice_End()
+{
+    pb_flush();
+}
+
+// ---- the viewport transform ----
+
+// NV2A screen space: screen = clip / w * scale + offset. The depth scale is the D24 range (16777215),
+// which is a constant here and not a format lookup: the console's z buffer is D24 whatever the colour
+// format is, so asking the depth format here would be asking the wrong question.
+void viewport_transform(float *pScale, float *pOffset)
+{
+    const Viewport &v = state().viewport;
+    const float zscale = 16777215.0f;
+    const float sx = state().screen_offset[0], sy = state().screen_offset[1];
+    pScale[0] = v.Width * 0.5f;
+    pScale[1] = -(v.Height * 0.5f);
+    pScale[2] = (v.MaxZ - v.MinZ) * zscale;
+    pScale[3] = 1.0f;
+    pOffset[0] = v.X + v.Width * 0.5f + sx;
+    pOffset[1] = v.Y + v.Height * 0.5f + sy;
+    pOffset[2] = v.MinZ * zscale;
+    pOffset[3] = 0.0f;
+}
+
+// Scale first, offset second, even though the transform reads "clip * scale + offset". That argument
+// order is the console's and the game's; reversing it would mirror the image about both axes.
+void XD3D_STDCALL D3DDevice_GetViewportOffsetAndScale(float *pOffset, float *pScale)
+{
+    if (!pOffset || !pScale) return;
+    viewport_transform(pScale, pOffset);
+}
+
+// FUN_0026eaf0: game code that poked the screen-space offset fields directly calls this to have the
+// transform rebuilt. The HLE derives the transform when it is read, so there is nothing to push and the
+// pointer comes back unchanged -- which is what the invoice returned too.
+uint32_t *XD3D_STDCALL D3D_WriteViewportTransform(uint32_t *pPush)
+{
+    return pPush;
+}
+
+// ---- palettes and streams ----
+
+void XD3D_STDCALL D3DDevice_SetPalette(uint32_t Stage, Palette *pPalette)
+{
+    if (Stage >= TEXTURESTAGE_COUNT) return;
+    state().palettes[Stage] = pPalette;
+}
+
+void XD3D_STDCALL D3DDevice_SetStreamSource(uint32_t StreamNumber, VertexBuffer *pStreamData, uint32_t Stride)
+{
+    if (StreamNumber >= 16) return;
+    pb_flush();
+    state().streams[StreamNumber].buffer = pStreamData;
+    state().streams[StreamNumber].stride = Stride;
+}
+
+// ---- the four single-state render entry points ----
+//
+// Each is one render-state index with the index baked into its own function, because the original
+// library compiled them that way and the game calls each by its own address. A macro rather than four
+// near-identical bodies: the four differ only in the index they write, and a hand-copied body is exactly
+// where a name and an index drift apart.
+
+#define RS_SETTER(fn, index)                 \
+    void XD3D_STDCALL fn(uint32_t Value)     \
+    {                                        \
+        pb_flush();                          \
+        render_state()[index] = Value;       \
+    }
+RS_SETTER(D3DDevice_SetRenderState_NormalizeNormals, XRS_NORMALIZENORMALS)
+RS_SETTER(D3DDevice_SetRenderState_StencilEnable, XRS_STENCILENABLE)
+RS_SETTER(D3DDevice_SetRenderState_StencilFail, XRS_STENCILFAIL)
+RS_SETTER(D3DDevice_SetRenderState_TextureFactor, XRS_TEXTUREFACTOR)
+#undef RS_SETTER
+
+void XD3D_STDCALL D3DDevice_SetTextureStageStateNotInline(uint32_t Stage, uint32_t Type, uint32_t Value)
+{
+    pb_flush();
+    if (Stage < TEXTURESTAGE_COUNT && Type < 32) texture_state((int)Stage)[Type] = Value;
+}
+
+// FUN_002709a0: the original library's lazy flush, which processed dirty flags here. The HLE applies
+// state when a draw is issued instead, so there is nothing to do. Doing nothing is the correct
+// behaviour, not a stub: a draw reads whatever the arrays hold at the moment it is issued.
+void XD3D_STDCALL D3D_FlushDirtyState() {}
+
+// FUN_002695f0 (esi = device): the fog and vertex-shader state upload. Fog reaches the hardware as two
+// render states the game sets itself, so there is nothing to upload here either.
+void XD3D_STDCALL D3D_UpdateFogState() {}
+
+// ---- shaders and their constants ----
+
+// CreateVertexShader: translating NV2A microcode into SPIR-V is A5. What is settled here is the handle
+// convention, because the game stores the handle and compares it -- bit 0 marks a real shader. With no
+// translation there is nothing to hand back, and a caller given a handle it could pass to SetVertexShader
+// and DeleteVertexShader would fault later, far from the call at fault. D3DERR_INVALIDCALL is the console's
+// own answer for a program it would not take, and it is one the game can see and report.
+uint32_t XD3D_STDCALL D3DDevice_CreateVertexShader(const uint32_t *pDeclaration, const uint32_t *pFunction,
+                                                  uint32_t *pHandle, uint32_t Usage)
+{
+    (void)pDeclaration;
+    (void)pFunction;
+    (void)Usage;
+    if (!pHandle) return D3D_E_POINTER;
+    return D3DERR_INVALIDCALL;
+}
+
+// Delete still has to clear the binding: a deleted shader left bound means the next draw reads a shader
+// that is no longer there. The handle itself is released in A5.
+void XD3D_STDCALL D3DDevice_DeleteVertexShader(uint32_t Handle)
+{
+    if (state().vertex_shader == Handle) state().vertex_shader = 0;
+}
+
+// One register is four floats, so a register's worth is 16 bytes and `count` is in registers. A register
+// outside the bank is dropped rather than clamped: 192 is where the XDK's shader epilogue stops, and a
+// clamped write would land somewhere the game never wrote.
+static void set_vs_constants(int Slot, const float *pData, uint32_t Count)
+{
+    pb_flush();
+    if (!pData) return;
+    for (uint32_t i = 0; i < Count; i++) {
+        const int r = Slot + (int)i;
+        if (r >= 0 && r < (int)VS_CONSTANT_COUNT) memcpy(state().vs_constants[r], pData + 4 * i, 16);
+    }
+}
+
+void XD3D_STDCALL D3DDevice_SetVertexShaderConstant1(int Register, const float *pConstantData)
+{
+    set_vs_constants(Register, pConstantData, 1);
+}
+
+void XD3D_STDCALL D3DDevice_SetVertexShaderConstant1Fast(int Register, const float *pConstantData)
+{
+    set_vs_constants(Register, pConstantData, 1);
+}
+
+void XD3D_STDCALL D3DDevice_SetVertexShaderConstant4(int Register, const float *pConstantData)
+{
+    set_vs_constants(Register, pConstantData, 4);
+}
+
+// The count here is in DWORDs, not registers: FUN_002699e0 pushes that many with SET_TRANSFORM_CONSTANT.
+// Read as a register count it writes four times too far, overwriting the following slots with memory past
+// the caller's data -- the invoice records losing three slots that way.
+void XD3D_STDCALL D3DDevice_SetVertexShaderConstantNotInlineFast(int Register, const float *pConstantData,
+                                                                 uint32_t DwordCount)
+{
+    set_vs_constants(Register, pConstantData, DwordCount / 4);
+}
+
+// The console kept a bound pixel shader's program in render states 0-56, which game code patches in
+// place. Binding is therefore a copy into those states, not a pointer the loader dereferences later. A5
+// does the translation, so there is nothing to copy in yet -- but the handle is stored regardless, so
+// DeletePixelShader and SetPixelShaderConstant see the same binding the game believes is current.
+void XD3D_STDCALL D3DDevice_SetPixelShader(uint32_t Handle)
+{
+    pb_flush();
+    state().pixel_shader = Handle;
+}
+
+void XD3D_STDCALL D3DDevice_DeletePixelShader(uint32_t Handle)
+{
+    if (state().pixel_shader == Handle) state().pixel_shader = 0;
+}
+
+void XD3D_STDCALL D3DDevice_SetPixelShaderConstant(uint32_t Register, const float *pConstantData,
+                                                   uint32_t ConstantCount)
+{
+    pb_flush();
+    if (!pConstantData) return;
+    for (uint32_t i = 0; i < ConstantCount; i++) {
+        const uint32_t r = Register + i;
+        if (r < PS_CONSTANT_COUNT) memcpy(state().ps_constants[r], pConstantData + 4 * i, 16);
+    }
+}
+
+// ---- fences and time ----
+
+// A fence on this console completed when it was asked for, because the HLE does the work when it is
+// asked. So the token is a counter, and the device object's copy at DEV_GPUTIME is updated to match --
+// game code reads that field directly rather than through this function.
+uint32_t XD3D_STDCALL D3D_SetFence(uint32_t Flags)
+{
+    (void)Flags;
+    pb_flush();
+    ++state().gpu_time;
+    dev_field<uint32_t>(DEV_GPUTIME) = state().gpu_time;
+    return state().gpu_time;
+}
+
+uint32_t XD3D_STDCALL D3DDevice_IsFencePending(uint32_t Fence)
+{
+    (void)Fence;
+    return 0; // nothing is ever outstanding
+}
+
+// BlockOnTime is the console's "wait until this timestamp". Nothing here is deferred, so it returns.
+void XD3D_STDCALL D3D_BlockOnTime(uint32_t Time, uint32_t MakeSpace)
+{
+    (void)Time;
+    (void)MakeSpace;
+}
+
 // ---- the table ----
 
 #define H(addr, fn, params, ret) { addr, #fn, (void *)&fn, params, ret }
 
+// Every row here is one console entry point: the address the game calls, the spec the thunk has to
+// match, and whether it hands a value back. The order and the addresses are facts about the image, so
+// they are copied from the invoice's own table rather than written from memory.
+//
+// Seven invoice rows are absent on purpose, and for two different reasons.
+//
+// Three need a graphics device or a window: Direct3D_CreateDevice (0x0026c620), D3DDevice_Clear
+// (0x00268880) and D3DDevice_Swap (0x002773a0). Adding them here would be a stub that looks like it works.
+//
+// Four take a structure this port cannot name yet: D3DDevice_SetMaterial, D3DDevice_SetLight and
+// D3DDevice_LightEnable (D3DMATERIAL9 / D3DLIGHT9) and D3DDevice_SetScissors (D3DRECT). The invoice took
+// all three types from Windows d3d9 headers, which a Linux i386 build does not have -- and the console's
+// own D3D8 layouts are not something to type from memory: getting a size wrong means copying past the
+// end of whatever the game allocated. They stay out until the image is available and their layout can be
+// read off it, which is A4/B1 work. Saying so here is the point: a caller the game makes to an address
+// with no thunk is reported by the dispatcher, so the gap is visible while it lasts.
 static const Hle kDeviceTable[] = {
+    // ---- Direct3D: adapters and device creation ----
+    H(0x00277580, Direct3D_GetAdapterModeCount, "s", true),
+    H(0x00277640, Direct3D_EnumAdapterModes, "s s s", true),
+
+    // ---- device lifetime and display ----
+    H(0x0026b5d0, D3DDevice_Release, "", true),
     H(0x0026a320, D3DDevice_GetDisplayMode, "s", true),
+    H(0x0026b610, D3DDevice_GetDisplayFieldStatus, "s", false),
+
+    // ---- push buffer ----
+    H(0x0026cdc0, D3D_MakeRequestedSpace, "s eax", true),
+    H(0x0026d110, D3DDevice_BeginPush, "s", true),
+    H(0x0026d170, D3DDevice_EndPush, "s", false),
+    H(0x0026a1f0, D3DDevice_End, "", false),
+
+    // ---- render targets ----
     H(0x0026a420, D3DDevice_SetRenderTarget, "s s", true),
     H(0x0026aa60, D3DDevice_GetRenderTarget2, "", true),
     H(0x0026aaa0, D3DDevice_GetDepthStencilSurface2, "", true),
+
+    // ---- transforms, viewport, material ----
     H(0x0026aae0, D3DDevice_SetTransform, "s s", false),
     H(0x0026ac00, D3DDevice_SetViewport, "s", false),
+    H(0x0026e9c0, D3DDevice_GetViewportOffsetAndScale, "s s", false),
     H(0x0026ba50, D3DDevice_SetScreenSpaceOffset, "s s", false),
+    H(0x0026eaf0, D3D_WriteViewportTransform, "eax", true),
+
+    // ---- textures, palettes, streams ----
     H(0x0026b370, D3DDevice_SetTexture, "s s", false),
+    H(0x0026b530, D3DDevice_SetPalette, "s s", false),
+    H(0x00268de0, D3DDevice_SetStreamSource, "s s s", false),
+
+    // ---- render state and texture-stage state ----
     H(0x0026e5e0, D3DDevice_SetRenderStateNotInline, "s s", false),
     H(0x0026e5b0, D3DDevice_SetRenderState_Simple, "ecx edx", false),
+    H(0x0026dd60, D3DDevice_SetRenderState_NormalizeNormals, "s", false),
+    H(0x0026de50, D3DDevice_SetRenderState_StencilEnable, "s", false),
+    H(0x0026df00, D3DDevice_SetRenderState_StencilFail, "s", false),
+    H(0x0026df80, D3DDevice_SetRenderState_TextureFactor, "s", false),
+    H(0x0026e860, D3DDevice_SetTextureStageStateNotInline, "s s s", false),
+    H(0x002709a0, D3D_FlushDirtyState, "", false),
+    H(0x002695f0, D3D_UpdateFogState, "", false),
+
+    // ---- vertex shaders ----
+    H(0x00269480, D3DDevice_CreateVertexShader, "s s s s", true),
+    H(0x002695d0, D3DDevice_DeleteVertexShader, "s", false),
     H(0x00269710, D3DDevice_SetVertexShader, "s", false),
     H(0x002690c0, D3D_SelectVertexShader, "eax", false),
+    H(0x00269880, D3DDevice_SetVertexShaderConstant1, "ecx edx", false),
+    H(0x002698e0, D3DDevice_SetVertexShaderConstant1Fast, "ecx edx", false),
+    H(0x00269930, D3DDevice_SetVertexShaderConstant4, "ecx edx", false),
+    H(0x002699e0, D3DDevice_SetVertexShaderConstantNotInlineFast, "ecx edx s", false),
+
+    // ---- pixel shaders ----
+    H(0x0026bd00, D3DDevice_SetPixelShader, "s", false),
+    H(0x0026bce0, D3DDevice_DeletePixelShader, "s", false),
+    H(0x0026bf10, D3DDevice_SetPixelShaderConstant, "ecx s eax", false),
+
+    // ---- fences and time ----
+    H(0x0026c920, D3D_SetFence, "s", true),
+    H(0x0026d0f0, D3DDevice_IsFencePending, "s", true),
+    H(0x0026cc10, D3D_BlockOnTime, "s s", false),
 };
 
 #undef H

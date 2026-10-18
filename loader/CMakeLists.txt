@@ -42,6 +42,9 @@ if(UNIX)
     src/d3d/device_posix.cpp
     src/d3d/hle_table_posix.cpp
     src/d3d/hle_device.cpp
+    src/d3d/vertex_posix.cpp
+    src/shader/nv2a_vsh_posix.cpp
+    src/shader/nv2a_psh_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
@@ -66,12 +69,79 @@ if(UNIX)
   target_link_libraries(gfx PRIVATE blackcore)
   target_compile_options(gfx PRIVATE -Wall -Wextra -Wno-unused-parameter)
   target_link_libraries(blackcore PUBLIC gfx)
+  # ---- the shader runtime: libglslang, i386, linked (plan section 7, decision 10) ----
+  #
+  # This is a runtime dependency and not the build-time one below: the game's NV2A microcode arrives while
+  # it is running, so something has to compile it then. The x86-64 library would be useless here -- this
+  # loader is a 32-bit process -- so the 32-bit one is looked for explicitly, and its absence is reported as
+  # a sentence rather than left to become a link error about a symbol nobody can act on.
+  find_path(GLSLANG_INCLUDE_DIR glslang/Public/ShaderLang.h
+            PATHS /usr/include /usr/include/i386-linux-gnu
+            NO_CMAKE_FIND_ROOT_PATH)
+  find_library(GLSLANG_LIBRARY NAMES glslang
+               PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib
+               NO_CMAKE_FIND_ROOT_PATH)
+
+  if(GLSLANG_INCLUDE_DIR AND GLSLANG_LIBRARY)
+    message(STATUS "libglslang ${GLSLANG_LIBRARY} -- the shader runtime will compile GLSL at run time")
+    add_library(shaderc_rt STATIC src/shader/glslang_posix.cpp)
+    target_include_directories(shaderc_rt PUBLIC src ${GLSLANG_INCLUDE_DIR})
+    # libglslang.a is a static archive and its SPIR-V emitter calls into SPIRV-Tools, so those come with
+    # it. Found by name rather than hard-coded, because a machine with a shared libglslang would not have
+    # them at all -- and a static archive that needs a library nobody listed fails with undefined references
+    # about spvContextCreate, which says nothing about where they come from.
+    # Three more archives, and the order matters because these are all static. libglslang.a's emitter calls
+    # spvtools::Optimizer (which lives in the -opt archive, not the plain one), which calls into libSPIRV.a,
+    # and the default resource table lives in a fourth archive of its own. A missing one shows up as an
+    # undefined reference to a symbol nobody can place, which is why each is named in a comment.
+    set(GLSLANG_EXTRA_LIBS)
+    foreach(lib SPIRV SPIRV-Tools-opt SPIRV-Tools glslang-default-resource-limits)
+      find_library(GLSLANG_LIB_${lib} NAMES ${lib} PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib
+                   NO_CMAKE_FIND_ROOT_PATH)
+      if(GLSLANG_LIB_${lib})
+        list(APPEND GLSLANG_EXTRA_LIBS ${GLSLANG_LIB_${lib}})
+      else()
+        message(WARNING "  ${lib} not found -- linking libglslang will probably fail on undefined references")
+      endif()
+    endforeach()
+    # libSPIRV.a before SPIRV-Tools-opt before libglslang.a: the archives are searched in the order given.
+    target_link_libraries(shaderc_rt PUBLIC ${GLSLANG_LIBRARY} ${GLSLANG_EXTRA_LIBS})
+    target_compile_options(shaderc_rt PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(blackcore PUBLIC shaderc_rt)
+    set(HAVE_GLSLANG ON)
+  else()
+    message(WARNING
+      "libglslang for i386 was not found, so the shader runtime is disabled and A5 cannot build.\n"
+      "  Install it with:  sudo apt install glslang-dev:i386\n"
+      "  The x86-64 package does not help: this loader is a 32-bit process.\n"
+      "  Everything else here builds and tests without it.")
+    set(HAVE_GLSLANG OFF)
+  endif()
+
   # Shaders are compiled at build time and embedded, so the loader ships with its SPIR-V inside it and needs
   # nothing installed to run. glslangValidator comes from glslang-tools; without it the graphics suite is
   # skipped rather than failing the build, because everything else here does not need a shader.
-  find_program(GLSLANG glslangValidator)
+  find_program(GLSLANG_VALIDATOR glslangValidator)
+  # find_program caches, so an upgrade that *removes* the binary leaves the path sitting in the cache and
+  # the build goes on believing in a file that is no longer there. Re-checking the file is one line and turns
+  # a confusing "no such file or directory" from deep inside a custom command into the host tool being used.
+  if(GLSLANG_VALIDATOR AND NOT EXISTS "${GLSLANG_VALIDATOR}")
+    message(STATUS "glslangValidator was uninstalled since the last configure -- not using the cached path")
+    unset(GLSLANG_VALIDATOR CACHE)
+  endif()
+  # The same compiler the shader runtime links, as a build tool. Preferred when glslangValidator is absent,
+  # which is what happens on a machine that installed glslang-dev:i386: that package conflicts with the
+  # amd64 glslang-tools, so apt removes the binary. Keeping the build dependent on it would mean installing
+  # A5's dependency silently breaks the A0 gate, which links the shaders generated here.
+  set(GLSLANG_HOST_TOOL)
+  if(HAVE_GLSLANG)
+    add_executable(glslc_host tools/glslc_host.cpp)
+    target_link_libraries(glslc_host PRIVATE shaderc_rt)
+    target_include_directories(glslc_host PRIVATE ${GLSLANG_INCLUDE_DIR})
+    set(GLSLANG_HOST_TOOL $<TARGET_FILE:glslc_host>)
+  endif()
   set(SPV_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/shaders)
-  if(GLSLANG)
+  if(GLSLANG_VALIDATOR OR GLSLANG_HOST_TOOL)
     file(MAKE_DIRECTORY ${SPV_DIR})
     # SPIR-V 1.0 / Vulkan 1.0 is the target, not the newest the compiler can emit: llvmpipe's shader JIT on
     # this machine (Mesa 24.x, 32-bit) segfaults inside vkCreateGraphicsPipelines on SPIR-V from a
@@ -86,6 +156,16 @@ if(UNIX)
     # One custom command per shader file, with the C symbol spelled out next to it. Doing this by string
     # surgery on the file name produced "kProbevert" the first time, and the compiler caught it.
     set(SPV_HEADERS)
+    # One command shape for both compilers, chosen here rather than in the loop: the validator takes the
+    # source and -o, the host tool takes the stage and the target env. Spelling that out per shader is how a
+    # stage name ends up in the wrong slot of the wrong command.
+    if(GLSLANG_VALIDATOR)
+      set(GLSLANG_COMPILE ${GLSLANG_VALIDATOR})
+      message(STATUS "shader compilation: glslangValidator at ${GLSLANG_VALIDATOR}")
+    else()
+      set(GLSLANG_COMPILE ${GLSLANG_HOST_TOOL})
+      message(STATUS "shader compilation: glslc_host (glslangValidator is not installed)")
+    endif()
     set(SPV_LIST "probe.vert|kProbeVert" "probe.frag|kProbeFrag" "probe_tex.frag|kProbeTexFrag")
     foreach(entry ${SPV_LIST})
       string(REPLACE "|" ";" parts ${entry})
@@ -96,7 +176,7 @@ if(UNIX)
       set(hdr ${SPV_DIR}/${sym}_spirv.h)
       add_custom_command(
         OUTPUT ${hdr}
-        COMMAND ${GLSLANG} -V --target-env ${SPIRV_TARGET_ENV} -o ${spv}
+        COMMAND ${GLSLANG_COMPILE} -V --target-env ${SPIRV_TARGET_ENV} -o ${spv}
                 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${stem}
         COMMAND ${CMAKE_COMMAND} -DINPUT=${spv} -DOUTPUT=${hdr} -DNAME=${name}Spv
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gen_spirv_header.cmake
@@ -109,7 +189,8 @@ if(UNIX)
     add_library(blackshaders_headers INTERFACE)
     target_include_directories(blackshaders_headers INTERFACE ${SPV_DIR})
   else()
-    message(WARNING "glslangValidator not found -- the headless graphics suite will be skipped")
+    message(WARNING "no GLSL to SPIR-V compiler found (neither glslangValidator nor glslc_host) -- the "
+                    "headless graphics suite and the A0 gate will be skipped")
   endif()
   # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
   # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).
@@ -155,6 +236,34 @@ if(UNIX)
   target_link_libraries(test_hle_device PRIVATE blackcore)
   add_test(NAME hle_device COMMAND test_hle_device)
 
+  # The vertex-format table: pure arithmetic over the console's declaration, so it needs no device. This is
+  # the part of A4 that can be finished without a GPU that submits; the rest of the draw path waits on A5.
+  add_executable(test_vertex_posix tests/test_vertex_posix.cpp)
+  target_link_libraries(test_vertex_posix PRIVATE blackcore)
+  add_test(NAME vertex_posix COMMAND test_vertex_posix)
+
+  # The shader runtime needs libglslang, so this one is only registered when it was found. A missing test is
+  # better than a failing one here: the wrapper is written against a library whose API moved, and a test
+  # that fails to build because of it would read as a defect in the port rather than a missing package.
+  if(HAVE_GLSLANG)
+    add_executable(test_shader_rt tests/test_shader_rt.cpp)
+    target_link_libraries(test_shader_rt PRIVATE blackcore shaderc_rt)
+    add_test(NAME shader_rt COMMAND test_shader_rt)
+
+    # The closed loop: hand-written NV2A microcode, this repository's translation to GLSL, libglslang's
+    # compilation, and a check that a real SPIR-V module came out. It needs no GPU and no image, which is the
+    # point -- before libglslang was installed there was no way to verify a translation at all.
+    add_executable(test_nv2a_vsh tests/test_nv2a_vsh.cpp)
+    target_link_libraries(test_nv2a_vsh PRIVATE blackcore shaderc_rt)
+    add_test(NAME nv2a_vsh COMMAND test_nv2a_vsh)
+
+    add_executable(test_nv2a_psh tests/test_nv2a_psh.cpp)
+    target_link_libraries(test_nv2a_psh PRIVATE blackcore shaderc_rt)
+    add_test(NAME nv2a_psh COMMAND test_nv2a_psh)
+  else()
+    message(STATUS "libglslang absent -- the shader runtime test is not registered")
+  endif()
+
   # DPCs and kernel timers: the last six kernel ordinals, checked against what the game can observe.
   add_executable(test_kdpc tests/test_kdpc.cpp)
   target_link_libraries(test_kdpc PRIVATE blackcore)
@@ -162,7 +271,10 @@ if(UNIX)
   # The graphics device, headless: a real device, a real pipeline, real shaders, and a PNG written from the
   # result. This is the gate that says the Vulkan path works at all on this machine -- with no window and no
   # XBE, which is the only way it can be run before the image arrives.
-  if(GLSLANG)
+  # The same condition that built the shaders above. This guard used to test a variable that no longer
+  # exists, which dropped test_gfx, test_vk32 and vk_probe32 from the build without a word -- two tests
+  # simply were not there, and a suite count is the kind of number nobody checks twice.
+  if(GLSLANG_VALIDATOR OR GLSLANG_HOST_TOOL)
     add_executable(test_gfx tests/test_gfx.cpp)
     target_link_libraries(test_gfx PRIVATE blackcore blackshaders_headers)
     add_dependencies(test_gfx blackshaders)

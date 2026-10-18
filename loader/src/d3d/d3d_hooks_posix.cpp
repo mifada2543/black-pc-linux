@@ -1,6 +1,8 @@
 // Hooks for the XBE's library sections -- see d3d_hooks_posix.h for the shape and for why it is this shape.
 #include "d3d/d3d_hooks_posix.h"
 
+#include "d3d/thunk_posix.h"
+
 #include "platform/posix/boot.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
@@ -92,6 +94,7 @@ LibHit g_last_hit;
 uint32_t g_hits;
 bool g_stop_on_unimplemented = true;
 
+
 void *code_alloc(size_t n, uint32_t image_size, uint8_t *code, std::string &err)
 {
     if (!g_thunks) {
@@ -144,6 +147,47 @@ __asm__(".text\n"
 
 } // namespace
 
+// ---- the trace ----
+//
+// A traced thunk calls blackrt_hle_trace before its implementation runs, which is the only place in
+// the whole path where a called D3D entry point can be named. Bounded: a game left running for an
+// hour makes millions of calls, and a report that grows without limit is a leak wearing a report's
+// clothes. The overflow is counted rather than hidden, because "the trace stopped" and "the trace was
+// complete" are different facts.
+constexpr size_t kTraceMax = 8192;
+std::vector<uint32_t> g_trace;
+bool g_trace_overflow = false;
+
+extern "C" void blackrt_hle_trace(uint32_t addr)
+{
+    if (g_trace.size() < kTraceMax) g_trace.push_back(addr);
+    else g_trace_overflow = true;
+}
+
+const char *hooks_trace_name(uint32_t addr)
+{
+    for (const Row &r : g_rows)
+        if (r.fn.addr == addr) return r.fn.name;
+    return nullptr;
+}
+
+const char *hooks_trace_section(uint32_t addr)
+{
+    for (const Row &r : g_rows)
+        if (r.fn.addr == addr) return r.section;
+    return nullptr;
+}
+
+void hooks_trace_reset()
+{
+    g_trace.clear();
+    g_trace_overflow = false;
+}
+
+size_t hooks_trace_count() { return g_trace.size(); }
+uint32_t hooks_trace_at(size_t i) { return i < g_trace.size() ? g_trace[i] : 0; }
+bool hooks_trace_overflowed() { return g_trace_overflow; }
+
 extern "C" __attribute__((stdcall)) void blackrt_lib_unimplemented_posix(uint32_t index, const uint32_t *frame,
                                                                        uint32_t eax, uint32_t ecx, uint32_t edx)
 {
@@ -192,7 +236,8 @@ bool breakpoint_probe(uint32_t eip, uint32_t eax, uint32_t ecx, uint32_t edx, co
 }
 
 bool install_section(const LibFunc *funcs, size_t count, const Hle *hle, size_t hle_count, const char *section,
-                     uint32_t image_base, uint32_t image_size, uint8_t *code, HookReport *report, std::string &err)
+                     uint32_t image_base, uint32_t image_size, uint8_t *code, HookReport *report, std::string &err,
+                     bool trace)
 {
     // Sorted by address, because "the room this function has" is read off the next one: a jump must not
     // reach into the function that follows. The rows are copied rather than pointed at: they are 16 bytes
@@ -244,6 +289,26 @@ bool install_section(const LibFunc *funcs, size_t count, const Hle *hle, size_t 
             // the same trade the Windows port makes with a vectored exception handler, for the same reason.
             fn[0] = 0xCC;
             local.trapped++;
+            g_rows.push_back(Row{f, section});
+            continue;
+        }
+
+        if (h && h->impl) {
+            // The positive case, and the one that was missing: a row with a replacement has to be *called*,
+            // not reported and stopped. The thunk is built in the arena beside the image, so the entry needs
+            // only the same five bytes a jump always needs -- `room >= 5` above is the whole requirement.
+            std::string thunk_err;
+            void *t = make_hle_thunk(*h, &thunk_err, trace);
+            if (!t) {
+                err = thunk_err.empty() ? (std::string(f.name) + " has no thunk") : thunk_err;
+                return false;
+            }
+            if (!write_jmp(fn, t)) {
+                err = std::string(f.name) + " is too far from the thunk arena for a five-byte jump";
+                return false;
+            }
+            local.patched++;
+            local.hle++;
             g_rows.push_back(Row{f, section});
             continue;
         }
@@ -333,18 +398,49 @@ bool hooks_prepare_arena(uint32_t image_size, uint8_t *code, std::string &err)
 bool hooks_install(const LibFunc *funcs, size_t count, const Hle *hle, size_t hle_count, uint32_t image_base,
                    uint32_t image_size, uint8_t *code, HookReport *report, std::string &err)
 {
-    return install_section(funcs, count, hle, hle_count, "", image_base, image_size, code, report, err);
+    return install_section(funcs, count, hle, hle_count, "", image_base, image_size, code, report, err, false);
 }
 
-bool hooks_install_all(uint32_t image_base, uint32_t image_size, uint8_t *code, HookReport *report,
-                       std::string &err)
+// Find the image's own section of this name. The guard compares against this and not against the image's
+// total size, because "inside the image" is too weak: the tables describe three specific sections, and a
+// different build moves them.
+const SectionSpan *find_span(const SectionSpan *sections, size_t count, const char *name)
 {
-    struct Section {
+    for (size_t i = 0; i < count; i++)
+        if (sections[i].name && strcmp(sections[i].name, name) == 0) return &sections[i];
+    return nullptr;
+}
+
+// Every row of a table has to sit inside the section it describes. One row outside means the table is for
+// another build, and a refusal by name is the honest answer: patching anyway writes jumps into whatever
+// happens to be mapped there, and the first of them is a crash with nothing to explain it.
+bool rows_fit(const SectionSpan *span, const LibFunc *funcs, size_t count, const char *which, std::string &err)
+{
+    for (size_t i = 0; i < count; i++) {
+        const LibFunc &f = funcs[i];
+        const uint32_t rel = f.addr - span->vaddr;
+        if (f.addr < span->vaddr || rel + f.size > span->vsize) {
+            char where[32];
+            snprintf(where, sizeof where, "0x%08x", f.addr);
+            err = std::string(which) + ": " + f.name + " at " + where + " is outside this image's " +
+                 span->name + " section (0x" + std::to_string(span->vaddr) + "+0x" + std::to_string(span->vsize) +
+                 ") -- these tables are for another build";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool hooks_install_all_impl(uint32_t image_base, uint32_t image_size, uint8_t *code,
+                            const SectionSpan *sections, size_t section_count, const Hle *hle, size_t hle_count,
+                            HookReport *report, bool trace, std::string &err)
+{
+    struct Table {
         const LibFunc *funcs;
         size_t count;
         const char *name;
     };
-    const Section sections[] = {
+    const Table tables[] = {
         {kD3D, sizeof kD3D / sizeof kD3D[0], "D3D"},
         {kDSound, sizeof kDSound / sizeof kDSound[0], "DSOUND"},
         {kXpp, sizeof kXpp / sizeof kXpp[0], "XPP"},
@@ -355,24 +451,61 @@ bool hooks_install_all(uint32_t image_base, uint32_t image_size, uint8_t *code, 
     g_thunks = nullptr; // re-aimed at this image: a second image may be nowhere near the first one's arena
     g_image_size = 0;
     g_image_code = nullptr;
+    hooks_trace_reset();
 
     HookReport total;
-    for (size_t s = 0; s < 3; s++) {
+    for (size_t t = 0; t < 3; t++) {
+        // The guard. A section the image does not have at all is a refusal too: the table would otherwise be
+        // patched into whatever now occupies that address range.
+        if (sections && section_count) {
+            const SectionSpan *span = find_span(sections, section_count, tables[t].name);
+            if (!span) {
+                err = std::string("this image has no ") + tables[t].name +
+                     " section, so its function table has nothing to install into";
+                return false;
+            }
+            if (!rows_fit(span, tables[t].funcs, tables[t].count, tables[t].name, err)) return false;
+        }
+
         HookReport one;
-        if (!install_section(sections[s].funcs, sections[s].count, nullptr, 0, sections[s].name, image_base,
-                             image_size, code, &one, err))
+        if (!install_section(tables[t].funcs, tables[t].count, hle, hle_count, tables[t].name, image_base,
+                             image_size, code, &one, err, trace))
             return false;
         total.functions += one.functions;
         total.patched += one.patched;
         total.trapped += one.trapped;
         total.skipped += one.skipped;
+        total.hle += one.hle;
     }
 
     seh_set_breakpoint_probe(&breakpoint_probe);
     if (report) *report = total;
-    logf("hooks: %zu functions in the library sections: %zu patched, %zu trapped (too small to jump), %zu left native",
-         total.functions, total.patched, total.trapped, total.skipped);
+    logf("hooks: %zu functions in the library sections: %zu patched (%zu with an HLE replacement), %zu trapped "
+         "(too small to jump), %zu left native",
+         total.functions, total.patched, total.hle, total.trapped, total.skipped);
     return true;
+}
+
+bool hooks_install_all(uint32_t image_base, uint32_t image_size, uint8_t *code, HookReport *report,
+                       std::string &err)
+{
+    return hooks_install_all_impl(image_base, image_size, code, nullptr, 0, nullptr, 0, report, false, err);
+}
+
+bool hooks_install_all_guarded(uint32_t image_base, uint32_t image_size, uint8_t *code,
+                               const SectionSpan *sections, size_t section_count, HookReport *report,
+                               std::string &err)
+{
+    return hooks_install_all_impl(image_base, image_size, code, sections, section_count, nullptr, 0, report, false,
+                                  err);
+}
+
+bool hooks_install_all_with_hle(uint32_t image_base, uint32_t image_size, uint8_t *code,
+                                const SectionSpan *sections, size_t section_count, const Hle *hle, size_t hle_count,
+                                HookReport *report, bool trace, std::string &err)
+{
+    return hooks_install_all_impl(image_base, image_size, code, sections, section_count, hle, hle_count, report,
+                                  trace, err);
 }
 
 } // namespace xd3d

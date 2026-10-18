@@ -98,7 +98,11 @@ ThunkPlan plan_hle_thunk(const char *params, bool returns)
     return plan;
 }
 
-size_t hle_thunk_size(const Hle &h)
+// What the traced block costs, counted the same way it is emitted. Kept next to the emitter on
+// purpose: the two drifting apart is a thunk whose own size check passes and whose bytes are wrong.
+constexpr size_t kTraceBlock = 8; // push eax; mov eax, fn; call eax; pop eax
+
+size_t hle_thunk_size(const Hle &h, bool trace)
 {
     const ThunkPlan plan = plan_hle_thunk(h.params, h.returns);
     if (!plan.valid) return 0;
@@ -113,6 +117,7 @@ size_t hle_thunk_size(const Hle &h)
     n += 2;                                      // push ecx, push edx
     if (!h.returns) n += 1;                      // push eax (and a matching pop later)
     for (int i = 0; i < count; i++) n += tokens[i].is_stack ? 4 : 1;
+    if (trace) n += kTraceBlock;
     n += 5;                                      // mov eax, impl
     n += 2;                                      // call eax
     if (!h.returns) n += 1;                      // pop eax
@@ -121,7 +126,7 @@ size_t hle_thunk_size(const Hle &h)
     return n;
 }
 
-void *make_hle_thunk(const Hle &h, std::string *err)
+void *make_hle_thunk(const Hle &h, std::string *err, bool trace)
 {
     auto fail = [&](const char *why) -> void * {
         if (err) *err = why;
@@ -139,7 +144,7 @@ void *make_hle_thunk(const Hle &h, std::string *err)
     }
 
     // The count first, so a long spec is refused instead of running off the end of a fixed buffer.
-    const size_t size = hle_thunk_size(h);
+    const size_t size = hle_thunk_size(h, trace);
     if (!size || size > kMaxThunk) {
         char why[192];
         snprintf(why, sizeof why, "%s: the thunk for this spec does not fit (%zu bytes)",
@@ -155,6 +160,20 @@ void *make_hle_thunk(const Hle &h, std::string *err)
     if (!h.returns) {
         buf[n++] = 0x50; // push eax
         saved = 3;
+    }
+
+    // The trace block goes here: after the saved registers and before the arguments are marshalled.
+    // Anywhere later and it would sit on top of an argument already staged for the callee -- and for
+    // a spec carrying an "eax" token, moving eax at all would destroy the value being passed.
+    if (trace) {
+        buf[n++] = 0x50; // push eax: restored at the end of the block, so every spec sees eax unchanged
+        buf[n++] = 0xB8; // mov eax, blackrt_hle_trace
+        const uint32_t tracer = (uint32_t)(uintptr_t)&blackrt_hle_trace;
+        memcpy(buf + n, &tracer, 4);
+        n += 4;
+        buf[n++] = 0xFF; // call eax
+        buf[n++] = 0xD0;
+        buf[n++] = 0x58; // pop eax
     }
 
     // Arguments are pushed back to front, because the implementation is __stdcall: it pops its own

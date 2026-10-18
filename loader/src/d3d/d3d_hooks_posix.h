@@ -36,6 +36,7 @@ struct HookReport {
     size_t patched = 0;   // entry patched with a jump to a thunk
     size_t trapped = 0;   // too small to patch: a 0xCC plus a trap handler instead
     size_t skipped = 0;   // not patched at all (an HLE entry that says "leave the original")
+    size_t hle = 0;       // patched with an HLE replacement rather than with a name-and-stop thunk
 };
 
 // The three section tables, built for one specific XBE (its SHA-256 is in the .inc header).
@@ -61,9 +62,33 @@ struct Hle {
 bool hooks_install(const LibFunc *funcs, size_t count, const Hle *hle, size_t hle_count, uint32_t image_base,
                    uint32_t image_size, uint8_t *code, HookReport *report, std::string &err);
 
-// The three tables above, all of them, in the order they are hooked.
+// Where one library section lives in *this* image. The function tables are per-build, so a table may only be
+// installed into a section of the same name, and only if every row of it falls inside that section's range.
+// The guard is structural rather than cryptographic on purpose: the tables carry the build's SHA-256 in a
+// comment, and nothing here could check a hash it cannot compute -- the image is not on this machine. What
+// it can check is the thing that would actually go wrong: writing a jump into a range that is not the
+// section the table describes.
+struct SectionSpan {
+    const char *name;
+    uint32_t vaddr = 0;
+    uint32_t vsize = 0;
+};
+
+// `sections` may be null, which means "no guard": the installer then checks only that each row lies inside
+// the image, exactly as before. Passing the spans is what turns a silent mis-patch into a refusal by name.
+bool hooks_install_all_guarded(uint32_t image_base, uint32_t image_size, uint8_t *code,
+                               const SectionSpan *sections, size_t section_count, HookReport *report,
+                               std::string &err);
+
+// The three tables above, all of them, in the order they are hooked, with no HLE replacements installed.
 bool hooks_install_all(uint32_t image_base, uint32_t image_size, uint8_t *code, HookReport *report,
                        std::string &err);
+
+// Install all three sections *and* an HLE replacement table, optionally building traced thunks. This is the
+// call the boot path makes; `hooks_install_all` above is the bare one the tests use.
+bool hooks_install_all_with_hle(uint32_t image_base, uint32_t image_size, uint8_t *code,
+                                const SectionSpan *sections, size_t section_count, const Hle *hle, size_t hle_count,
+                                HookReport *report, bool trace, std::string &err);
 
 // Where the generated thunks live, and it is a fact worth exposing: the arena is mapped next to the image
 // because every patch is a rel32 jump, and a jump that cannot reach is a silent corruption rather than an
@@ -95,5 +120,19 @@ uint32_t hooks_hit_count();
 // The first call to a library function ends the run, because a return value invented by the loader would
 // be worse than a stopped run. Tests turn it off so they can call a thunk and see what it does.
 void hooks_set_stop_on_unimplemented(bool on);
+
+// ---- the call trace ----
+//
+// A traced thunk reports its row's address before the replacement runs, which is the only place a called
+// D3D entry point can be named -- and naming it is the whole point of `--probe`: "the game got past
+// CreateDevice and stopped at the next named D3D function" is only a useful answer if the functions before
+// it were recorded too. Addresses, not indices: whoever builds a thunk may not know its row index in the
+// combined table, but the address is in the row itself.
+void hooks_trace_reset();
+size_t hooks_trace_count();
+uint32_t hooks_trace_at(size_t i);
+const char *hooks_trace_name(uint32_t addr);   // null when the address is not a row of this build's tables
+const char *hooks_trace_section(uint32_t addr);
+bool hooks_trace_overflowed(); // true once the trace hit its bound; "truncated", not "complete"
 
 } // namespace xd3d

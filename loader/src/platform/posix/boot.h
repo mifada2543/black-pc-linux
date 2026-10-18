@@ -50,7 +50,7 @@ struct BootReport {
     // Library sections (D3D/DSOUND/XPP): how many functions were found, and how many of their entries are
     // ours now. Zero means the image is not the build these addresses came from, which is reported and
     // otherwise left alone.
-    size_t lib_functions = 0, lib_patched = 0, lib_trapped = 0;
+    size_t lib_functions = 0, lib_patched = 0, lib_trapped = 0, lib_hle = 0;
 
     bool has_tls = false;
     XbeTlsInfo tls{};
@@ -119,3 +119,8 @@ const char *boot_exit_reason();
 // The stdout dump --info and --probe share. Written to stderr so it interleaves with the log lines in a
 // terminal and stays next to them in a redirect.
 void boot_print_report(const BootReport &rep);
+
+// The `--probe` report: how far the game got, in names. Prints the ordered list of D3D entries it called
+// (only when the run was traced -- BLACKLINUX_TRACE=1), and always the function it stopped at, because
+// "the game reached X" without "and stopped at Y" is half an answer.
+void boot_print_probe_report(const BootReport &rep);

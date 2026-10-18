@@ -390,6 +390,468 @@ static void test_textures_and_shader()
     check_eq(g_io.out[2], 0x50, "while eax, being no one's argument, is untouched");
 }
 
+// ---- the rows added for A3 ----
+
+static void test_adapters_and_device()
+{
+    printf("\nadapters and the device itself\n");
+
+    const int i_count = row_index("Direct3D_GetAdapterModeCount");
+    const int i_enum = row_index("Direct3D_EnumAdapterModes");
+    const int i_release = row_index("D3DDevice_Release");
+    check(i_count >= 0 && i_enum >= 0 && i_release >= 0, "the three rows are present");
+
+    reset_io();
+    call(i_count, 1);
+    check_eq(g_io.out[2], 1, "one mode, and one mode is what the game is told");
+
+    // Mode 0 is the mode the driver insists on; the widths are the loader's window, not the TV mode,
+    // which is the whole reason GetDisplayMode overrides them.
+    static DisplayMode m;
+    memset(&m, 0, sizeof m);
+    reset_io();
+    g_io.stack[0] = 0;
+    g_io.stack[1] = 0;
+    g_io.stack[2] = (uint32_t)(uintptr_t)&m;
+    call(i_enum, 3);
+    check_eq(g_io.out[2], D3D_OK, "mode 0 is enumerated");
+    check_eq(g_io.out[1], g_io.out[0], "with a balanced stack");
+
+    // Out of range is refused rather than clamped. A caller that asked for mode 7 of a one-mode adapter
+    // has a bug, and handing back mode 0 would hide it until something further along went wrong.
+    reset_io();
+    g_io.stack[1] = 7;
+    g_io.stack[2] = (uint32_t)(uintptr_t)&m;
+    call(i_enum, 3);
+    check_eq(g_io.out[2], D3DERR_INVALIDCALL, "mode 7 of a one-mode adapter is refused, not clamped");
+
+    reset_io();
+    g_io.stack[2] = 0;
+    call(i_enum, 3);
+    check_eq(g_io.out[2], D3D_E_POINTER, "and a null out-pointer is reported");
+
+    // Release on the device frees nothing -- the device is the singleton at ADDR_DEVICE_OBJECT -- but the
+    // caller still expects a reference count, so the answer is 1 rather than 0.
+    reset_io();
+    call(i_release, 0);
+    check_eq(g_io.out[2], 1, "Release reports a reference count of 1");
+}
+
+static void test_display_field_status()
+{
+    printf("\ndisplay field status\n");
+
+    const int i_field = row_index("D3DDevice_GetDisplayFieldStatus");
+    check(i_field >= 0, "the row is present");
+
+    // The fields alternate: 1 is odd, 2 is even. The count itself is reported as the field number, so a
+    // caller that polls parity gets the right answer whichever way round it is read.
+    uint32_t fs[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+    state().vblank_count = 0;
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)fs;
+    call(i_field, 1);
+    check_eq(fs[0], 2, "an even count reports the even field");
+    check_eq(fs[1], 0, "and the count itself");
+
+    state().vblank_count = 7;
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)fs;
+    call(i_field, 1);
+    check_eq(fs[0], 1, "an odd count reports the odd field");
+    check_eq(fs[1], 7, "and the count again");
+
+    reset_io();
+    g_io.stack[0] = 0;
+    call(i_field, 1);
+    check(true, "a null argument does not fault");
+}
+
+static void test_push_buffer()
+{
+    printf("\npush buffer\n");
+
+    const int i_space = row_index("D3D_MakeRequestedSpace");
+    const int i_begin = row_index("D3DDevice_BeginPush");
+    const int i_end = row_index("D3DDevice_EndPush");
+    check(i_space >= 0 && i_begin >= 0 && i_end >= 0, "the three rows are present");
+
+    // A stand-in for the push buffer. It is not the real segment -- nothing is queued yet -- but the point
+    // of these rows is that the cursor lives in the device object and the caller's pointer becomes it.
+    static uint32_t segment[4096];
+    dev_field<uint32_t *>(DEV_PUT) = segment;
+    dev_field<uint32_t *>(DEV_THRESHOLD) = segment + 2048;
+
+    reset_io();
+    g_io.stack[0] = 64;
+    call(i_space, 1);
+    check_eq(g_io.out[2], (uint32_t)(uintptr_t)segment, "MakeRequestedSpace hands back the write cursor");
+
+    // EndPush stores the caller's pointer as the new cursor. Storing it is the whole function: the game
+    // wrote its primitive and hands back where it got to.
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)(segment + 32);
+    call(i_end, 1);
+    check_eq((uint32_t)(uintptr_t)dev_field<uint32_t *>(DEV_PUT), (uint32_t)(uintptr_t)(segment + 32),
+             "EndPush made the caller's pointer the cursor");
+
+    // BeginPush returns the cursor, and rewinds when the requested primitive would not fit before the
+    // threshold. The rewind is invisible while nothing is queued, so what is checked is that the call is
+    // safe with and without the condition, and that the pointer still comes from the device object.
+    reset_io();
+    g_io.stack[0] = 16;
+    call(i_begin, 1);
+    check_eq(g_io.out[2], (uint32_t)(uintptr_t)(segment + 32), "BeginPush hands back the cursor");
+
+    dev_field<uint32_t *>(DEV_PUT) = segment + 4090; // nearly at the end of the segment
+    reset_io();
+    g_io.stack[0] = 4096;
+    call(i_begin, 1);
+    check(true, "a push that would overrun the threshold does not fault");
+
+    // With no device, both pointers are null and the comparison the console does is between two
+    // unrelated pointers. The call has to stay safe anyway, because GetDisplayMode and friends can run
+    // before CreateDevice does.
+    dev_field<uint32_t *>(DEV_PUT) = nullptr;
+    dev_field<uint32_t *>(DEV_THRESHOLD) = nullptr;
+    reset_io();
+    g_io.stack[0] = 16;
+    call(i_begin, 1);
+    check_eq(g_io.out[2], 0, "BeginPush on a device that does not exist answers null");
+}
+
+static void test_viewport_transform()
+{
+    printf("\nthe viewport transform\n");
+
+    const int i_get = row_index("D3DDevice_GetViewportOffsetAndScale");
+    const int i_write = row_index("D3D_WriteViewportTransform");
+    check(i_get >= 0 && i_write >= 0, "the two rows are present");
+
+    // screen = clip / w * scale + offset, with the console's D24 depth range. The numbers are worked out
+    // by hand rather than copied from a run, because a test that reads back what the code just wrote
+    // proves nothing about whether the formula is right.
+    Viewport v = {};
+    v.X = 10;
+    v.Y = 20;
+    v.Width = 640;
+    v.Height = 480;
+    v.MinZ = 0.25f;
+    v.MaxZ = 0.75f;
+    state().viewport = v;
+    state().screen_offset[0] = 0.0f;
+    state().screen_offset[1] = 0.0f;
+
+    float offset[4] = {0, 0, 0, 0}, scale[4] = {0, 0, 0, 0};
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)offset;
+    g_io.stack[1] = (uint32_t)(uintptr_t)scale;
+    call(i_get, 2);
+    check(scale[0] > 319.9f && scale[0] < 320.1f, "scale x is half the width");
+    check(scale[1] < -239.9f && scale[1] > -240.1f, "scale y is minus half the height -- the console's Y is down");
+    // 16777215 * (0.75 - 0.25) = 8388607.5 exactly. Worked out here rather than read back from the code,
+    // because a test that recomputes what it just wrote proves nothing about the formula.
+    check(scale[2] > 8388607.0f && scale[2] < 8388608.0f, "scale z is the D24 range times (MaxZ - MinZ)");
+    check(scale[3] == 1.0f, "and the perspective term is 1");
+    check(offset[0] > 329.9f && offset[0] < 330.1f, "offset x is X + half the width");
+    check(offset[1] > 259.9f && offset[1] < 260.1f, "offset y likewise");
+    check(offset[2] > 4194303.0f && offset[2] < 4194304.0f, "offset z is MinZ times the D24 range");
+    check(offset[3] == 0.0f, "and the w term is 0");
+
+    // The screen-space offset moves the offset and leaves the scale alone: it is a translation, not a zoom.
+    state().screen_offset[0] = 3.0f;
+    state().screen_offset[1] = -4.0f;
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)offset;
+    g_io.stack[1] = (uint32_t)(uintptr_t)scale;
+    call(i_get, 2);
+    check(offset[0] > 332.9f && offset[0] < 333.1f, "a screen-space offset x of 3 shifts offset x by 3");
+    check(offset[1] > 255.9f && offset[1] < 256.1f, "and an offset y of -4 shifts offset y by -4");
+    check(scale[0] > 319.9f && scale[0] < 320.1f, "leaving the scale untouched");
+
+    // FUN_0026eaf0: the HLE derives the transform when it reads it, so there is nothing to push and the
+    // pointer comes back exactly as it went in.
+    // Spec "eax": the argument arrives in eax, and a row that reports a value has it handed back in edx,
+    // which is where out[2] reads it from.
+    reset_io();
+    g_io.regs[0] = 0x1234;
+    call(i_write, 0);
+    check_eq(g_io.out[2], 0x1234, "WriteViewportTransform returns the push pointer unchanged");
+}
+
+static void test_palettes_and_streams()
+{
+    printf("\npalettes and streams\n");
+
+    const int i_pal = row_index("D3DDevice_SetPalette");
+    const int i_str = row_index("D3DDevice_SetStreamSource");
+    check(i_pal >= 0 && i_str >= 0, "the two rows are present");
+
+    static Palette pal[2];
+    memset(pal, 0, sizeof pal);
+    static VertexBuffer vb;
+    memset(&vb, 0, sizeof vb);
+
+    reset_io();
+    g_io.stack[0] = 1;
+    g_io.stack[1] = (uint32_t)(uintptr_t)&pal[1];
+    call(i_pal, 2);
+    check(state().palettes[1] == &pal[1], "the palette is remembered on its stage");
+
+    // A stage past the fourth is one the console dropped. Dropping it -- rather than clamping it onto
+    // stage 3 -- is what keeps "SetPalette(7)" from quietly becoming "SetPalette(3)".
+    reset_io();
+    g_io.stack[0] = 7;
+    g_io.stack[1] = (uint32_t)(uintptr_t)&pal[0];
+    call(i_pal, 2);
+    check(state().palettes[1] == &pal[1], "a stage past the fourth is dropped, not clamped");
+    check(state().palettes[0] == nullptr, "and it did not land on stage 0 either");
+
+    reset_io();
+    g_io.stack[0] = 2;
+    g_io.stack[1] = (uint32_t)(uintptr_t)&vb;
+    g_io.stack[2] = 32;
+    call(i_str, 3);
+    check(state().streams[2].buffer == &vb, "the stream source is remembered");
+    check_eq(state().streams[2].stride, 32, "with the stride the game gave");
+
+    reset_io();
+    g_io.stack[0] = 16;
+    g_io.stack[1] = (uint32_t)(uintptr_t)&vb;
+    g_io.stack[2] = 8;
+    call(i_str, 3);
+    check(state().streams[2].buffer == &vb, "stream 16 of 16 is dropped, not clamped onto 15");
+}
+
+static void test_single_render_states()
+{
+    printf("\nthe four single-state render entry points\n");
+
+    const int i_norm = row_index("D3DDevice_SetRenderState_NormalizeNormals");
+    const int i_en = row_index("D3DDevice_SetRenderState_StencilEnable");
+    const int i_fail = row_index("D3DDevice_SetRenderState_StencilFail");
+    const int i_factor = row_index("D3DDevice_SetRenderState_TextureFactor");
+    check(i_norm >= 0 && i_en >= 0 && i_fail >= 0 && i_factor >= 0, "the four rows are present");
+
+    // Each writes one index. The point of the test is that they are four *different* indices: a macro
+    // that took the wrong index would still compile, still store, and still pass a test that only checked
+    // "something changed".
+    const uint32_t before = render_state()[XRS_NORMALIZENORMALS];
+    reset_io();
+    g_io.stack[0] = before + 1;
+    call(i_norm, 1);
+    check_eq(render_state()[XRS_NORMALIZENORMALS], before + 1, "NormalizeNormals wrote its own index");
+
+    const uint32_t en_before = render_state()[XRS_STENCILENABLE];
+    reset_io();
+    g_io.stack[0] = en_before ^ 1u;
+    call(i_en, 1);
+    check_eq(render_state()[XRS_STENCILENABLE], en_before ^ 1u, "StencilEnable wrote its own index");
+
+    const uint32_t fail_before = render_state()[XRS_STENCILFAIL];
+    reset_io();
+    g_io.stack[0] = fail_before + 7;
+    call(i_fail, 1);
+    check_eq(render_state()[XRS_STENCILFAIL], fail_before + 7, "StencilFail wrote its own index");
+
+    const uint32_t factor_before = render_state()[XRS_TEXTUREFACTOR];
+    reset_io();
+    g_io.stack[0] = factor_before + 3;
+    call(i_factor, 1);
+    check_eq(render_state()[XRS_TEXTUREFACTOR], factor_before + 3, "TextureFactor wrote its own index");
+
+    // Texture-stage state is a separate array per stage.
+    const int i_stage = row_index("D3DDevice_SetTextureStageStateNotInline");
+    check(i_stage >= 0, "the texture-stage row is present");
+    reset_io();
+    g_io.stack[0] = 2;
+    g_io.stack[1] = 5;
+    g_io.stack[2] = 0xABCD;
+    call(i_stage, 3);
+    check_eq(texture_state(2)[5], 0xABCDu, "the texture-stage state landed on the stage it was given");
+
+    reset_io();
+    g_io.stack[0] = 7;
+    g_io.stack[1] = 5;
+    g_io.stack[2] = 0x1234;
+    call(i_stage, 3);
+    check_eq(texture_state(2)[5], 0xABCDu, "a stage past the fourth is dropped, not clamped");
+}
+
+static void test_shader_constants()
+{
+    printf("\nshader constants\n");
+
+    const int i_c1 = row_index("D3DDevice_SetVertexShaderConstant1");
+    const int i_c4 = row_index("D3DDevice_SetVertexShaderConstant4");
+    const int i_dw = row_index("D3DDevice_SetVertexShaderConstantNotInlineFast");
+    check(i_c1 >= 0 && i_c4 >= 0 && i_dw >= 0, "the three vertex-constant rows are present");
+
+    static float data[4 * 8];
+    for (int i = 0; i < 4 * 8; i++) data[i] = (float)i;
+
+    // Spec "ecx edx": both arguments arrive in registers, not on the stack.
+    reset_io();
+    g_io.regs[1] = 10;
+    g_io.regs[2] = (uint32_t)(uintptr_t)data;
+    call(i_c1, 0);
+    check(state().vs_constants[10][0] == 0.0f && state().vs_constants[10][3] == 3.0f,
+          "one constant is four floats, copied whole");
+
+    reset_io();
+    g_io.regs[1] = 20;
+    g_io.regs[2] = (uint32_t)(uintptr_t)data;
+    call(i_c4, 0);
+    check(state().vs_constants[23][0] == 12.0f, "a four-constant write lands on registers 20..23");
+    check(state().vs_constants[24][0] == 0.0f, "and stops there");
+
+    // The count is in DWORDs. Read as a register count it would write four times too far, over the slots
+    // after it with memory past the caller's data -- which is exactly the bug the invoice records.
+    memset(state().vs_constants, 0, sizeof state().vs_constants);
+    // Spec "ecx edx s": two in registers, the DWORD count on the stack.
+    reset_io();
+    g_io.regs[1] = 30;
+    g_io.regs[2] = (uint32_t)(uintptr_t)data;
+    g_io.stack[0] = 8; // 8 DWORDs = 2 registers
+    call(i_dw, 1);
+    check(state().vs_constants[31][0] == 4.0f, "8 DWORDs is two registers");
+    check(state().vs_constants[32][0] == 0.0f, "not eight -- the slot after is untouched");
+
+    // A register outside the bank is dropped, not clamped: 192 is where the shader epilogue stops, and a
+    // clamped write would land somewhere the game never wrote.
+    reset_io();
+    g_io.regs[1] = VS_CONSTANT_COUNT + 5;
+    g_io.regs[2] = (uint32_t)(uintptr_t)data;
+    call(i_c1, 0);
+    check(state().vs_constants[VS_CONSTANT_COUNT - 1][0] == 0.0f,
+          "a register past 191 is dropped, not wrapped onto the last one");
+
+    const int i_ps = row_index("D3DDevice_SetPixelShader");
+    const int i_psdel = row_index("D3DDevice_DeletePixelShader");
+    const int i_psc = row_index("D3DDevice_SetPixelShaderConstant");
+    check(i_ps >= 0 && i_psdel >= 0 && i_psc >= 0, "the three pixel-shader rows are present");
+
+    reset_io();
+    g_io.stack[0] = 0;
+    call(i_ps, 1);
+    check_eq(state().pixel_shader, 0, "binding pixel shader 0 records it");
+
+    reset_io();
+    g_io.stack[0] = 0x1234;
+    call(i_ps, 1);
+    check_eq(state().pixel_shader, 0x1234, "a handle is stored as the binding");
+
+    // Delete clears the binding only when it is the shader that is bound. A delete of some other handle
+    // leaving the binding alone is the whole reason this is a comparison and not an assignment.
+    reset_io();
+    g_io.stack[0] = 0x9999;
+    call(i_psdel, 1);
+    check_eq(state().pixel_shader, 0x1234, "deleting another shader leaves the binding alone");
+
+    reset_io();
+    g_io.stack[0] = 0x1234;
+    call(i_psdel, 1);
+    check_eq(state().pixel_shader, 0, "deleting the bound one clears the binding");
+
+    // Spec "ecx s eax": the register in ecx, the data on the stack, the count in eax.
+    reset_io();
+    g_io.regs[1] = 2;
+    g_io.stack[0] = (uint32_t)(uintptr_t)data;
+    g_io.regs[0] = 4;
+    call(i_psc, 1);
+    check(state().ps_constants[5][0] == 12.0f, "four pixel constants land on registers 2..5");
+    check(state().ps_constants[6][0] == 0.0f, "and stop there");
+
+    // 16 is the register count the register combiners read; past it there is nothing to write into.
+    reset_io();
+    g_io.regs[1] = PS_CONSTANT_COUNT - 1;
+    g_io.stack[0] = (uint32_t)(uintptr_t)data;
+    g_io.regs[0] = 4;
+    call(i_psc, 1);
+    check(state().ps_constants[PS_CONSTANT_COUNT - 1][0] == 0.0f, "the last register takes what fits");
+    check(true, "and the overflow does not run off the bank");
+}
+
+static void test_vertex_shader_handles()
+{
+    printf("\nvertex shader handles\n");
+
+    const int i_create = row_index("D3DDevice_CreateVertexShader");
+    const int i_delete = row_index("D3DDevice_DeleteVertexShader");
+    check(i_create >= 0 && i_delete >= 0, "the two rows are present");
+
+    // Translation is A5, so there is nothing to hand back yet. What matters here is that it refuses
+    // visibly rather than returning a handle that would fault later, somewhere far from this call.
+    static uint32_t decl[16], func[16], handle = 0xFFFFFFFFu;
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)decl;
+    g_io.stack[1] = (uint32_t)(uintptr_t)func;
+    g_io.stack[2] = (uint32_t)(uintptr_t)&handle;
+    g_io.stack[3] = 0;
+    call(i_create, 4);
+    check_eq(g_io.out[2], D3DERR_INVALIDCALL, "a shader that cannot be translated is refused, not faked");
+    check_eq(handle, 0xFFFFFFFFu, "and the caller's handle is left alone");
+
+    reset_io();
+    g_io.stack[0] = (uint32_t)(uintptr_t)decl;
+    g_io.stack[1] = (uint32_t)(uintptr_t)func;
+    g_io.stack[2] = 0;
+    call(i_create, 4);
+    check_eq(g_io.out[2], D3D_E_POINTER, "a null handle out-parameter is reported");
+
+    // Delete has to clear the binding: a deleted shader left bound means the next draw reads a shader
+    // that is no longer there.
+    state().vertex_shader = 0x5555;
+    reset_io();
+    g_io.stack[0] = 0x7777;
+    call(i_delete, 1);
+    check_eq(state().vertex_shader, 0x5555, "deleting a different shader leaves the binding alone");
+
+    reset_io();
+    g_io.stack[0] = 0x5555;
+    call(i_delete, 1);
+    check_eq(state().vertex_shader, 0, "deleting the bound one clears the binding");
+}
+
+static void test_fences()
+{
+    printf("\nfences\n");
+
+    const int i_set = row_index("D3D_SetFence");
+    const int i_pending = row_index("D3DDevice_IsFencePending");
+    check(i_set >= 0 && i_pending >= 0, "the two rows are present");
+
+    const uint32_t before = state().gpu_time;
+    reset_io();
+    g_io.stack[0] = 0;
+    call(i_set, 1);
+    check_eq(g_io.out[2], before + 1, "a fence hands back an increasing token");
+    // Game code reads this field of the device object directly rather than through the entry point, so
+    // the two have to agree.
+    check_eq(dev_field<uint32_t>(DEV_GPUTIME), before + 1, "and the device object's copy agrees");
+
+    // Nothing is ever outstanding: the HLE does the work when it is asked, so a fence has completed by
+    // the time anyone asks whether it has.
+    reset_io();
+    g_io.stack[0] = g_io.out[2];
+    call(i_pending, 1);
+    check_eq(g_io.out[2], 0, "no fence is ever pending");
+
+    const int i_block = row_index("D3D_BlockOnTime");
+    const int i_flush = row_index("D3D_FlushDirtyState");
+    const int i_fog = row_index("D3D_UpdateFogState");
+    check(i_block >= 0 && i_flush >= 0 && i_fog >= 0, "the time and dirty-state rows are present");
+    reset_io();
+    call(i_block, 2);
+    check(true, "BlockOnTime returns rather than waiting on nothing");
+    reset_io();
+    call(i_flush, 0);
+    check(true, "FlushDirtyState is a no-op because state is applied at draw time");
+    reset_io();
+    call(i_fog, 0);
+    check(true, "UpdateFogState is a no-op because fog arrives as render states");
+}
+
 static void test_display_mode()
 {
     printf("\ndisplay mode\n");
@@ -427,6 +889,15 @@ int main()
     test_viewport_and_offset();
     test_textures_and_shader();
     test_display_mode();
+    test_adapters_and_device();
+    test_display_field_status();
+    test_push_buffer();
+    test_viewport_transform();
+    test_palettes_and_streams();
+    test_single_render_states();
+    test_shader_constants();
+    test_vertex_shader_handles();
+    test_fences();
 
     printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

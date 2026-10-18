@@ -154,6 +154,16 @@ VkFormat srgb_format(VkFormat f);
 
 // ---- pipeline ----
 
+// The vertex format codes the d3d layer works in, mapped to Vulkan's. The codes are plain integers so
+// that d3d/ can name a vertex format without naming a Vulkan type (plan section 3.2); the numbers must
+// match VertexFormatCode in d3d/vertex_posix.h, and they are checked here rather than assumed -- a table
+// that drifted would produce pipelines that read the right width from the wrong format, which draws.
+//
+// VF_UNPACKED has no answer here on purpose: NORMPACKED3 is three signed bytes packed into a dword, and
+// handing back the nearest RGBA format would fill the fourth component with buffer bytes nobody meant to
+// read. It is refused, and the caller has to unpack it in the shader instead.
+VkFormat gfx_format_for_vertex_code(uint32_t code);
+
 enum PipelineFlag : uint32_t {
     PIPE_BLEND = 1u << 0,              // alpha blending, the Xbox's default for most passes
     PIPE_DEPTH_TEST = 1u << 1,         // depth test, less-or-equal
@@ -165,7 +175,11 @@ enum PipelineFlag : uint32_t {
 struct VertexAttribute {
     uint32_t binding;
     uint32_t location; // shader input location
-    VkFormat format;
+    // A VertexFormatCode, not a VkFormat. The D3D layer works in those codes and must not have to name a
+    // Vulkan type (plan section 3.2), so the conversion happens here, once, where Vulkan types belong. A
+    // caller that passes VK_FORMAT_R32_SFLOAT here would get whatever code that happens to be -- which is
+    // why the field is uint32_t and the comment names where the numbering comes from.
+    uint32_t format;
     uint32_t offset;
 };
 

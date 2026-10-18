@@ -13,6 +13,7 @@
 // say it is (0x200000, well clear of the loader's own mappings and of the 64 MB block at 0x80000000) and
 // filled with a filler byte, so "was this byte ours?" is answerable.
 #include "d3d/d3d_hooks_posix.h"
+#include "d3d/thunk_posix.h"
 #include "platform/posix/seh.h"
 
 #include <stdio.h>
@@ -129,6 +130,10 @@ static std::vector<Row> collect()
 }
 
 static const uint32_t kImageBase = 0x00200000;
+
+// A replacement the HLE tests can name in a table. It is never called -- these tests check what the
+// installer does with a row, not what the row does -- so its body only has to be a real address.
+static void hle_impl(uint32_t arg) { (void)arg; }
 static const uint8_t kFiller = 0x90;
 
 int main()
@@ -336,6 +341,100 @@ int main()
             check(hit.addr == tiny->addr, "as the function whose entry holds it (" + std::string(hit.name) + ")");
             check(std::string(hit.section) == tiny->section, "with its section");
         }
+    }
+
+    // --- an HLE replacement is actually installed ---------------------------------------------------------
+    printf("\nan HLE replacement reaches the entry\n");
+    {
+        // The gap this closes: a row with a real implementation used to fall through to the name-and-stop
+        // thunk, so a game stopped at its first D3D call no matter how much of the console had been ported.
+        // The existing tests covered only the two refusals, so nothing noticed.
+        // A region of its own, mapped here. The thunk lives in the arena beside whatever image was installed
+        // first, and a five-byte jump from a stack buffer cannot reach anything -- the refusal further down
+        // is the honest outcome of getting that wrong, which is why it is one of the two refusal tests.
+        const size_t slot = 0x200;
+        uint8_t *own = (uint8_t *)mmap((void *)(uintptr_t)kImageBase, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        check(own != MAP_FAILED, "a region for the HLE entry is mapped");
+        if (own == MAP_FAILED) return 1;
+        memset(own, kFiller, 0x4000);
+        const xd3d::LibFunc fns[] = {{kImageBase + slot, 32, "HLE_ONE"}};
+        const xd3d::Hle hle[] = {{kImageBase + slot, "HLE_ONE", (void *)&hle_impl, "s", true}};
+        xd3d::HookReport one{};
+        std::string err_h;
+        const bool ok = xd3d::hooks_install(fns, 1, hle, 1, kImageBase, 0x4000, own, &one, err_h);
+        check(ok, "a row with an implementation installs: " + err_h);
+        check_eq_u32(one.patched, 1, "and counts as patched");
+        check_eq_u32(one.hle, 1, "and as an HLE replacement, not as a name-and-stop thunk");
+        check(own[slot] == 0xE9, "and the entry really was jumped over");
+
+        // A row marked native is the opposite: no jump, no thunk, original code still in place.
+        memset(own, kFiller, 0x4000);
+        const xd3d::Hle native_hle[] = {{kImageBase + slot, "NATIVE", nullptr, "", true}};
+        xd3d::HookReport two{};
+        std::string err_n;
+        xd3d::hooks_install(fns, 1, native_hle, 1, kImageBase, 0x4000, own, &two, err_n);
+        check_eq_u32(two.hle, 0, "a row marked native is not counted as an HLE replacement");
+        check_eq_u32(two.skipped, 1, "it is counted as skipped");
+        check(own[slot] == kFiller, "and its entry is untouched");
+        munmap(own, 0x4000);
+    }
+
+    // --- the per-build guard ---------------------------------------------------------------------------
+    printf("\nthe guard refuses another build\n");
+    {
+        // The tables are per-build, and the guard is structural: every row has to land inside the image's
+        // own section of the same name. A section the image does not have is a refusal, not a shrug --
+        // patching anyway writes jumps into whatever now occupies that range.
+        uint8_t page[0x1000];
+        memset(page, kFiller, sizeof page);
+        const xd3d::SectionSpan other[] = {{"SOMETHING_ELSE", kImageBase, 0x1000}};
+        xd3d::HookReport rep{};
+        std::string err_m;
+        const bool ok_missing = xd3d::hooks_install_all_guarded(kImageBase, 0x1000, page, other, 1, &rep, err_m);
+        check(!ok_missing && err_m.find("no D3D section") != std::string::npos,
+              "an image with no D3D section is refused by name: " + err_m);
+
+        // And the section that is there but too small for the table it holds: the same class of mistake,
+        // caught the same way, with the address in the message so it can be traced back to a row.
+        const xd3d::SectionSpan tiny[] = {{"D3D", kImageBase, 0x200}, {"DSOUND", kImageBase + 0x400, 0x200},
+                                          {"XPP", kImageBase + 0x800, 0x200}};
+        std::string err_t;
+        xd3d::HookReport rep2{};
+        const bool ok_tiny = xd3d::hooks_install_all_guarded(kImageBase, 0x4000, (uint8_t *)(uintptr_t)kImageBase,
+                                                             tiny, 3, &rep2, err_t);
+        check(!ok_tiny && err_t.find("another build") != std::string::npos,
+              "a section too small for its table is refused, and says the tables are for another build: " + err_t);
+    }
+
+    // --- the trace ---------------------------------------------------------------------------------------
+    printf("\nthe trace records what the game called\n");
+    {
+        // Side one: the emitter. A traced thunk is eight bytes longer, and the difference is a fixed block
+        // rather than a variable one -- that is what keeps the size check and the emitted bytes in step.
+        const xd3d::Hle row = {0x00200000, "TRACED", (void *)&hle_impl, "s", true};
+        const size_t plain = xd3d::hle_thunk_size(row, false);
+        const size_t traced = xd3d::hle_thunk_size(row, true);
+        check(traced == plain + 8, "a traced thunk is eight bytes longer, and exactly eight");
+        check_eq_u32(xd3d::hle_thunk_size(row, false), plain, "the untraced size does not depend on the flag twice");
+
+        // Side two: the recorder. This is the function the thunk calls, so it is what decides whether
+        // "the game got this far" is an answer the report can print.
+        xd3d::hooks_trace_reset();
+        check_eq_u32(xd3d::hooks_trace_count(), 0, "a fresh trace is empty");
+        check(!xd3d::hooks_trace_overflowed(), "and not marked truncated");
+
+        xd3d::blackrt_hle_trace(0x0020AAAAu);
+        xd3d::blackrt_hle_trace(0x0020BBBBu);
+        check_eq_u32(xd3d::hooks_trace_count(), 2, "two calls are two records");
+        if (xd3d::hooks_trace_count() == 2) {
+            check_eq_u32(xd3d::hooks_trace_at(0), 0x0020AAAAu, "recorded in order, first call first");
+            check_eq_u32(xd3d::hooks_trace_at(1), 0x0020BBBBu, "and then the second");
+            check(xd3d::hooks_trace_at(2) == 0, "reading past the end answers zero, not garbage");
+        }
+
+        xd3d::hooks_trace_reset();
+        check_eq_u32(xd3d::hooks_trace_count(), 0, "the trace can be cleared between runs");
     }
 
     // --- the two refusal cases -------------------------------------------------------------------------

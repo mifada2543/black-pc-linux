@@ -7,6 +7,7 @@
 #include "kernel/k_thread_posix.h"
 #include "platform/posix/fs_patch.h"
 #include "d3d/d3d_hooks_posix.h"
+#include "d3d/hle_table_posix.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
 
@@ -106,6 +107,47 @@ std::string boot_default_hdd_dir()
         base = home && home[0] ? std::string(home) + "/.local/share" : std::string(".");
     }
     return base + "/blacklinux";
+}
+
+// The trace can hold thousands of entries and the interesting part is the tail, so this prints the last
+// ones. Printing all of them would bury the answer under the game's start-up, which calls the same
+// twenty functions a thousand times before it draws anything.
+static constexpr size_t kProbeTail = 40;
+
+void boot_print_probe_report(const BootReport &rep)
+{
+    printf("\n");
+    printf("--probe -----------------------------------------------------------------\n");
+    printf("library functions : %zu (%zu patched, %zu of them with an HLE replacement, %zu trapped)\n",
+           rep.lib_functions, rep.lib_patched, rep.lib_hle, rep.lib_trapped);
+
+    const size_t calls = xd3d::hooks_trace_count();
+    if (calls == 0) {
+        printf("D3D calls traced : none -- rerun with BLACKLINUX_TRACE=1 to record them\n");
+    } else {
+        printf("D3D calls traced : %zu", calls);
+        if (xd3d::hooks_trace_overflowed()) printf(" (truncated: the trace reached its bound)");
+        printf("\n");
+        const size_t first = calls > kProbeTail ? calls - kProbeTail : 0;
+        if (first) printf("  ... %zu earlier calls omitted\n", first);
+        for (size_t i = first; i < calls; i++) {
+            const uint32_t addr = xd3d::hooks_trace_at(i);
+            const char *name = xd3d::hooks_trace_name(addr);
+            const char *section = xd3d::hooks_trace_section(addr);
+            char buf[192];
+            snprintf(buf, sizeof buf, "  %s%s%s at 0x%08x", section ? section : "?", section ? "/" : "",
+                     name ? name : "(this build's tables do not name this address)", addr);
+            logc("%s", buf);
+        }
+    }
+
+    if (xd3d::hooks_hit_count()) {
+        const xd3d::LibHit &hit = xd3d::hooks_last_hit();
+        logc("stopped at %s/%s (0x%08x), called from 0x%08x", hit.section, hit.name, hit.addr, hit.caller);
+    } else {
+        logc("no unimplemented library function was reached");
+    }
+    printf("----------------------------------------------------------------------------\n");
 }
 
 void boot_print_report(const BootReport &rep)
@@ -217,10 +259,29 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     {
         xd3d::HookReport hooks{};
         std::string hook_err;
-        if (xd3d::hooks_install_all(x.base, x.size_of_image, (uint8_t *)(uintptr_t)x.base, &hooks, hook_err)) {
+
+        // The HLE replacements come from the device table. They were not wired in before: install_section
+        // used its `hle` argument only to decide "leave this native" and "too small to jump", so a row with
+        // a real implementation ended up behind the name-and-stop thunk like every other function. The game
+        // therefore stopped at its first D3D call regardless of how much of the console was already ported.
+        size_t device_count = 0;
+        const xd3d::Hle *device_rows = xd3d::device_rows(&device_count);
+
+        // The guard needs the image's own sections. XbePosix parsed them already; asking it is cheaper and
+        // less duplicative than re-reading the section headers here.
+        std::vector<xd3d::SectionSpan> spans;
+        spans.reserve(x.sections.size());
+        for (const XbeSectionInfo &sec : x.sections)
+            spans.push_back(xd3d::SectionSpan{sec.name.c_str(), sec.vaddr, sec.vsize});
+
+        const bool probe = getenv("BLACKLINUX_TRACE") != nullptr;
+        if (xd3d::hooks_install_all_with_hle(x.base, x.size_of_image, (uint8_t *)(uintptr_t)x.base,
+                                              spans.empty() ? nullptr : spans.data(), spans.size(), device_rows,
+                                              device_count, &hooks, probe, hook_err)) {
             rep.lib_functions = hooks.functions;
             rep.lib_patched = hooks.patched;
             rep.lib_trapped = hooks.trapped;
+            rep.lib_hle = hooks.hle;
         } else {
             logc("hooks: the library sections were not hooked (%s) -- the game will run its own D3D code",
                  hook_err.c_str());

@@ -39,7 +39,10 @@ namespace xd3d {
 
 // Build the thunk for `h` and return where it was placed, or nullptr with `err` saying why. The code comes
 // from the shared arena next to the image (hooks_alloc_thunk), so the hook's jump to it always reaches.
-void *make_hle_thunk(const Hle &h, std::string *err = nullptr);
+// `trace` adds an eight-byte block that records the row's address before the implementation runs --
+// what `--probe` prints. It is off by default: the game pays nothing for it, and a trace is a report,
+// not part of the hot path.
+void *make_hle_thunk(const Hle &h, std::string *err = nullptr, bool trace = false);
 
 // The parsed form of a spec, exposed because the test checks the parse on its own: which parameters come
 // from the stack and in what order, and which from which register.
@@ -54,6 +57,10 @@ ThunkPlan plan_hle_thunk(const char *params, bool returns);
 
 // How many bytes the thunk for `h` will be, or 0 if the spec is bad. Useful for a test that wants to know
 // the size without building anything.
-size_t hle_thunk_size(const Hle &h);
+size_t hle_thunk_size(const Hle &h, bool trace = false);
+
+// Implemented by the hook layer, which is where the address is turned back into a name. Declared here
+// because the thunk builder is what emits the call.
+extern "C" void blackrt_hle_trace(uint32_t addr);
 
 } // namespace xd3d

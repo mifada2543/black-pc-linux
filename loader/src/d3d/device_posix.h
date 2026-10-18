@@ -29,6 +29,19 @@ namespace xd3d {
 // paper over.
 constexpr uint32_t D3D_OK = 0;
 constexpr uint32_t D3D_E_POINTER = 0x80004003;
+// The other two the device entry points can usefully report: a call the console would have refused
+// (D3DERR_INVALIDCALL), and one it could not service on this machine (D3DERR_NOTAVAILABLE). Both are
+// values D3D8 documents, not invented ones.
+constexpr uint32_t D3DERR_INVALIDCALL = 0x80004001;
+constexpr uint32_t D3DERR_NOTAVAILABLE = 0x80004011;
+
+// The console's constant banks, in registers. 192 vertex registers is what the XDK's vertex shader
+// epilogue addresses -- slots 58 and 59 carry the screen-space transform, which is why they are
+// reserved by convention rather than by any driver -- and 16 pixel registers is what the register
+// combiners read.
+constexpr uint32_t VS_CONSTANT_COUNT = 192;
+constexpr uint32_t PS_CONSTANT_COUNT = 16;
+constexpr uint32_t MAX_LIGHTS = 8;
 
 // The state we own. Kept in one place so that "what does the loader think is bound" has one answer.
 struct DeviceState {
@@ -42,13 +55,21 @@ struct DeviceState {
     } streams[16];
 
     uint32_t vertex_shader = 0; // the handle the game passed, not an index into anything of ours
+    uint32_t pixel_shader = 0;  // the same, for the pixel side
     Matrix transforms[TRANSFORM_COUNT] = {};
     Viewport viewport = {};          // what is in effect
     Viewport requested_viewport = {}; // what the game asked for, before it is fitted to the target
     float screen_offset[2] = {0.0f, 0.0f};
 
+    // The constant banks. These are what a translated shader reads, so they are state in the same sense
+    // the render-state array is: the game writes them, and a draw consumes whatever is in them.
+    float vs_constants[VS_CONSTANT_COUNT][4] = {};
+    float ps_constants[PS_CONSTANT_COUNT][4] = {};
+
     uint32_t swap_count = 0;
     uint32_t frame_count = 0;
+    uint32_t gpu_time = 0;     // SetFence's counter, mirrored into the device object at DEV_GPUTIME
+    uint32_t vblank_count = 0; // drives GetDisplayFieldStatus's field parity
 
     // The window the loader opened, which is what GetDisplayMode reports back: the game uses the answer to
     // decide how big its back buffer should be, so it has to be the real size rather than the TV mode.
@@ -97,5 +118,17 @@ constexpr uint32_t ADDR_TEXTURESTATE_ARRAY = ADDR_TEXTURESTATE;
 // (the push buffer must not observe state mid-frame), and every implementation that would flush calls it,
 // so A4 has one place to make real.
 void pb_flush();
+
+// The push buffer's rewind. The console rewinds to the start when it runs out of room rather than
+// growing the buffer, because the segment is mapped at a fixed address and a draw that overran it is a
+// bug to find rather than a buffer to resize. Nothing is queued yet, so this is a named no-op for the
+// same reason pb_flush() is: one place for A4 to make real.
+void pb_reset();
+
+// The NV2A screen-space transform: screen = clip / w * scale + offset. This is the pair of four-float
+// vectors D3DDevice_GetViewportOffsetAndScale hands back, and what the screen-space epilogue of an
+// XDK-compiled vertex shader reads out of vertex constants 58 and 59. It is a pure function of the
+// viewport plus the screen-space offset, which is why it sits next to the state it reads.
+void viewport_transform(float *pScale, float *pOffset);
 
 } // namespace xd3d

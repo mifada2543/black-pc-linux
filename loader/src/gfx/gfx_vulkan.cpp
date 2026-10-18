@@ -1,5 +1,7 @@
 #include "gfx/gfx_vulkan.h"
 
+#include "d3d/vertex_posix.h"
+
 #include "gfx/png.h"
 
 #include "platform/posix/log.h"
@@ -1142,6 +1144,42 @@ bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count)
 
 // ---- pipeline ----
 
+// The codes are xd3d::VertexFormatCode from d3d/vertex_posix.h, included here so the two sides are checked
+// against each other rather than kept in step by hand. The dependency runs gfx -> d3d, never the reverse:
+// d3d/ names these codes as plain integers and never sees a VkFormat, which is the rule in section 3.2.
+static_assert((uint32_t)xd3d::VF_UNPACKED == 0u, "the vertex-format codes have been renumbered");
+static_assert((uint32_t)xd3d::VF_NONE == 19u, "gfx_format_for_vertex_code and VertexFormatCode have drifted apart");
+
+VkFormat gfx_format_for_vertex_code(uint32_t code)
+{
+    switch (code) {
+    case xd3d::VF_R32_SFLOAT: return VK_FORMAT_R32_SFLOAT;
+    case xd3d::VF_R32G32_SFLOAT: return VK_FORMAT_R32G32_SFLOAT;
+    case xd3d::VF_R32G32B32_SFLOAT: return VK_FORMAT_R32G32B32_SFLOAT;
+    case xd3d::VF_R32G32B32A32_SFLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case xd3d::VF_R16G16_SFLOAT: return VK_FORMAT_R16G16_SFLOAT;
+    case xd3d::VF_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+    case xd3d::VF_R16_SINT: return VK_FORMAT_R16_SINT;
+    case xd3d::VF_R16G16_SINT: return VK_FORMAT_R16G16_SINT;
+    case xd3d::VF_R16G16B16_SINT: return VK_FORMAT_R16G16B16_SINT;
+    case xd3d::VF_R16G16B16A16_SINT: return VK_FORMAT_R16G16B16A16_SINT;
+    case xd3d::VF_R16_SNORM: return VK_FORMAT_R16_SNORM;
+    case xd3d::VF_R16G16_SNORM: return VK_FORMAT_R16G16_SNORM;
+    case xd3d::VF_R16G16B16_SNORM: return VK_FORMAT_R16G16B16_SNORM;
+    case xd3d::VF_R16G16B16A16_SNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+    case xd3d::VF_R8_SNORM: return VK_FORMAT_R8_SNORM;
+    case xd3d::VF_R8G8_SNORM: return VK_FORMAT_R8G8_SNORM;
+    case xd3d::VF_R8G8B8_SNORM: return VK_FORMAT_R8G8B8_SNORM;
+    case xd3d::VF_R8G8B8A8_SNORM: return VK_FORMAT_R8G8B8A8_SNORM;
+    default:
+        // VF_UNPACKED lands here along with VF_NONE, and both are refused for the same reason: there is no
+        // honest format to hand back. The caller unpacks it, or reads nothing.
+        return VK_FORMAT_UNDEFINED;
+    }
+}
+
+
+uint32_t g_bound_binding = 0;
 bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
 {
     if (!ready()) {
@@ -1215,7 +1253,11 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
         memset(&v, 0, sizeof v);
         v.location = desc.attributes[i].location;
         v.binding = desc.attributes[i].binding;
-        v.format = desc.attributes[i].format;
+        // The one place a vertex format code becomes a Vulkan format. A code with no Vulkan equivalent --
+        // NORMPACKED3, VF_UNPACKED -- resolves to VK_FORMAT_UNDEFINED, which vkCreateGraphicsPipelines
+        // refuses with a named error. That is the outcome wanted: the shader has to unpack it, and a
+        // pipeline that quietly read four components where the console had three would draw wrong geometry.
+        v.format = gfx_format_for_vertex_code(desc.attributes[i].format);
         v.offset = desc.attributes[i].offset;
         attrs.push_back(v);
     }
@@ -1363,8 +1405,10 @@ Image *g_depth;
 VkViewport g_viewport{0, 0, 1, 1, 0, 1};
 VkRect2D g_scissor{{0, 0}, {1, 1}};
 bool g_scissor_set = false;
-const Buffer *g_bound_buffer;
-uint32_t g_bound_binding = 0;
+const Buffer *g_bound_buffer;// The codes are xd3d::VertexFormatCode, spelled as numbers here on purpose: including d3d/vertex_posix.h
+// would work, but the rule that d3d/ must not see Vulkan's types is much easier to keep true when the two
+// sides share a numbering instead of a header. The static_asserts below are the guard -- they compare this
+// table's codes against the header's enum, so the two cannot drift apart silently.
 } // namespace
 
 void set_render_target(Image *color, Image *depth)

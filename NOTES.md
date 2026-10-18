@@ -238,6 +238,312 @@ build resmi). Hasilnya: **Intel crash dengan signal 11 juga di 64-bit**, pada la
 Jadi **A0b (render server 64-bit) tidak menutup masalah ini** -- ia memakai driver yang sama, dan
 driver itulah yang crash. A0b bukan lagi pilihan yang terlihat dari sini.
 
+### A3 iris kedua — tabel HLE device (2026-10-18 sore)
+
+**Temuan negatif yang lebih dulu dicatat di `plan.md`: "sisa 59 butuh device" adalah perkiraan yang
+salah.** `src/d3d/hle_device.cpp` punya **nol** pemanggilan `gfx::`, dan `test_hle_device` tidak pernah
+`gfx::init()`. Jadi tabel HLE device tidak butuh GPU sama sekali — yang dibutuhkan device adalah
+*memverifikasi* bahwa draw-nya benar, bukan *menerjemahkan* state-nya.
+
+**Angka yang benar.** Tabel invoice `windows/src/d3d/device.cpp` punya **50 baris HLE** (+2 `NATIVE`).
+Total HLE di arsip 71 = 50 device + 3 draw (`draw.cpp`) + 18 resource (`resources.cpp`); dua `NATIVE`
+tidak dihitung. Port ini sekarang punya **43 dari 50** baris device, naik dari 12.
+
+**Tujuh baris yang sengaja belum ada, dengan alasannya:**
+
+| Baris | Alasan |
+|---|---|
+| `Direct3D_CreateDevice` `0x0026c620` | butuh device Vulkan + jendela SDL |
+| `D3DDevice_Clear` `0x00268880` | butuh device Vulkan |
+| `D3DDevice_Swap` `0x002773a0` | butuh device Vulkan |
+| `D3DDevice_SetMaterial`, `SetLight`, `LightEnable` | tipe `D3DMATERIAL9`/`D3DLIGHT9` |
+| `D3DDevice_SetScissors` | tipe `D3DRECT` |
+
+Tiga yang pertama butuh device. **Empat yang terakhir tidak boleh diketik dari ingatan.** Invoice
+mengambil ketiga tipe itu dari header d3d9 Windows, yang tidak ada di build Linux i386; dan layout D3D8
+milik konsol sendiri tidak boleh diasumsikan — salah ukuran berarti `memcpy` melewati akhir alokasi yang
+diminta game. Ketiganya ditunda sampai image tersedia dan layout-nya bisa dibaca darinya (pekerjaan A4/B1).
+
+**Yang ditambahkan** (`src/d3d/hle_device.cpp`): adapter/mode, `GetDisplayFieldStatus`, `Release`,
+lima baris push buffer, transform viewport (`viewport_transform()`), palet, stream source, empat
+entry point render-state satu-indeks lewat satu makro, texture-stage state, flush dirty state, fog state,
+empat baris konstanta vertex shader, tiga baris pixel shader, fence, dan `BlockOnTime`. State baru di
+`device_posix.h`: bank 192 konstanta vertex, 16 konstanta pixel, `pixel_shader`, `gpu_time`,
+`vblank_count`, plus `D3DERR_INVALIDCALL`/`D3DERR_NOTAVAILABLE` dan `pb_reset()`.
+
+**Dua keputusan yang diambil, dan alasannya:**
+
+1. **`CreateVertexShader` mengembalikan `D3DERR_INVALIDCALL`, bukan handle palsu.** Translasi NV2A ke
+   SPIR-V adalah A5, jadi tidak ada yang bisa dikembalikan. Memberi handle yang nanti dipakai
+   `SetVertexShader`/`DeleteVertexShader` akan fault jauh dari panggilan yang menyebabkannya.
+2. **Konstanta vertex_shader dalam DWORD, bukan register.** `FUN_002699e0` mendorong sebanyak itu dengan
+   `SET_TRANSFORM_CONSTANT`; dibaca sebagai register, tulisannya empat kali terlalu jauh dan menimpa slot
+   berikutnya dengan memori di luar data pemanggil — persis bug yang dicatat invoice.
+
+**Tiga kesalahan tes yang saya buat sendiri dan perbaiki** (kodenya tidak salah, tesnya): ekspektasi
+kedalaman dihitung salah (`16777215 * 0.5 = 8388607.5`, bukan `~8388600`); dan argumen untuk spec
+`"eax"`/`"ecx edx"` dikirim lewat stack, padahal lewat register (`regs[0]`=eax, `regs[1]`=ecx,
+`regs[2]`=edx), dengan nilai balik di `out[2]`.
+
+**Suite `test_hle_device`: 58 -> 135 check, 0 kegagalan.** Repo: 21/21 suite hijau, 0 warning.
+
+### A6 — hook per-build dan laporan `--probe` (2026-10-18 malam)
+
+**Temuan yang menentukan pekerjaan ini: 43 baris HLE A3 tidak pernah terpasang.** `install_section()`
+menerima argumen `hle`, tapi memakainya hanya untuk dua keputusan — "biarkan native"
+(`impl == nullptr`) dan "terlalu kecil untuk jmp" (`room < 5`). **Jalur positifnya tidak ada**: baris
+dengan `impl` yang sah melewati kedua pemeriksaan itu lalu jatuh ke thunk *name-and-stop*, persis seperti
+fungsi tanpa pengganti. Akibatnya game berhenti di panggilan D3D pertamanya, berapa pun bagian konsol
+yang sudah diport.
+
+**Kenapa tidak ketahuan:** tes yang ada hanya menguji **dua penolakan** HLE — terlalu kecil, dan
+ditandai native. Tidak ada satu tes pun yang memanggil entry yang sudah ditambal dan memeriksa bahwa
+implementasinya yang jalan. Parameter itu ada, divalidasi, ditolak dengan nama yang benar — dan tidak
+pernah dipakai.
+
+Yang diperbaiki:
+
+1. **Jalur positif HLE.** Baris dengan `impl` dibangun jadi thunk di arena, lalu entry-nya di-jmp ke
+   sana. `room >= 5` tetap satu-satunya syarat, karena thunk-nya berada di arena, bukan di dalam fungsi.
+2. **`HookReport::hle`** — laporan per-build sekarang membedakan "dipatch" dari "dipatch dengan
+   pengganti HLE", karena keduanya sebelumnya cuma satu angka.
+3. **Guard per-build** (`SectionSpan`): sebuah tabel hanya dipasang bila image punya section dengan
+   nama yang sama, dan semua barisnya jatuh di dalam rentang section itu. Tanpa ini, menambal ke build
+   lain menulis jmp ke alamat yang bukan entry apa pun. **Sengaja struktural, bukan kriptografis** —
+   tabel mencantumkan SHA-256 build di komentar, tapi image-nya tidak ada di mesin ini sehingga tidak
+   ada hash yang bisa dihitung untuk dibandingkan. Yang bisa diperiksa adalah hal yang benar-benar akan
+   salah: menulis jmp ke rentang yang bukan section yang digambarkan tabel.
+4. **Trace.** Thunk bertanda menyisipkan blok 8 byte (`push eax; mov eax, trace; call eax; pop eax`)
+   tepat setelah register disimpan dan **sebelum** argumen disusun — penting, karena untuk spec yang
+   memuat token `eax`, memindahkan eax saat itu akan merusak argumennya. Diblok `trace=false` secara
+   bawaan: game tidak membayar apa pun untuk laporan yang tidak diminta.
+5. **`--probe` sekarang mencetak laporan**: berapa fungsi, berapa yang dipatch, berapa dengan
+   pengganti HLE, fungsi D3D mana yang dipanggil (ekor 40 terakhir), dan fungsi tanpa pengganti tempat
+   ia berhenti — dengan nama, alamat, dan pemanggilnya.
+
+**Dibiarkan kosong dengan sengaja:** uji end-to-end `--probe`. `game/default.xbe` tidak ada di mesin
+ini, jadi jalur yang diuji adalah apa yang dilakukan installer terhadap baris tabel, bukan apa yang
+dilakukan game. Yang terbukti: baris HLE terpasang dan terhitung; guard menolak section yang hilang dan
+section yang terlalu kecil, keduanya **dengan nama**; thunk bertanda 8 byte lebih panjang dan
+`blackrt_hle_trace` mencatat alamat yang lalu berubah kembali menjadi nama fungsi.
+
+**Suite `test_d3d_hooks`: 38 -> 57 check, 0 kegagalan.** `test_thunk_posix` tetap 83 check — thunk tanpa
+`trace` sengaja tidak berubah satu byte pun, dan itu yang diperiksa.
+
+### A4 iris pertama — format vertex dan layout deklarasi (2026-10-19)
+
+**Yang bisa diselesaikan tanpa GPU yang bisa submit:** memetakan deklarasi shader game ke
+`VkVertexInputState`. Itu murni aritmetika: "apa yang akan diminta GPU untuk dibaca", dan jawabannya
+menghitung. Yang tersisa — shader NV2A (A5) dan jendela host (A7) — masih menunggu keputusan Anda dan
+kernel.
+
+Berkas baru `src/d3d/vertex_posix.{h,cpp}`, tanpa satu pun tipe `Vk*` (§3.2):
+
+1. **`vsdt_size`** — lebar tiap `D3DVSDT_*`. Disalin dari tabel konsol, bukan diturunkan: lebarnya tidak
+   beraturan (`FLOAT3` 12 byte tapi `PBYTE3` 3 byte, `NORMPACKED3` 4 byte berisi tiga komponen), jadi
+   tidak ada rumus yang menghasilkannya. Tipe yang tidak dikenal lebarnya **0**, bukan tebakan — itulah
+   yang membuat token asing dalam deklarasi terlihat, bukan stride yang diam-diam salah untuk setiap
+   elemen setelahnya.
+2. **`vertex_format_code`** — kode `VertexFormatCode`, angka biasa. **NORMPACKED3 dikembalikan sebagai
+   `VF_UNPACKED`**, bukan format RGBA yang paling dekat: begitu reports tiga komponen di tempat yang
+   kurang lebih benar dan mengisi komponen keempat dengan byte buffer yang tidak pernah dimaksudkan untuk
+   dibaca — geometri salah, digambar dengan yakin. Shader terjemahan harus meng-unpack sendiri.
+3. **`build_vertex_layout`** — elemen + stride → binding dan atribut. Menolak, bukan menambal: register
+   dideklarasikan dua kali, tipe tak dikenal, stream melewati angka enam belas.
+4. **Dua penomoran bertemu di satu tempat.** Baris atribut menomori **stream konsol**; baris
+   binding menomori **binding Vulkan**. Di titik itu baris atribut ditulis ulang ke nomor binding --
+   satu-satunya tempat dua penomoran itu bertemu, karena itu satu tempat.
+
+Sisi gfx: `gfx_format_for_vertex_code()` memetakan kode ke `VkFormat`, dengan `static_assert` yang
+menybandingkan terhadap enum di `d3d/`, jadi keduanya tidak bisa menggeser diam-diam. Arah dependensinya
+`gfx -> d3d`, tidak pernah sebaliknya; inilah bentuk nyata dari aturan §3.2, bukan hiasan.
+
+**Suite `test_vertex_posix`: 40 check, 0 kegagalan.** Repo 22/22 suite hijau (suite baru), 0 warning.
+
+**Sisa A4, jujur:** draw path yang sebenarnya belum ada. Yang belum: `D3DPOOL_MANAGED` dengan dirty
+tracking dan staging upload, tiga baris draw (`DrawVerticesUP`, `DrawVertices`, `DrawIndexedVertices`),
+pemetaan primitif ke topologi, dan pipeline yang dibangun dari shader terjemahan. Tiga baris draw invoice
+bergantung pada `begin_draw`, konversi shader, dan `host3d` — jadi potongannya berimpit dengan A5 dan A7.
+
+### A5 iris pertama — runtime shader dan parser deklarasi (2026-10-19)
+
+**Keputusan §7 no. 10: libglslang i386**, bukan builder SPIR-V sendiri. Alasannya seperti yang
+diminta — lebih cepat sampai jalan — dan alasannya juga benar: yang tersisa untuk ditulis adalah
+terjemahan NV2A ke GLSL, sedangkan compiler-nya sudah ada dan matang.
+
+**Yang harus dipasang user** (butuh sudo):
+
+```
+sudo apt install glslang-dev:i386
+```
+
+`glslang-tools` yang sudah terpasang **tidak memenuhi**. Itu alat build-time (`glslangValidator`,
+`spirv-remap`), sedangkan mikrocode NV2A datang dari game **saat runtime**. Yang dibutuhkan pustaka +
+header, dan varian **i386**-nya karena loader adalah proses 32-bit — pustaka x86-64 di mesin yang sama
+tidak terlihat olehnya. Paketnya ada di noble/universe, 15.1.0, versi yang sama dengan yang terpasang.
+
+**Sudah ditulis, tidak perlu pustaka untuk mengujinya:**
+
+1. **`src/shader/glslang_posix.{h,cpp}`** — pembungkus setipis mungkin: satu fungsi GLSL → SPIR-V, plus
+   satu untuk melepas. Header-nya **sengaja** tidak pulling `ShaderLang.h`; hanya .cpp yang/library,
+   sehingga apa pun di atas file itu hanya berurusan dengan kata SPIR-V.
+2. **Deteksi CMake** — mencari pustaka **i386** secara eksplisit, dan kalau tidak ada memberi
+   peringatan **bertulis kalimat**: apa yang harus dipasang, dan bahwa paket 64-bit tidak menolong.
+   Ini dipilih daripada membiarkan build gagal dengan `undefined reference`, yang tiba kemudian dan
+   tidak berisi tindakan yang bisa dilakukan. Builder SPIR-V sendiri tetap mungkin sebagai jalan keluar
+   kalau libglslang i386 ternyata tidak bisa dipakai di mesin ini.
+3. **Parser deklarasi** (`vertex_posix.cpp`) — membaca aliran token shader ke `VertexElement[]` beserta
+   stride per stream.
+
+**Satu bug di invoice yang sengaja tidak disalin.** Parser invoice menggerakkan `decl += count * 4`
+untuk token `CONSTMEM` **di dalam** satu iterasi, sedangkan penjaga loop hanya menghitung *iterasi*.
+Sebuah token bisa membawa 15 konstanta; enam puluh dword melewati akhir buffer milik game tanpa
+pernah kembali ke loop. Yang ditulis di sini memindahkan **anggaran** bersama kursor, jadi setiap
+langkah yang melompat ikut menaikkan batas. Diuji dengan token itu persis: terhadap anggaran
+yang memang cukup (lalu diterima), dan terhadap yang tidak (ditolak).
+
+Parser juga **menolak** deklarasi yang tidak habis, dan tipe elemen yang tidak dikenal — daripada
+memotong separuhnya, karena offset setelahnya akan salah dan geometri yang keluar meyakinkan.
+
+### Tiga cacat di ronde A5, dan satu koreksi atas cara mengukur (2026-10-19)
+
+**1. Nama paket salah, dua kali.** Paketnya `glslang-dev`, bukan `libglslang-dev`. Nama itu diambil dari
+hasil `apt-cache` yang masih memakai index lama, **tidak dicek ulang setelah `apt update`**, lalu
+diteruskan apa adanya. Dua percobaan user keduanya benar; perintah yang saya beri yang salah. Yang benar:
+
+```
+sudo apt install glslang-dev:i386
+```
+
+**2. Guard CMake yang hilang tanpa suara -- paling berbahaya dari ketiganya.** Saat `GLSLANG` diganti nama
+menjadi `GLSLANG_VALIDATOR`, satu `if(GLSLANG)` tidak ikut berubah. Variabel yang sudah tidak ada itu
+bernilai kosong, jadi cabang itu tidak pernah benar, dan `test_gfx`, `test_vk32`, serta `vk_probe32`
+**tidak pernah dibangun tanpa satu pesan pun**. Jumlah suite turun dari 22 ke 20.
+
+Yang membuatnya lolos: **build incremental**. Binary lama masih ada di `build/linux/`, jadi `ctest` tetap
+menemukan 22 tes. Baru ketika `build/linux` dihapus total, dua target itu benar-benar hilang. Pelajaran
+yang diambil: **jumlah tes adalah angka yang tidak pernah dicek dua kali**, dan "semua hijau" dari build
+yang tidak bersih bukan bukti apa pun.
+
+**3. Dua warning dari `memset` di atas struct berinisialisasi default.** Diganti dengan value
+initialisation. Klaim "0 warning" sebelumnya benar **hanya karena berkas-berkas itu belum dikompilasi
+ulang**, bukan karena kodenya bersih.
+
+**Koreksi atas cara mengukur, dipakai mulai sekarang.** Kalau cacat seperti no. 2 bisa lolos berjam-jam
+karena satu pengukuran yang tidak bersih, maka setiap laporan harus menyebut **build bersih atau bukan**,
+bukan hanya "hijau". Verifikasi terakhir: `rm -rf build/linux`, configure, build, ctest -- hasilnya build
+0 warning, **22/22 hijau**, dan `vk_probe32`, `vk_intel_diag`, `test_gfx` benar-benar ada. Satu-satunya
+warning yang tersisa adalah yang memang diminta: libglslang i386 belum terpasang, dan pesannya menyebut
+nama paket yang benar.
+
+**Yang juga selesai di ronde ini:**
+
+- `tools/glslc_host.cpp` -- compiler GLSL ke SPIR-V untuk **build-time**, dengan antarmuka yang sama
+  persis dengan `glslangValidator`. Alasannya nyata: `glslang-dev:i386` **menghapus** `glslang-tools`
+  amd64, jadi memasang dependency A5 akan membuat shader build-time hilang dan gate A0 berhenti link.
+  Ketiga header SPIR-V yang di-regenerasi **identik byte per byte** dengan salinan sebelumnya.
+- **`PipelineDesc::attributes[].format` sekarang `uint32_t`, bukan `VkFormat`.** `create_pipeline` adalah
+  satu-satunya tempat kode itu menjadi `VkFormat`, jadi aturan di section 3.2 ditutup beneran: lapisan D3D
+  tidak perlu menyebut tipe Vulkan sama sekali. `VF_UNPACKED` menjadi `VK_FORMAT_UNDEFINED`, yang
+  ditolak `vkCreateGraphicsPipelines` **dengan nama** -- lebih baik daripada pipeline yang diam-diam
+  membaca empat komponen di tempat konsol hanya punya tiga.
+
+### Runtime shader — terbukti bekerja (2026-10-19, setelah `glslang-dev:i386` terpasang)
+
+**Bukti: output byte-identik.** Ketiga header SPIR-V build-time yang dihasilkan `tools/glslc_host`
+(kompiler pengganti `glslangValidator`) **identik byte per byte** dengan yang dihasilkan `glslangValidator`
+sebelumnya. Jadi mengganti compiler tidak menggeser satu byte pun dari shader yang sudah dipakai gate A0 --
+dicek, bukan diasumsikan.
+
+**Runtime-nya juga diuji**, tanpa GPU, tanpa jendela, tanpa image: `test_shader_rt`, 16 check. Shader valid
+menghasilkan modul SPIR-V dengan **versi 1.0** yang diperiksa, shader rusak ditolak **beserta log yang bisa
+dibaca**, dan empat compile berturut-turut tetap sehat. Yang tidak bisa dibuktikan tes ini: bahwa kata-kata
+SPIR-V itu menjadi pipeline -- itu gate A0, dan masih menunggu.
+
+**Empat bug nyata muncul di ronde ini, semuanya karena menulis API dari ingatan:**
+
+1. **Wrapper ditulis dari API C++ versi lain.** `getDefaultVersion()`, `spv::SpvToolsTools`, dan bentuk
+   argumen yang lain tidak ada di glslang 15. Semuanya dibaca ulang dari header yang terpasang.
+2. **Antarmuka C tidak bisa dipakai.** `glslang_shader_create()` tidak pernah menamai entry point, dan
+   linking gagal dengan "Each stage requires one entry point". Jadi C++ tetap, dan hanya C++ yang bisa.
+3. **`parse(nullptr, ...)` mensegfault.** Bukan di panggilan itu: beberapa frame di dalam
+   `TBuiltIns::initialize`, jauh dari baris penyebabnya. Ditemukan lewat backtrace. Tabel resource **wajib**
+   diisi; `GetDefaultResources()` ada di **namespace global**, bukan `glslang::`.
+4. **Use-after-free di log kompilasi.** `getInfoLog()` mengembalikan penunjuk ke dalam sink milik
+   `TShader` — yang musnah sebelum fungsi ini kembali. Caller diberi penunjuk menggantung; tes menangkapnya
+   karena yang tercetak dua karakter sampah, bukan error GLSL. Sekarang log **disalin** ke buffer sendiri.
+
+Plus satu yang **hampir** bug: `force_default_version_and_profile = 1` menimpa `#version 450` milik shader
+dengan 100, dan kompilator membacanya sebagai shader ES sebelum era layout qualifier. Yang sekarang dipakai
+adalah `parse()` empat-argumen yang **tidak** memaksa, jadi `#version` miliknya yang menentukan.
+
+### Translator NV2A vertex, dan rantai yang tertutup (2026-10-19)
+
+`src/shader/nv2a_vsh_posix.{h,cpp}`. Decoding adalah transkripsi posisi field dari dokumentasi NV2A publik
+-- tidak ada yang bisa diturunkan, jadi ditulis. Aritmetikanya milik konsol, termasuk snapped ke grid
+sub-piksel di akhir dan penanganan `w` nol.
+
+**Rantainya tertutup dan diuji tanpa GPU:** mikrocode empat dword buatan tangan -> decoder repo ini ->
+GLSL -> libglslang -> SPIR-V -> diperiksa sebagai modul. Sebelum `glslang-dev:i386` terpasang, tiga langkah
+terakhir tidak ada di sini, jadi terjemahan hanya bisa **dibaca mata**. Sekarang bisa **dijalankan**.
+Mikrocode di tes ditulis tangan, bukan diambil dari game, sehingga jawabannya bisa ditulis turun --
+bukan direkam.
+
+`test_nv2a_vsh`, 31 check: encoder di tes dan decoder saling cocok, **dua belas bentuk MAC dan tujuh
+bentuk ILU** masing-masing terjemahan dan bisa dikompilasi, konstanta terindeks, swizzle, negasi, urutan
+baca-sebelum-tulis, serta kedua epilog konsol. Yang **tidak** dibuktikan: bahwa shader itu menggambar apa
+yang dimaksud game. Itu gate A0.
+
+**Lima bug nyata, semuanya GLSL, dan tiga di antaranya adalah kesalahan konsepsi:**
+
+1. **`gl_Position` dideklarasikan.** Itu bawaan GLSL; mendeklarasi ulang adalah error compile soal
+   identifier yang dilindungi.
+2. **Blok uniform diberi nama instans, operand tidak.** `uniform Consts { ... } C;` membuat anggota
+   berada di `C.c[...]`, sementara emulator operand menulis `c[...]` -- 198 konstanta tak dikenal. Blok
+   sekarang tanpa nama instans, jadi anggotanya adalah nama global yang dipakai emulator.
+3. **`A < B` bukan per-komponen di GLSL.** Operator perbandingan GLSL pada dua vektor menjawab **satu
+   bool** untuk seluruh vektor, sedangkan konsol menjawab per komponen. Jadi `A < B` gagal compile --
+   dan gagal compile lebih baik daripada diam-diam salah. Diganti `lessThan` / `greaterThanEqual`.
+4. **`parse(nullptr, ...)`** di runtime wrapper (sebelum ini sudah).
+5. **Tes sendiri salah dua kali**: field konstanta 4-bit diberi nilai 200 (melewati kapasitas), dan
+   swizzle `{1,0,1,0}` diharapkan jadi `.xyxy` padahal `"xyzw"[1]` adalah `y`, jadi `.yxyx`. Yang kedua
+   adalah kesalahan yang sama persis dengan mengetik swizzle salah -- persis apa yang tes ini ada untuk
+   menangkap, di penerjemah maupun di ekspektasinya.
+
+### Translator NV2A pixel, dan dua kesalahan yang tidak tertangkap compile (2026-10-19)
+
+`src/shader/nv2a_psh_posix.{h,cpp}`. Bentuk masalahnya berbeda dari sisi vertex: bukan aliran instruksi,
+melainkan struktur tetap -- delapan tahap combiner, masing-masing dengan input, output, dan flag sendiri,
+plus final combiner. Yang sulit adalah **arti bitnya berbeda tergantung field mana**, sehingga yang penting
+bukan apakah berhasil compile.
+
+`test_nv2a_psh`, **47 check**: definisi dibangun tangan, semua **delapan pemetaan input** (tiap mapping punya
+bentuknya sendiri, bukan hanya skala), flag dot-product dan mux dengan dua polaritasnya, blue-to-alpha, final
+combiner, dan **kesepakatannya dua separuh** soal varying.
+
+**Dua kesalahan yang TIDAK tertangkap compile** -- keduanya baru ketahuan saat membandingkan instruksi demi
+instruksi dengan invoice, atas permintaan scrutinize:
+
+1. **Urutan eye vector untuk refleksi dibalik.** Konsol mengambil `tc[i-2].w, tc[i-1].w, tc[i].w`; saya
+   menulis `tc[i].w, tc[i-2].w, tc[i-1].w`. Itu **rotasi vektor**, bukan pembalikan tanda: vektor hasil
+   rotasi tetap vektor yang sah, jadi compile, jalan, dan menyala setiap permukaan reflektif dari arah
+   yang salah.
+2. **Clip plane terbalik *dan* dipangkas jadi dua komponen.** Bit yang terset berarti "clip di bawah nol",
+   jadi ia justru **mempertahankan** komponen di atas atau sama dengan nol. Saya membacanya sebaliknya --
+   plane memotong justru piksel yang seharusnya dipertahankan. Dan keempat komponen dibandingkan, bukan
+   hanya x dan y.
+
+Keduanya sekarang punya tes yang menyebutnya. Plus dua yang tertangkap tes: **`sat()` dipanggil sebagai
+fungsi** (`clamp(tc0,...)(tc0)`), dan **koordinat eye vector tidak dideklarasikan** sehingga shader pantulan
+gagal compile.
+
+**Dan satu cacat desain yang diperbaiki dengan menghapus duplikasi.** Analisis sampler, analisis varying,
+dan kode yang dihasilkan adalah tiga switch terpisah yang dalam sehari sudah saling berbeda: PASSTHRU dan
+CLIPPLANE dianggap "tidak mengambil texture" sehingga koordinatnya tidak dideklarasikan -- padahal keduanya
+**membaca** koordinat itu; DOT_STR_3D menghasilkan sampel kube tanpa meminta sampler kube. Ketiganya kini
+menjawab dari **satu switch** (`mode_needs()`). Duplikasi yang bisa lapuk lebih buruk daripada kode yang
+salah.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

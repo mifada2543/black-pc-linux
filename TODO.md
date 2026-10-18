@@ -8,15 +8,29 @@ git, so none of it is actionable without that folder.
 
 ## Linux port (the actual work now)
 
-The plan, phase gates, risk register and blockers are in `.agents/plan.md`; this is only the order.
+All planning lives in `.agents/plan.md` — **one document** since 18 October 2026 (the plan, the phase gates,
+the risk register, the full coverage list: workstreams A-G plus E, F, P, and the milestones, and the
+decision log). This file is only the order, and `plan.md` decides which steps can be proven without
+`game/default.xbe`.
 
-1. **D3D8 foundation.** Port `xd3d.h` (the Xbox D3D8 ABI) and the device object layout; the HLE thunks
-   that forward arguments by a parameter spec (`loader/windows/src/d3d/dispatch.cpp`'s `make_thunk`) behind
-   the hook installer that now exists; then the draw path over the Vulkan device in `loader/src/gfx`.
-   Blocked in part: the NV2A shader microcode format needs the real image.
-2. **SDL2 host** — window, input, audio, replacing the XAudio2/XInput layer of the archive.
-3. **The Phase 1 gate**: run the real `default.xbe` to the first D3D call. Everything that can be verified
-   without the image already is (17 suites, 930 checks).
+1. ~~**D3D8 foundation.**~~ **Done 2026-10-18**: the ABI as a Linux header (`loader/src/d3d/xd3d8_posix.h`,
+   every size/offset pinned twice), the parameter-spec thunk builder (`loader/src/d3d/thunk_posix.cpp`, 83
+   checks through a hand-written caller), the device object plus the arrays the game writes in place
+   (`loader/src/d3d/device_posix.cpp`), a table builder that reports every unbuildable row by name
+   (`hle_table_posix.cpp`), and 12 state functions callable through their thunks (`hle_device.cpp`,
+   `tests/test_hle_device.cpp`, 58 checks). Reasons and the two bugs this caught: `NOTES.md`,
+   "Temuan Linux Track A".
+2. **SDL2 host, window first.** `loader/src/host/host_sdl.*` does not exist yet, while SDL2 i386 and
+   `src/gfx/png.cpp` are already here -- so this is the next step that can actually be *proven* on this
+   machine (window + clear + PNG screenshot with `SDL_VIDEODRIVER=dummy`), and it comes before the draw
+   path because the draw path's gate cannot pass here (llvmpipe 32-bit rasterises 0 fragments). Then input
+   and audio output, replacing the XAudio2/XInput layer of the archive.
+3. **Draw path over `src/gfx`** (roadmap C-2/C-3): vertex declaration, MANAGED textures via staging +
+   dirty tracking, `Draw*UP`, readback. The details worth not losing are in `plan.md` §5.4 (C-2/C-3), not here.
+4. **NV2A microcode**: the shader translation path can be built and tested with synthetic microcode, but the
+   *real* format needs the image -- that stays Track B in `plan.md`.
+5. **The Phase 1 gate**: run the real `default.xbe` to the first D3D call. Everything that can be verified
+   without the image is verified: **20 suites, 1164 checks**, clean rebuild, zero warnings.
 
 
 ## Verify (fixed, waiting for a playtest)

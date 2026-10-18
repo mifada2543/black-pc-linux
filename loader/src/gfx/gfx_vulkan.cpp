@@ -1,5 +1,7 @@
 #include "gfx/gfx_vulkan.h"
 
+#include "gfx/png.h"
+
 #include "platform/posix/log.h"
 
 #include <stdio.h>
@@ -33,6 +35,9 @@ AdapterInfo g_adapter;
 std::string g_error;
 std::vector<VkExtensionProperties> g_device_extensions;
 std::vector<std::string> g_skip_reasons; // one per physical device, empty when it was accepted
+std::vector<AdapterInfo> g_adapters;      // every device, in enumeration order (see adapter_at)
+int g_chosen_index = -1;                   // which one the loader drew on, -1 before init
+int g_index_override = -1;                 // BLACKLINUX_VK_INDEX / vulkan_set_device_index: force one
 std::string g_device_override;
 bool g_probe_enabled = true;
 bool g_probe_read_env = false;
@@ -246,13 +251,21 @@ static void probe_child(uint32_t physical_index)
     VkQueue queue;
     vkGetDeviceQueue(dev, family, 0, &queue);
 
-    // A 256-byte buffer the GPU fills. An empty command buffer would be cheaper, but it would not prove the
-    // driver can execute anything, which is the question being asked.
+    // A 256-byte buffer and a barrier. Both exist so the command buffer is not empty -- an empty submit would
+    // not prove the driver can execute anything, which is the question being asked.
+    //
+    // It used to be a transfer: this buffer plus `vkCmdFillBuffer`. That is where the 32-bit Intel driver
+    // segfaults, measured (loader/tools/vk_intel_diag.cpp case G: empty submits, dynamic rendering, memory,
+    // images and descriptor allocation all survive; the first transfer command does not). It is a poor probe,
+    // not because the driver is unusable but because **the game never issues a transfer command** -- it draws
+    // and it writes push buffers -- so the probe was judging the driver by work this port will never ask of it,
+    // and turning a usable GPU into "crashes on submit". A barrier is a real command in the same path, and it
+    // is one the game's own workload does contain.
     VkBufferCreateInfo bci;
     memset(&bci, 0, sizeof bci);
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     bci.size = 256;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     VkBuffer buffer;
     if (vkCreateBuffer(dev, &bci, nullptr, &buffer) != VK_SUCCESS) probe_exit(PROBE_REFUSED);
     VkMemoryRequirements req;
@@ -293,7 +306,13 @@ static void probe_child(uint32_t physical_index)
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) probe_exit(PROBE_REFUSED);
-    vkCmdFillBuffer(cmd, buffer, 0, 256, 0xDEADBEEFu);
+    VkMemoryBarrier barrier;
+    memset(&barrier, 0, sizeof barrier);
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr,
+                         0, nullptr);
     VkSubmitInfo si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -338,6 +357,18 @@ std::string vulkan_skip_reason(uint32_t index)
 
 uint32_t vulkan_device_count() { return (uint32_t)g_skip_reasons.size(); }
 
+uint32_t adapter_count() { return (uint32_t)g_adapters.size(); }
+
+const AdapterInfo &adapter_at(uint32_t index)
+{
+    static const AdapterInfo none;
+    return index < g_adapters.size() ? g_adapters[index] : none;
+}
+
+int adapter_index() { return g_chosen_index; }
+
+void vulkan_set_device_index(int index) { g_index_override = index; }
+
 void vulkan_set_device_override(const char *name_substring)
 {
     g_device_override = name_substring ? name_substring : "";
@@ -381,11 +412,29 @@ bool init()
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(g_instance, &count, devices.data());
 
+    // Every device, by name, in enumeration order. The loader draws on one of them, but "which ones were
+    // there, and what is each one" is the first question anyone asks when a picture does not appear -- and it
+    // is the question the A0 gate has to answer about all of them, one at a time.
+    g_adapters.assign(count, AdapterInfo());
+    for (uint32_t i = 0; i < count; i++) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(devices[i], &p);
+        AdapterInfo &a = g_adapters[i];
+        a.name = p.deviceName;
+        a.api_version = p.apiVersion;
+        a.driver_version = p.driverVersion;
+        a.vendor_id = p.vendorID;
+        a.device_id = p.deviceID;
+        a.device_type = (int)p.deviceType;
+        a.max_image_dimension_2d = p.limits.maxImageDimension2D;
+    }
+
     if (!g_probe_read_env) {
         // Read once. A loader that changes its mind about the driver half way through a frame is a loader
         // with two opinions, and the environment does not change under a running process anyway.
         g_probe_read_env = true;
         if (const char *name = getenv("BLACKLINUX_VK_DEVICE")) g_device_override = name;
+        if (const char *idx = getenv("BLACKLINUX_VK_INDEX")) g_index_override = atoi(idx);
         if (const char *probe = getenv("BLACKLINUX_VK_PROBE")) g_probe_enabled = atoi(probe) != 0;
     }
 
@@ -404,10 +453,14 @@ bool init()
     });
 
     int chosen = -1;
-    for (uint32_t index : order) {
+    for (uint32_t index : order) {  // in preference order, each probed in a child
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(devices[index], &p);
 
+        if (g_index_override >= 0 && (uint32_t)g_index_override != index) {
+            g_skip_reasons[index] = "not selected by BLACKLINUX_VK_INDEX";
+            continue;
+        }
         if (!g_device_override.empty() && !strstr(p.deviceName, g_device_override.c_str())) {
             g_skip_reasons[index] = "not selected by BLACKLINUX_VK_DEVICE";
             continue;
@@ -444,6 +497,8 @@ bool init()
         chosen = (int)index;
         break;
     }
+
+    g_chosen_index = chosen;
 
     if (chosen < 0) {
         std::string why = "no Vulkan device survived a submit:";
@@ -511,6 +566,22 @@ bool init()
     // discard the fragment, and the game's shaders rely on that (see the nv2a_vsh notes in the reference).
     // rasterizer discard is deliberately absent: it is not a core feature, so requesting it would need an
     // extension, and nothing in the game needs it.
+    // Vulkan 1.2+ features, queried through vkGetPhysicalDeviceFeatures2 and enabled through pNext. This is
+    // not optional bookkeeping: vkCmdBeginRendering -- which begin_frame() records, so every frame -- is
+    // dynamic rendering, and dynamic rendering is a feature that has to be switched on at device creation. A
+    // device created without it makes every begin_frame call undefined behaviour. Measured on this machine:
+    // llvmpipe tolerates it, and the 32-bit Intel driver segfaults inside vkQueueSubmit, which is how it was
+    // found (loader/tools/vk_intel_diag.cpp case C, and the A0 gate's per-step trace).
+    // dynamicRendering is a Vulkan 1.3 core feature (promoted from VK_KHR_dynamic_rendering), so it is read
+    // from VkPhysicalDeviceVulkan13Features -- the 1.2 struct does not carry it.
+    VkPhysicalDeviceVulkan13Features have13{};
+    have13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    VkPhysicalDeviceFeatures2 have2{};
+    have2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    have2.pNext = &have13;
+    vkGetPhysicalDeviceFeatures2(g_physical, &have2);
+    const bool have_dynamic_rendering = have13.dynamicRendering == VK_TRUE;
+
     VkPhysicalDeviceFeatures have{};
     vkGetPhysicalDeviceFeatures(g_physical, &have);
     VkPhysicalDeviceFeatures features{};
@@ -521,14 +592,28 @@ bool init()
     features.samplerAnisotropy = have.samplerAnisotropy;
     features.shaderStorageImageExtendedFormats = have.shaderStorageImageExtendedFormats;
 
+    // The features that are switched on, chained through pNext. Only what this layer actually uses:
+    // dynamic rendering and nothing else (no synchronisation2, no 1.3-only commands).
+    VkPhysicalDeviceVulkan13Features features13{};
+    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    features13.dynamicRendering = have_dynamic_rendering ? VK_TRUE : VK_FALSE;
+
     VkDeviceCreateInfo dci;
     memset(&dci, 0, sizeof dci);
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.pEnabledFeatures = &features;
+    dci.pNext = &features13;
     r = vkCreateDevice(g_physical, &dci, nullptr, &g_device);
     if (r != VK_SUCCESS) return fail("no Vulkan device", r);
+
+    if (!have_dynamic_rendering) {
+        // Without this feature there is no vkCmdBeginRendering, so the render path cannot work at all, and
+        // saying so here is much better than letting the first frame die inside a driver.
+        return fail("this driver has no dynamic rendering (Vulkan 1.2 feature), and this layer draws with it",
+                    r);
+    }
 
     vkGetDeviceQueue(g_device, g_queue_family, 0, &g_queue);
 
@@ -1553,5 +1638,25 @@ bool read_color(const Image *img, void *out)
     vkFreeMemory(g_device, dst_mem, nullptr);
     return true;
 }
+
+bool write_png_from_color_target(const char *path, const Image *img)
+{
+    if (!path || !img || !img->image || img->width == 0 || img->height == 0) return false;
+    std::vector<uint8_t> pixels((size_t)img->width * img->height * 4);
+    if (!read_color(img, pixels.data())) return false;
+
+    // read_color hands back the image's own byte order; PNG wants RGBA. Only the two formats this port
+    // creates for colour targets differ, and only in the first and third byte.
+    const bool bgra = img->format == VK_FORMAT_B8G8R8A8_UNORM || img->format == VK_FORMAT_B8G8R8A8_SRGB;
+    if (bgra) {
+        for (size_t i = 0; i < pixels.size(); i += 4) {
+            const uint8_t t = pixels[i];
+            pixels[i] = pixels[i + 2];
+            pixels[i + 2] = t;
+        }
+    }
+    return write_png(path, pixels.data(), img->width, img->height);
+}
+
 
 } // namespace gfx

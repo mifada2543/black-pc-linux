@@ -183,7 +183,10 @@ static void test_clear_and_readback()
 
 // Draws the triangle with whichever fragment shader it is given, and reads the result back. Returns false
 // only when something could not be created; a wrong picture is the caller's business to judge.
-static bool draw_the_triangle(const void *frag_spirv, size_t frag_size, std::vector<uint8_t> *pixels)
+// `keep` receives the target so a caller can screenshot it afterwards; pass nullptr when the pixels are all
+// that is wanted. Keeping it is the caller's to destroy -- this function does not when `keep` is given one.
+static bool draw_the_triangle(const void *frag_spirv, size_t frag_size, std::vector<uint8_t> *pixels,
+                              gfx::Image *keep = nullptr)
 {
     gfx::Image target, depth;
     if (!gfx::create_color_target(&target, kWidth, kHeight, VK_FORMAT_B8G8R8A8_UNORM) ||
@@ -244,7 +247,11 @@ static bool draw_the_triangle(const void *frag_spirv, size_t frag_size, std::vec
     gfx::destroy_buffer(&verts);
     gfx::destroy_pipeline(&pipe);
     gfx::destroy_image(&depth);
-    gfx::destroy_image(&target);
+    if (keep) {
+        *keep = target;
+    } else {
+        gfx::destroy_image(&target);
+    }
     return ok;
 }
 
@@ -253,7 +260,8 @@ static void test_draw(const char *out_png)
     printf("\na real draw\n");
 
     std::vector<uint8_t> pixels;
-    if (!draw_the_triangle(kProbeFragSpv, sizeof kProbeFragSpv, &pixels)) {
+    gfx::Image target_for_png;
+    if (!draw_the_triangle(kProbeFragSpv, sizeof kProbeFragSpv, &pixels, &target_for_png)) {
         check(false, std::string("the triangle was drawn (") + gfx::last_error() + ")");
         return;
     }
@@ -273,7 +281,8 @@ static void test_draw(const char *out_png)
     if (!rasterised) {
         skip("the triangle's three corner colours (this device produced no fragments at all)");
         skip("the background outside the triangle (same reason)");
-        check(gfx::write_png(out_png, pixels.data(), kWidth, kHeight), "a PNG was written anyway");
+        check(gfx::write_png_from_color_target(out_png, &target_for_png), "a PNG was written anyway");
+        gfx::destroy_image(&target_for_png);
         return;
     }
 
@@ -301,7 +310,8 @@ static void test_draw(const char *out_png)
     const uint8_t *corner = at(0, 0);
     check(corner[2] > 100 && corner[0] < 60, "the top-left corner is still the background colour");
 
-    check(gfx::write_png(out_png, pixels.data(), kWidth, kHeight), "a PNG was written");
+    check(gfx::write_png_from_color_target(out_png, &target_for_png), "a PNG was written");
+    gfx::destroy_image(&target_for_png);
 }
 
 // ---- the same draw with a texture, in a child ----------------------------------------------------------

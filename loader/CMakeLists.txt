@@ -60,6 +60,10 @@ if(UNIX)
     src/gfx/png.cpp)
   target_include_directories(gfx PUBLIC src)
   target_link_libraries(gfx PUBLIC Vulkan::Vulkan)
+  # gfx writes to the loader log, and blackcore links gfx, so this is a cycle between two static libraries.
+  # Declared rather than left to the linker's order: without it a new target that links blackcore fails with
+  # an undefined logf, and the failure says nothing about what went wrong.
+  target_link_libraries(gfx PRIVATE blackcore)
   target_compile_options(gfx PRIVATE -Wall -Wextra -Wno-unused-parameter)
   target_link_libraries(blackcore PUBLIC gfx)
   # Shaders are compiled at build time and embedded, so the loader ships with its SPIR-V inside it and needs
@@ -163,6 +167,28 @@ if(UNIX)
     target_link_libraries(test_gfx PRIVATE blackcore blackshaders_headers)
     add_dependencies(test_gfx blackshaders)
     add_test(NAME gfx COMMAND test_gfx)
+
+    # A0, the Vulkan 32-bit gate: every physical device, one forked child each, and the answer as an exit
+    # code -- 0 drew, 1 did not, 77 there is no hardware GPU to ask. Labelled `gpu` with 77 as the skip code
+    # so a machine without a GPU records "skipped" instead of failing; a software rasteriser must never be
+    # this gate, because it accepts work and then draws nothing.
+    add_executable(test_vk32 tests/probe_vk32.cpp)
+    target_link_libraries(test_vk32 PRIVATE blackcore blackshaders_headers)
+    add_dependencies(test_vk32 blackshaders)
+    add_test(NAME vk32 COMMAND test_vk32)
+    set_tests_properties(vk32 PROPERTIES LABELS gpu SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+    # A diagnostic, not a test: it asks the 32-bit Intel driver three questions (empty submit on 1.0, empty
+    # submit on 1.3, submit with dynamic rendering) to find out whether the crash A0 found is the driver or
+    # this port asking for Vulkan 1.3. The answer decides whether A4 can stay in-process at all.
+    add_executable(vk_intel_diag tools/vk_intel_diag.cpp)
+    target_link_libraries(vk_intel_diag PRIVATE Vulkan::Vulkan)
+
+    # The same source as a standalone probe, to run by hand on a GPU this repository cannot see. That is how
+    # the other rows of the driver table in NOTES.md get filled in.
+    add_executable(vk_probe32 tests/probe_vk32.cpp)
+    target_link_libraries(vk_probe32 PRIVATE blackcore blackshaders_headers)
+    add_dependencies(vk_probe32 blackshaders)
   endif()
   # How a run ends and what the exit code says: halt, bugcheck, --strict, and the ordinary case. Each
   # scenario forks, because the exit request is process-wide and one-shot by design.

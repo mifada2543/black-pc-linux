@@ -73,6 +73,19 @@ const AdapterInfo &adapter();
 // device was accepted, or when it was never considered.
 std::string vulkan_skip_reason(uint32_t index);
 uint32_t vulkan_device_count();
+
+// Every device on the machine, in enumeration order, filled in even for the ones that were skipped. The A0
+// gate reports on all of them one at a time, and `--doctor` needs the same list; a function that only knows
+// the device it picked cannot answer "why not the other one".
+uint32_t adapter_count();
+const AdapterInfo &adapter_at(uint32_t index);
+
+// Which of them the loader actually drew on, or -1 before init.
+int adapter_index();
+
+// Draw on device N whatever the preference order says, which is how a gate measures *each* driver instead
+// of only the one the loader happens to prefer. -1 restores the normal choice.
+void vulkan_set_device_index(int index);
 bool has_device_extension(const char *name);
 
 // The objects the D3D8 layer needs for the parts Vulkan keeps to itself: the queue it presents on, and the
@@ -284,8 +297,19 @@ bool clear_depth(float value);
 // readback -- or a PNG written from one -- mean anything.
 bool end_frame();
 
-// Copy a colour target's pixels out, row-major from the top, RGBA8. `out` must hold width*height*4 bytes.
+// Copy a colour target's pixels out, row-major from the top. `out` must hold width*height*4 bytes.
+//
+// **In the image's own byte order, not RGBA.** For the B8G8R8A8 targets this port uses -- the game's A8R8G8B8
+// -- that is B, G, R, A, because that is what the game itself reads back through LockRect: it asked for
+// A8R8G8B8 and would read those bytes. Normalising here would hand the D3D8 layer a picture with two
+// channels the wrong way round, which is not a detail anyone notices until a screenshot comes out orange.
+// For screenshots use write_png_from_color_target() below, which does the conversion once, in one place.
 bool read_color(const Image *img, void *out);
+
+// Read a colour target back and write it as a PNG. This is the screenshot path, and it exists so that no
+// caller feeds read_color's byte order straight into a writer that expects RGBA: doing that swaps red and
+// blue in every image, and the only test that looked at the file checked its header rather than its pixels.
+bool write_png_from_color_target(const char *path, const Image *img);
 
 // The staging buffer draw calls upload through, sized on first use and grown in whole megabytes.
 Buffer &vertex_staging();

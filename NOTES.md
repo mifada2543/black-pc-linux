@@ -67,6 +67,98 @@
 10. Xbox vs Windows kernel differences hit so far: XAPI passes DOS paths with `RootDirectory = ObDosDevicesDirectory() = (HANDLE)-3`; XAPI queries attributes on write-only handles (Windows needs `FILE_READ_ATTRIBUTES`, the loader adds it to every open); Xbox critical sections are 28 bytes with a KTHREAD* owner (not the Windows layout); `FILE_DIRECTORY_INFORMATION` and volume info use 8-bit names.
 11. **Cache partition table**: 512-byte sector at `\Device\Harddisk0\Partition0` offset `0x800`: magic `0x97315286`, version 2, 12-byte entries `{TitleId, partition-3, used}`, `0xAA550000` at `+0x1F8`. XAPI rebuilds it if invalid and picks the utility partition (first run: Partition5 = Z:). The loader backs raw device opens with `hdd\PartitionN.raw` (reads past the end return zeros).
 
+## Temuan Linux Track A (2026-10-18) — ABI D3D8, thunk, state device
+
+Semua angka di sini **sudah jadi satu sumber di `loader/src/d3d/xd3d8_posix.h`** dengan `static_assert`, dan
+diperiksa ulang di `loader/tests/test_xd3d8.cpp` (93 check) yang menghitung ulang tiap ukuran dari aturan
+sendiri. Yang dicatat di sini adalah alasan dan temuan yang tidak terlihat dari kode.
+
+1. **Entri render state terakhir adalah `DONOTCULLUNCOMPRESSED` (165), bukan `ROPZREAD`.** Sumber Windows
+   menulis daftar nama lalu komentar `// 165` di ujungnya; dibaca "ROPZREAD = 165" itu salah satu. `XRS_MAX =
+   166` jadi ukuran array state, jadi nilai yang geser satu menulis slot yang salah. Ditangkap `static_assert`
+   sebelum test pertama jalan.
+2. **Kontrak thunk tidak dikompilasi.** Implementasi harus `__stdcall` dengan **tepat** sebanyak token `"s"`
+   pada spec-nya: thunk menumpuk argumen itu lalu membiarkan implementasi yang memop-nya, lalu `ret imm16`
+   membuang asli dari game. Spec 8 token + implementasi 4 parameter tidak "melewati" 4 argumen — sisa 4-nya
+   diambil `pop edx`/`pop ecx`, lalu `ret` kembali ke salah satu argumen. Aturan ini sekarang tertulis di
+   `loader/src/d3d/thunk_posix.h` dan dijaga test (`impl_8`).
+3. **`DEV_TRANSFORMS = 0x0C60` + 10 x 0x40-byte = persis `DEV_VIEWPORT = 0x0EE0`.** Tiga angka yang hanya
+   berarti bersama-sama. Ada **11** nama transform (`XTS_WORLD` .. `XTS_TEXTURE7`) tapi hanya **10** slot:
+   `XTS_TEXTURE7` (10) tidak punya tempat dan console membuangnya, jadi `SetTransform` (**≥ 10**) mengabaikannya
+   — bukan memotongnya ke slot terakhir, karena itu akan menimpa viewport.
+4. **Tabel HLE port Windows 71 baris, bukan 819.** 819 adalah jumlah *entry hook* yang dipasang
+   `d3d_hooks_posix` (811 dipatch + 8 dijerat `0xCC` lewat `seh_set_breakpoint_probe`). Hanya 71 yang punya
+   implementasi; 12 di antaranya state murni yang sudah dipindah (A3 iris). Sisa 59 butuh device sungguhan.
+5. **`GetDisplayMode` harus melaporkan ukuran jendela**, bukan TV mode 640x480x60: game memakainya untuk
+   menentukan besar back buffer, jadi menjawab dengan mode akan salah setiap kali jendela bukan 640x480.
+6. **Dua float, bukan dua integer**: `SetScreenSpaceOffset` menerima **dua float**, bukan dua integer (field 0xEF8/0xEFC
+   dipakai untuk offset yang bisa pecahan) — calling convention-nya baru terlihat kalau thunk-nya benar.
+7. **Toolchain ini tidak bisa assemble `mov` memori-ke-memori** ("operand size mismatch"), padahal i386 boleh
+   (opcode 0x89). Semua copy di test caller lewat register, dan alasannya ditulis di
+   `loader/tests/test_thunk_posix.cpp` supaya tidak dianggap kebetulan.
+8. **`test_kdpc` punya deadline wall-clock** (2–3 detik, di-poll 10x/ms) supaya DPC yang tidak jalan bisa
+   dibedakan dari test yang tidak selesai. Akibatnya gagal satu kali saat mesin sibuk (rebuild penuh + suite
+   lain), lalu 15 kali berturut-turut hijau. Jalankan sendiri dulu sebelum percaya.
+9. **`pitch` di `PixelContainer::Size` cuma 8 bit.** 640x480 = 2560 byte tidak muat, dan memang tidak
+   dimaksudkan: console tidak menaruh pitch di field itu untuk surface selebar itu, dan jalur upload
+   menghitungnya sendiri dari lebar x bpp (persis seperti `texture_level_offset()` di port Windows).
+
+## A0 — gate Vulkan 32-bit: hasil, koreksi, dan yang masih terbuka (2026-10-18)
+
+Alat: `loader/tests/probe_vk32.cpp` (juga dibangun sebagai `build/linux/vk_probe32`) untuk gate per device, dan
+`loader/tools/vk_intel_diag.cpp` untuk diagnosis pemicu. Keduanya bisa dijalankan manual.
+
+### Yang terukur di device ini
+
+| Device | Device | Memori/buffer | Image (+device-local) | View | Descriptor | **Pipeline** | Submit kosong | Barrier | Dynamic rendering | **Transfer (`vkCmdFillBuffer`)** | Raster |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Intel ADL GT2, **32-bit** | OK | OK | OK | OK | OK | **OK** | OK | OK | OK | **CRASH (SIGSEGV)** | tidak bisa diuji |
+| Intel ADL GT2, **64-bit** | OK | OK | OK | OK | OK | **OK** | OK | OK | OK | **CRASH (SIGSEGV)** | tidak bisa diuji |
+| llvmpipe, 32-bit | OK | OK | OK | OK | OK | OK | OK | OK | OK | OK | **0 fragmen** |
+
+### Tiga koreksi terhadap kesimpulan yang salah
+
+1. **`dynamicRendering` tidak pernah diaktifkan.** `begin_frame()` merekam `vkCmdBeginRendering` (dynamic
+   rendering), dan dynamic rendering adalah *fitur* yang harus diaktifkan saat device dibuat — device dibuat
+   hanya dengan `VkPhysicalDeviceFeatures` (Vulkan 1.0) tanpa `VkPhysicalDeviceVulkan13Features` sama sekali.
+   Setiap frame adalah undefined behaviour: llvmpipe menerimanya, driver yang ketat menewaskan. **Diperbaiki**:
+   fitur ditanyakan dengan `vkGetPhysicalDeviceFeatures2` dan diaktifkan lewat `pNext`; device tanpa fitur
+   sekarang ditolak dengan pesan, bukan mati di frame pertama.
+2. **Probe kami sendiri yang menghakimi driver.** Probe di `gfx::init()` memakai `vkCmdFillBuffer` pada buffer
+   `TRANSFER_DST` — dan itulah yang segfault di Intel. Presifnya: probe menilai driver dengan pekerjaan yang
+   **tidak pernah dilakukan game** (game menggambar dan menulis push buffer, tidak pernah transfer), sehingga
+   GPU yang bisa dipakai berubah jadi "mati saat submit". **Diperbaiki**: probe memakai `vkCmdPipelineBarrier`.
+3. **Bukan masalah 32-bit.** Hasil yang sama di build 64-bit: ANV Mesa 25.2.8 segfault pada perintah transfer
+   **di kedua bitness**. Jadi ini bug driver pada versi Mesa yang terpasang, bukan batasan proses 32-bit —
+   dan karena itu render server 64-bit (A0b) **tidak** otomatis menyelamatkannya.
+
+### Yang masih terbuka
+
+- **Gate A0 belum tuntas:** setelah fitur diaktifkan, A0 masih mati di
+  `create_targets` pada Intel. Semua primitif yang dipakai jalur render sudah terisolasi satu per satu di
+  `vk_intel_diag` dan semuanya selamat (termasuk memori DEVICE_LOCAL), jadi ada satu perbedaan lagi antara
+  `create_image()` dan kasus O yang belum teridentifikasi. Jejak per-panggilan ada di gate (`STEP ...`), jadi
+  titik berikutnya narrowed tanpa menebak.
+- **llvmpipe 0 fragmen**, dan itu bukan sesuatu yang bisa diukur di sini: 722 piksel berbeda dari referensi, dan
+  referensi mencakup tepat 722 piksel — segitiga tidak digambar sama sekali, sisanya memang clear. Berguna
+  untuk menguji jalur API, tidak untuk menggambar apa pun.
+
+### Tindakan yang hanya bisa dilakukan user
+
+**Coba versi Mesa lain untuk i386.** Driver ANV yang terpasang (25.2.8) terbukti rusak pada perintah transfer,
+dan itu crash yang sama di kedua bitness — jadi kandidat lain adalah versi Mesa yang lebih lama/lebih baru
+(PPA PPA, atau paket dari distro lain). Kalau salah satu tidak crash pada `vkCmdFillBuffer`, gate A0 bisa
+dipertahankan dan A0b tidak diperlukan. Cara cek cepat:
+
+```
+./build/linux/vk_probe32          # gate per device (0 = drew, 1 = did not, 77 = no hardware GPU)
+./build/linux/vk_intel_diag       # pemicu per primitif, kasus G = transfer
+```
+
+Kalau **semua** versi Mesa yang bisa dicoba masih crash pada transfer, keputusan arsitekturnya menjadi:
+**A0b (render server 64-bit) tetap jalur Intel** — karena satu-satunya driver yang bisa dipakai di mesin ini
+adalah ANV, dan ia harus dipakai dari proses 64-bit.
+
 ## Loader design (Phase 4, `loader/`)
 
 - `black.exe` is a no-CRT stub linked `/BASE:0x10000 /FIXED` with a 0x7F0000-byte BSS, so its image spans `0x10000-0x803000` and owns the XBE range before Windows creates heaps/stacks. It imports `BlackMain` from `blackrt.dll`, which maps the XBE over the stub image and never returns (it ends with `TerminateProcess`). The stub is `/SUBSYSTEM:WINDOWS` (2026-10-08, user: only the game window should show): no console of its own; `console_init` attaches to the parent's console when started from a prompt (stdout redirected by the parent is kept). The console gets only `logc` lines (banner, XBE hash, setup errors, exit, FATAL, unhandled exception), `--verbose` mirrors the whole log; black.log is as verbose as before. Without a console, `--help`/bad options show the usage in a message box.

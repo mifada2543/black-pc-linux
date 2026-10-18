@@ -709,6 +709,59 @@ Jadi sementara ini ketiga baris menolak draw sambil menyebut alasannya, bukan me
 jujur dan terlihat dari luar, tetapi **belum ada yang benar-benar tergambar** — dan itu batas A4 yang
 tersisa, bukan A4 yang selesai.
 
+### A11: `--doctor`, `tools/check-env.sh`, `docs/INSTALL.md` (2026-10-19)
+
+Tiga bagian A11. Dua di antaranya sudah bisa dipakai sekarang, dan yang ketiga gatenya belum terpenuhi.
+
+**`blacklinux --doctor`** (`src/platform/posix/doctor.{h,cpp}`). Satu halaman yang mengukur, bukan
+menebak: ukuran pointer dan apakah itu empat, distro, keberadaan image beserta judul dan entry point-nya,
+setiap perangkat Vulkan beserta alasan kalau ada yang dilewati, dan mana yang dipakai.
+
+Bagian yang paling berguna adalah bagian **yang belum ada**. Di sana dicantumkan konstanta FVF, empat
+baris device yang butuh layout `D3DMATERIAL9`, `D3DLIGHT9` dan `D3DRECT`, gate A0, dan keputusan lisensi
+A9. Alasannya: "game tidak menggambar" dan "jalur draw sengaja berhenti di batas bernama" tampak sama dari
+luar, dan hanya yang kedua yang benar.
+
+`--doctor` berjalan sebelum apa pun yang lain. Mesin tanpa perangkat Vulkan tetap harus bisa
+mengatakannya, dan laporan yang berhenti di kegagalan pertama tidak akan pernah sampai ke kegagalan kedua
+— padahal itulah yang paling ingin dilihat pembaca.
+
+**`tools/check-env.sh`.** Skrip ini tidak memasang apa pun, dan itu bukan karena memasang berbahaya,
+melainkan karena memasang bukan pertanyaannya. Pertanyaannya paket mana, dan skrip yang memasang adalah
+skrip yang menebak. Yang diperiksa diukur: ia mengompilasi program Vulkan 32-bit sungguhan lalu
+menjalankannya, karena loader yang tertaut dan driver yang berfungsi adalah dua fakta terpisah.
+
+Dua jebakan khusus Debian dan Ubuntu, keduanya mahal:
+
+- **Paket shader adalah `glslang-dev:i386`.** Bukan `libglslang-dev`, dan bukan `glslang-tools` versi
+  amd64. Memasang yang amd64 memberi `glslangValidator` yang tidak bisa jalan di proses 32-bit, dan itulah
+  gejalanya ketika build memakai compiler host untuk shader waktu-build.
+- **`mesa-vulkan-drivers:i386` yang menyediakan llvmpipe.** Tanpa itu proses 32-bit tidak melihat
+  perangkat Vulkan sama sekali pada mesin yang GPU-nya cuma Intel, dan gejalanya terbaca "Vulkan tidak
+  terpasang" padahal yang terpasang cuma separuh 64-bit.
+
+**`docs/INSTALL.md`.** Bagian Debian dan Ubuntu **sudah dijalankan** di mesin ini. Tiga bagian lain
+(Fedora, Arch, openSUSE) **belum dijalankan** dan ditandai begitu. Nama paket yang salah menghasilkan
+pesan `no such package` yang langsung mengatakannya, bukan kegagalan senyap. Tapi "belum diverifikasi" di
+sini berarti benar-benar belum diverifikasi, dan labelnya bukan hiasan.
+
+Dengan ini **gate A11 belum terpenuhi**: syaratnya terverifikasi pada minimal dua distro, dan satu mesin
+tidak bisa memenuhinya. Yang menutupnya menurut urutan biaya:
+
+1. Mesin kedua dengan distro mana pun. Jalankan `check-env.sh`, tempel keluarannya.
+2. Kontainer distro kedua dengan `/dev/dri` diteruskan. Cukup untuk nama paket, tidak cukup untuk loader.
+3. Tidak melakukan apa-apa, dan menerima bahwa port ini berjalan dengan instruksi terverifikasi pada satu
+   distro serta berlabel jelas pada tiga lainnya.
+
+Pilihan ketiga adalah jawaban yang sah. Ia lebih buruk dari dua pertama, dan lebih baik daripada
+mengumumkan verifikasi yang tidak terjadi.
+
+**Bentuk distribusi belum diputuskan**, dan mestinya diputuskan oleh A0, bukan oleh selera. A0 terbuka
+karena driver Intel 32-bit mati di dalam `vkQueueSubmit`, dan itu terjadi pada program sepuluh baris yang
+tidak ada hubungannya dengan port ini. Jadi pada sebagian mesin, bentuk apa pun yang dipilih tidak akan
+berjalan sampai itu dipahami. Mendistribusikan sebelum A0 tertutup berarti mengirim sesuatu yang
+pengalaman pertama di mesin yang umum adalah sebuah crash.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

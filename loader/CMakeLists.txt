@@ -198,7 +198,7 @@ if(UNIX)
   endif()
   # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
   # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).
-  add_executable(blacklinux src/platform/posix/main.cpp)
+  add_executable(blacklinux src/platform/posix/main.cpp src/platform/posix/doctor.cpp)
   target_link_libraries(blacklinux PRIVATE blackcore)
   # Platform layer tests. These need no XBE: they exercise the TEB anchor, the fs->gs patcher and the
   # SEH chain directly.

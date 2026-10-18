@@ -22,6 +22,8 @@
 // stubs, which is exactly the list that says what to implement next.
 #include "kernel/ktable_posix.h"
 #include "platform/posix/boot.h"
+#include "platform/posix/doctor.h"
+
 #include "platform/posix/log.h"
 
 #include <stdio.h>
@@ -37,6 +39,7 @@ struct Options {
     // Where \Device\Harddisk0 lives. Empty means "use the default under XDG_DATA_HOME", which is what a
     // player's writable console data belongs in: the game's own folder is the DVD and stays read-only.
     std::string hdd;
+    bool doctor = false;
     bool probe = false;
     bool info = false;
     bool trace = false;
@@ -54,6 +57,7 @@ void usage()
             "  --xbe <path>    XBE to run (default game/default.xbe)\n"
             "  --log <path>    log file (default blacklinux.log)\n"
             "  --hdd <path>    writable folder for \\Device\\Harddisk0 (default $XDG_DATA_HOME/blacklinux)\n"
+            "  --doctor        report what this machine can and cannot do, then exit\n"
             "  --probe         enter the entry point, wait --timeout seconds, then report how far it got\n"
             "                  (set BLACKLINUX_TRACE=1 to record which D3D entries it called)\n"
             "  --info          print the image and exit without mapping it\n"
@@ -91,6 +95,8 @@ bool parse_args(int argc, char **argv, Options &o)
             const char *v = need("--timeout");
             if (!v) return false;
             o.timeout_s = (uint32_t)atoi(v);
+        } else if (!strcmp(a, "--doctor")) {
+            o.doctor = true;
         } else if (!strcmp(a, "--probe")) {
             o.probe = true;
         } else if (!strcmp(a, "--info")) {
@@ -116,6 +122,11 @@ int run(const Options &o)
     log_init(o.log.c_str(), o.trace);
     log_set_trace(o.trace);
     kernel_set_trace(o.trace);
+
+    // --doctor runs before anything else, and deliberately. A machine with no usable Vulkan device still has
+    // to be able to say so, and a report that dies at the first missing thing cannot: it would report the
+    // first failure and never the second, which is exactly what a reader needs to see.
+    if (o.doctor) return xd3d::run_doctor(o.xbe.c_str(), o.hdd.c_str());
 
     logc("BLACK loader %s -- XBE %s, log %s", kVersion, o.xbe.c_str(), log_path() ? log_path() : "(none)");
 

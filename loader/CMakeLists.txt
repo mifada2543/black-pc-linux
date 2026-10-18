@@ -92,6 +92,8 @@ if(UNIX)
     src/input/xinput_posix.cpp
     src/input/bindings_posix.cpp
     src/input/mouselook_posix.cpp
+    src/audio/output_posix.cpp
+    src/audio/decoder_posix.cpp
     src/shader/nv2a_vsh_posix.cpp
     src/shader/nv2a_psh_posix.cpp
     src/shader/material_posix.cpp
@@ -246,6 +248,38 @@ if(UNIX)
     message(WARNING "no GLSL to SPIR-V compiler found (neither glslangValidator nor glslc_host) -- the "
                     "headless graphics suite and the A0 gate will be skipped")
   endif()
+
+# ---- audio decoder: FFmpeg libavcodec (i386) for WMA/XMV ----
+# The game uses WMA for audio and XMV for video. Both decode via libavcodec.
+# We need the i386 dev package: libavcodec-dev:i386 (also pulls libavformat, libavutil, libswresample, libswscale).
+find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h
+          PATHS /usr/include /usr/include/i386-linux-gnu
+          NO_CMAKE_FIND_ROOT_PATH)
+find_library(AVCODEC_LIB avcodec PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib NO_CMAKE_FIND_ROOT_PATH)
+find_library(AVFORMAT_LIB avformat PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib NO_CMAKE_FIND_ROOT_PATH)
+find_library(AVUTIL_LIB avutil PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib NO_CMAKE_FIND_ROOT_PATH)
+find_library(SWRESAMPLE_LIB swresample PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib NO_CMAKE_FIND_ROOT_PATH)
+find_library(SWSCALE_LIB swscale PATHS /usr/lib/i386-linux-gnu /usr/lib32 /usr/lib NO_CMAKE_FIND_ROOT_PATH)
+
+if(AVCODEC_INCLUDE_DIR AND AVCODEC_LIB AND AVFORMAT_LIB AND AVUTIL_LIB AND SWRESAMPLE_LIB AND SWSCALE_LIB)
+  message(STATUS "FFmpeg libavcodec ${AVCODEC_LIB} -- audio/video decoder will link")
+  set(FFMPEG_LIBS ${AVCODEC_LIB} ${AVFORMAT_LIB} ${AVUTIL_LIB} ${SWRESAMPLE_LIB} ${SWSCALE_LIB})
+  set(HAVE_FFMPEG ON)
+else()
+  message(WARNING
+    "libavcodec-dev:i386 was not found, so the audio/video decoder (A9) is disabled.\n"
+    "  Install it with:  sudo apt install libavcodec-dev:i386\n"
+    "  The x86-64 package does not help: this loader is a 32-bit process.\n"
+    "  Everything else here builds and tests without it.")
+  set(HAVE_FFMPEG OFF)
+endif()
+
+# Link FFmpeg libraries to blackcore if available
+if(HAVE_FFMPEG)
+  target_include_directories(blackcore PUBLIC ${AVCODEC_INCLUDE_DIR})
+  target_link_libraries(blackcore PUBLIC ${FFMPEG_LIBS})
+  target_compile_definitions(blackcore PUBLIC HAVE_FFMPEG=1)
+endif()
   # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
   # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).
   add_executable(blacklinux src/platform/posix/main.cpp src/platform/posix/doctor.cpp src/platform/posix/window.cpp)

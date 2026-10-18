@@ -879,6 +879,31 @@ Implementasi layer input Linux (SDL2) yang memetakan keyboard/mouse/gamepad ke X
 
 **Test:** `--window --frames 10` jalan tanpa crash, window focus/capture log terlihat.
 
+### A9: Audio/Video decoder — FFmpeg wrapper WMA + XMV (2026-10-19)
+
+`src/audio/decoder_posix.{h,cpp}` + `src/audio/output_posix.{h,cpp}` — implementasi decoder WMA (audio) dan XMV (video) via libavcodec (FFmpeg), plus output audio SDL2.
+
+**Files:**
+| File | Deskripsi |
+|---|---|
+| `src/audio/decoder_posix.h` | API publik: `AudioDecoder`/`VideoDecoder`, `audio_open/close/decode`, `video_open/close/decode` |
+| `src/audio/decoder_posix.cpp` | Implementasi conditional: `HAVE_FFMPEG=1` → libavcodec/avformat/avutil/swresample/swscale; stub kosong kalau tidak ada header |
+| `src/audio/output_posix.{h,cpp}` | Output audio SDL2 (48 kHz stereo, 10 ms block, ring buffer, WAV recording via `BLACKLINUX_AUDIO_WAV`) |
+
+**Decoder support:**
+| Format | Codec FFmpeg | Status |
+|---|---|---|
+| WMA (Windows Media Audio) | `AV_CODEC_ID_WMAV2` (wmav2) | ✅ `audio_open/decode/close` → float stereo 48 kHz via `swresample` |
+| XMV (Xbox Media Video) | `AV_CODEC_ID_WMV3` / fallback `VC1` | ✅ `video_open/decode/close` → RGBA via `swscale` |
+
+**Build integration:**
+- CMake deteksi `libavcodec-dev:i386` (include + 5 library: avcodec, avformat, avutil, swresample, swscale)
+- `target_compile_definitions(blackcore PUBLIC HAVE_FFMPEG=1)` saat ditemukan
+- Header guard di decoder: `#if HAVE_FFMPEG_HEADERS` / `#else` stub
+- `output_posix.cpp`: SDL2 audio device, callback thread-safe, ring buffer 7 block (70 ms), underrun handling
+
+**Test:** Clean rebuild 0 warning/error (17 warning dari SDL enum aritmetika di bindings_posix), 30/30 suite, 1.721 check, SPIR-V byte-identik.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

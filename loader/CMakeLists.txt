@@ -37,6 +37,11 @@ if(UNIX)
     src/kernel/k_thread_posix.cpp
     src/kernel/k_dpc_posix.cpp
     src/d3d/d3d_hooks_posix.cpp
+    src/d3d/xd3d8_posix.cpp
+    src/d3d/thunk_posix.cpp
+    src/d3d/device_posix.cpp
+    src/d3d/hle_table_posix.cpp
+    src/d3d/hle_device.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
@@ -127,6 +132,25 @@ if(UNIX)
   add_executable(test_d3d_hooks tests/test_d3d_hooks.cpp)
   target_link_libraries(test_d3d_hooks PRIVATE blackcore)
   add_test(NAME d3d_hooks COMMAND test_d3d_hooks)
+  # The Xbox D3D8 ABI, with every size and offset derived a second time in the test itself. No game image
+  # needed: this is the layer whose mistakes are invisible until the real thing runs.
+  add_executable(test_xd3d8 tests/test_xd3d8.cpp)
+  target_link_libraries(test_xd3d8 PRIVATE blackcore)
+  add_test(NAME xd3d8 COMMAND test_xd3d8)
+
+  # The HLE thunk builder: an LTCG call site with register arguments, forwarded to a __stdcall
+  # implementation, with the caller's stack and registers measured afterwards. This is where the four
+  # stdcall-shaped bugs of this port were found, so it is checked from both ends.
+  add_executable(test_thunk tests/test_thunk_posix.cpp)
+  target_link_libraries(test_thunk PRIVATE blackcore)
+  add_test(NAME thunk COMMAND test_thunk)
+
+  # The HLE state functions: every table row builds a callable thunk, and calling one moves exactly the
+  # bytes the game would read. A function that writes a shadow the game cannot see is not state.
+  add_executable(test_hle_device tests/test_hle_device.cpp)
+  target_link_libraries(test_hle_device PRIVATE blackcore)
+  add_test(NAME hle_device COMMAND test_hle_device)
+
   # DPCs and kernel timers: the last six kernel ordinals, checked against what the game can observe.
   add_executable(test_kdpc tests/test_kdpc.cpp)
   target_link_libraries(test_kdpc PRIVATE blackcore)

@@ -70,6 +70,15 @@ bool hooks_install_all(uint32_t image_base, uint32_t image_size, uint8_t *code, 
 // error.
 uint32_t hooks_arena_base();
 
+// Room for a generated thunk, from that same arena. The HLE thunk builder (thunk_posix.h) allocates here
+// rather than making an arena of its own: two arenas would mean two places where reach has to be checked,
+// and the one nobody remembered to check is the one that breaks.
+void *hooks_alloc_thunk(size_t bytes, std::string &err);
+
+// Map the arena without installing anything, for a caller that only wants to build thunks (the tests, and
+// a boot sequence that builds HLE thunks before it patches any entry). Installing hooks maps it too.
+bool hooks_prepare_arena(uint32_t image_size, uint8_t *code, std::string &err);
+
 // What the loader wants to know about a call it stopped on.
 struct LibHit {
     uint32_t index;      // row in the table it was installed from

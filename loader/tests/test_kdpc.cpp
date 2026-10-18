@@ -9,6 +9,13 @@
 //
 // The last one is the Xbox's rule rather than a convenience: one DPC object is in the queue or it is not, and
 // the Windows port's k_dpc.cpp (the invoice for this) says the same thing.
+//
+// Every check that waits here waits on a *wall-clock* deadline -- two or three seconds, polled ten times a
+// millisecond -- because a DPC that never runs cannot be told apart from a test that never finished. The
+// consequence is that these checks can fail on a machine busy for reasons that have nothing to do with the
+// DPC: one such failure happened while a full rebuild and the rest of the suite ran at the same time, and
+// fifteen consecutive runs afterwards were clean. So if exactly one of these fails, run it on its own before
+// believing it; if it passes there, the DPC was fine and the machine was not.
 #include "kernel/k_dpc_posix.h"
 #include "kernel/k_sync_posix.h"
 #include "kernel/k_thread_posix.h"

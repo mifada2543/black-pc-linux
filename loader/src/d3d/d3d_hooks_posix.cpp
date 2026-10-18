@@ -39,6 +39,8 @@ std::vector<Row> g_rows;
 uint8_t *g_thunks;
 size_t g_thunks_used;
 uint32_t g_arena_base;
+uint32_t g_image_size;
+uint8_t *g_image_code;
 const size_t kThunkBytes = 16; // push imm32 + call rel32 + add esp,4 + ret
 const size_t kThunkPage = 0x40000;
 
@@ -95,6 +97,8 @@ void *code_alloc(size_t n, uint32_t image_size, uint8_t *code, std::string &err)
     if (!g_thunks) {
         g_thunks = arena_near(image_size, code, err);
         if (!g_thunks) return nullptr;
+        g_image_size = image_size;
+        g_image_code = code;
     }
     if (g_thunks_used + n > kThunkPage) return nullptr;
     uint8_t *p = g_thunks + g_thunks_used;
@@ -315,6 +319,17 @@ uint32_t hooks_arena_base()
     return g_arena_base;
 }
 
+void *hooks_alloc_thunk(size_t bytes, std::string &err)
+{
+    void *p = code_alloc(bytes, g_image_size, g_image_code, err);
+    return p;
+}
+
+bool hooks_prepare_arena(uint32_t image_size, uint8_t *code, std::string &err)
+{
+    return code_alloc(16, image_size, code, err) != nullptr;
+}
+
 bool hooks_install(const LibFunc *funcs, size_t count, const Hle *hle, size_t hle_count, uint32_t image_base,
                    uint32_t image_size, uint8_t *code, HookReport *report, std::string &err)
 {
@@ -338,6 +353,8 @@ bool hooks_install_all(uint32_t image_base, uint32_t image_size, uint8_t *code, 
     g_rows.clear();
     g_thunks_used = 0;
     g_thunks = nullptr; // re-aimed at this image: a second image may be nowhere near the first one's arena
+    g_image_size = 0;
+    g_image_code = nullptr;
 
     HookReport total;
     for (size_t s = 0; s < 3; s++) {

@@ -7,7 +7,9 @@
 #version 450
 
 layout(location = 0) in vec4 v_color;
-layout(location = 1) out vec4 out_color;
+// Location 0 for the same reason as probe.frag: one colour attachment, so location 0 is the only output
+// that reaches a framebuffer. See the note there and NOTES.md.
+layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D u_tex;
 

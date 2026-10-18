@@ -1374,3 +1374,277 @@ User report: the game froze when the PC went to sleep. Three things broke, all f
   strings are written in place in fixed buffers; the port's entries hold 0x10000 references.
 - The Windows menu bar is gone. Fullscreen from PC SETTINGS is `host3d::set_fullscreen` (WM_APP + 0x53). The key
   bindings dialog and menu.cpp were removed.
+---
+
+## "llvmpipe 32-bit membuang semua fragmen" — dikarbantah, dan tiga bug asli di_replace (2026-10-18)
+
+Pencetusnya satu baris di `vk_probe32`:
+
+```
+PIXELS total=3072 covered_by_reference=722 mismatched=722 tolerance=61 first_mismatch=19x0
+llvmpipe ... FAIL (no pixels)
+```
+
+`mismatched == covered == 722`, dan `tests/test_gfx.cpp` sudah memuat catatan yang menyimpulkan
+"32-bit llvmpipe membuang setiap fragmen". Kesimpulan itu **salah**, dan saya hampir melaporkannya
+sebagai bug driver kedua ke Mesa.
+
+### Bukti awal: gambarnya benar-benar kosong
+
+`VK_PROBE_PNG` ditulis, lalu `convert` + `numpy`-free decode:
+
+```
+ukuran 64x48   warna unik: 1
+   RGB(0, 0, 128) -> 3072 piksel
+```
+
+Satu warna = warna clear `(0, 0, 0.5, 1)`. Segitiga **tidak menghasilkan fragmen sama sekali**.
+Bukan "warnanya salah" — tidak ada apa-apa.
+
+### Metode: program Vulkan 32-bit yang berdiri sendiri
+
+Tulis `tests/probe_vk32` benar-benar tidak berguna untuk questions ini, karena ia memakai
+`gfx::`. Saya tulis program ~330 baris di `/tmp/opencode/mini_vk.cpp`: hanya `libvulkan`, tanpa
+blackcore, tanpa loader kita, memakai SPIR-V yang sama. Empat mode (render pass klasik vs dynamic
+rendering x ada/tidaknya depth) supaya bisa dibedakan "barisan kita" dari "llvmpipe".
+
+Empat mode, **32-bit dan 64-bit**: `covered=0 of 3072`. Jadi bukan dynamic rendering, bukan depth,
+bukan 32-bit.
+
+### Bug 1 (kita) — fragmen ditulis ke location yang tidak ada
+
+```
+shaders/probe.frag:12       layout(location = 1) out vec4 out_color;
+shaders/probe_tex.frag:10   layout(location = 1) out vec4 out_color;
+src/gfx/gfx_vulkan.cpp:1835 cb.attachmentCount = 1;
+```
+
+Attachment_color pada pipeline cuma satu, jadi yang ada hanya **location 0**. Ketiga shader fragmen
+menulis ke **location 1**. Semua fragmen masuk ke tempat yang tidak ada attachment. Clear tetap
+utuh (loadOp CLEAR tidak ikut terpotong), draw "sukses", tidak ada error, tidak ada crash.
+
+Bukti: GLSL yang sama dengan `location = 0` → `covered=253` . Dengan
+`location = 1` → `covered=0`. Selisihnya bukan soal driver.
+
+### Bug 2 (llvmpipe) — baca dua atribut vertex merusak fetch posisi  [diperbaiki & dikendalikan, lihat "Dua klaim yang dicabut"]
+
+Setelah Bug 1 diperbaiki, segitiga masih salah bentuk. Butuh trapezium, lalu `gl_FragCoord`
+dibandingkan dengan posisi readback: **0 pixel meleset** — readback benar, rasterisasi yang salah.
+
+| uji | covered | benar? |
+|---|---|---|
+| posisi dari `gl_VertexIndex`, `in_color` **dibaca** | 1536 | ya |
+| hanya `location 0` dibaca shader | 1536 | ya |
+| `in_pos` dari attr 0 **dan** `in_color` dibaca, stride 28 | 384 -> 0 | **tidak** |
+| sama, layout standar vec2@0/vec4@16, stride 32 | 768 | **tidak** |
+
+1536 = tepat setengah 3072, dan itu yang benar untuk segitiga NDC -1..+1 di viewport 64x48. Jadi
+`gl_VertexIndex` + baca attr 1 benar, attr 0 + attr 1 salah. Yang rusak adalah **fetch attribute 0
+ketika attribute 1 juga diambil**.
+
+Bukan OOB: buffer 4096 byte, validation layer (`VkLayer_khronos_validation.json` terpasang dan
+dipakai) **nol error**, dan hasil identik di 64-bit. Lesser-used layout `stride 24` justru benar
+(1536) — jadi ini bukan sekadar "stride sembarang".
+
+Ini kandidat laporan driver kedua, dan **terpisah** dari crash ANV. Belum dikirim; minimal case-nya
+sudah kecil.
+
+### Bug 3 (kita, di dalam test) — presedensi di fungsi referensi
+
+`tests/probe_vk32.cpp:87`:
+
+```c
+const float ndc_y = 1.0f - ((float)y + 0.5f) / (float)kHeight * 2.0f - 1.0f;
+```
+
+`/` dan `*` sama presedensi, kiri-ke-kanan; lalu `-` kiri-ke-kanan. Hasilnya
+`(1 - X*2) - 1` = `-X*2` — jadi `ndc_y` berada di `[-0.02, -1.98]`, bukan `[-0.98, 0.98]`. `1.0f`
+di depan tidak ada gunanya.
+
+Dihitung ulang di Python dengan urutan presedensi C++:
+
+```
+covered oleh reference SEKARANG  : 722   <- cocok persis dengan angka test
+covered oleh reference YANG BENAR: 962
+```
+
+Jadi fungsi itu memang yang menghasilkan 722, dan 962 yang seharusnya. Gate akan tetap salah
+walaupun Bug 1 sudah diperbaiki.
+
+### Kenapa tidak tertangkap sebelumnya
+
+`test_gfx.cpp:281` — kalau tidak ada fragmen, dua check warnanya di-`skip`, bukan `fail`:
+
+```
+skip the triangle's three corner colours (this device produced no fragments at all)
+skip the background outside the triangle (same reason)
+```
+
+Jadi "30/30 suite, 1721 checks" **tidak pernah** menguji rasterisasi. Pola yang sama seperti
+A4/A9: menyingkirkan cek bukan bukti berfungsi. `vk_probe32` satu-satunya yang menolak menyingkirkan,
+karena itu memang tugasnya.
+
+### Temuan sampingan: header Vulkan sistem bukan stock
+
+`/usr/include/vulkan/vulkan_core.h` mendeklarasikan
+`VK_HEADER_VERSION_COMPLETE = VK_MAKE_API_VERSION(0, 1, 3, 275)`, tapi **`vkCmdCopyImageToImage` dan
+`VkCopyImageToImageInfo` tidak ada** di dalamnya, sementara `vkCmdCopyImageToBuffer` dan varian
+`-EXT`-nya ada. Keduanya adalah core 1.0. `VkViewport`/`VkRect2D` urutannya normal, dan program
+minimal ini justru tidak bisa dikompilasi tanpauo workaround. Tidak dicedah apakah ini hasil
+patching Ubuntu atau sesuatu yang lain — hanya dicatat karena loader kita mungkin terpengaruh.
+
+### Yang harus dikerjakan berikutnya
+
+1. `shaders/probe.frag`, `shaders/probe_tex.frag`: `location = 1` → `location = 0`.
+2. `tests/probe_vk32.cpp:87`: betulkan presedensi `ndc_y` (dan cek apakah `ndc_x` juga perlu).
+3. `test_gfx.cpp`: hapus `skip` itu, atau jadikan `fail` yang jujur — selama ini suite hijau
+   menutupi rasterisasi yang tidak pernah benar.
+4. Bug 2: siapkan minimal case untuk laporan Mesa **terpisah** dari crash ANV.
+
+---
+
+## Hasil perbaikan, dan dua klaim yang saya cabut sendiri (2026-10-19)
+
+### Yang diperbaiki di ronde ini
+
+| file | perubahan | status |
+|---|---|---|
+| `shaders/probe.frag` | `location = 1` -> `location = 0` | terrain |
+| `shaders/probe_tex.frag` | `location = 1` -> `location = 0` | terrain |
+| `tests/probe_vk32.cpp` | presedensi `ndc_y` diperbaiki | terrain |
+
+Shader runtime (`nv2a_psh_posix.cpp:272`, `material_posix.cpp:119`,
+`pipeline_cache_posix.cpp:88`) **sudah** benar pakai `location = 0`; hanya tiga shader
+statis untuk gate yang salah.
+
+Setelah perbaikan, `covered_by_reference` naik **722 -> 962** — persis angka yang dihitung
+ulang secara terpisah untuk referensi yang benar. Build bersih: 0 warning, 0 error,
+30/30 suite, 1721 checks.
+
+### Dua klaim yang saya cabut
+
+**1. "Header Vulkan sistem bukan stock."** Saya bilang `vkCmdCopyImageToImage` dan
+`VkCopyImageToImageInfo` hilang, dan `VkRenderingAttachmentInfo` tidak punya
+`finalLayout`, lalu nearly menambahkan `finalLayout` ke `gfx_vulkan.cpp`. Dua-duanya
+**salah**. Saya unduh `vulkan_core.h` resmi dari Khronos (`main`, `VK_HEADER_VERSION 365`)
+dan membandingkan:
+
+```
+                                        lokal    resmi
+VK_FORMAT_R32G32_SFLOAT                   103      103
+VK_FORMAT_B8G8R8A8_UNORM                   44       44
+vkCmdCopyImageToImage                      0        0
+VkRenderingAttachmentInfo.finalLayout      absen   absen
+```
+
+Header lokal **identik** dengan yang resmi. Dugaan "header rusak" dicabut seluruhnya, dan
+perubahan `finalLayout` yang sempat saya buat sudah dikembalikan. (Saya juga sempat
+"salah": nilai `VK_FORMAT_R32_SFLOAT` ada di ingatan saya sebagai 1000066008; ternyata
+salah, yang benar 100.)
+
+**2. "llvmpipe mengabaikan stride vertex."** Dari sweep pertama menyimpulkan
+`stride 8` benar dan `>= 24` nol. **Salah** — harness saya sendiri yang salah: struct
+verteks 8 byte sementara stride-nya saya ubah ke 28, sehingga data yang diunggah lebih
+kecil dari yang dibaca. Setelah data diperbaiki (buffer 768 B, seluruhnya terisi):
+
+```
+stride  8  12  16  20  24  28  32  36  40  48  64
+covered 1536 1536 1536 1536 1536 1536 1536 1536 1536 1536 1536   -- semua BENAR
+```
+
+Jadi stride **bukan** penyebabnya. Penyebabnya jumlah atribut, dan temuan itu tetap
+bertahan setelah dikontrol ulang:
+
+| konfigurasi | covered | |
+|---|---|---|
+| 1 atribut, stride 8..64 (11 nilai) | 1536 | benar |
+| 2 atribut (`vec2`@0 + `vec4`@8), stride 28, buffer 768 B | **0** | salah |
+| 2 atribut, posisi dari `gl_VertexIndex` | 1536 | benar |
+
+### Yang sebenarnya explains kegagalan loader
+
+Bukti penentu datang dari mengganti isi `probe.vert` sementara: posisi diambil dari
+`gl_VertexIndex`, bukan dari vertex buffer. Hasilnya **1536 piksel dengan bentuk
+segitiga yang sempurna** — lewat seluruh `gfx::`, dengan pipeline, tiga pass, depth,
+viewport dinamis, descriptor set, dan format apa adanya.
+
+Artinya: **seluruh lapisan `gfx::` benar**. Yang rusak hanya pengambilan atribut vertex,
+dan itu replikasinya persis apa yang Dilihat di program minimal. Loader kita memakai
+dua atribut (`probe.vert` membaca `in_pos` dan `in_color`), jadi ia jatuh ke bug yang sama.
+
+Ini membatalkan catatan lama "32-bit llvmpipe membuang setiap fragmen" sebagai penjelasan
+yang salah, dan menggantinya dengan yang benar dan lebih sempit.
+
+### Yang masih terbuka, jujur
+
+- Apakah bug ini llvmpipe atau ada beda lain antara program minimal dan loader kita:
+  **belum tersingkirkan**. Program minimal tidak mengaktifkan `samplerAnisotropy` dan
+  `shaderStorageImageExtendedFormats`, sedangkan `gfx::` keduanya menyalakan.
+- Karena itu laporan ke Mesa **disiapkan tapi ditahan** (`report.md` bagian [4]).
+- `tests/test_gfx.cpp` masih `skip` dua check raster. Selama `skip` itu ada, "30/30"
+  tidak berarti rasterisasi benar. Ini belum diperbaiki — memang tidak bisa diperbaiki
+  sebelum bug di atas selesai.
+
+### Kalau nanti diperbaiki
+
+`test_gfx.cpp` harus berhenti `skip` dan gagal keras. Kalau tidak, cacat yang sama akan
+tertidur lagi tepat seperti Bug 1 tertidur di balik `skip` ini.
+
+---
+
+## Radius bug ANV di Mesa 26.2.5, danpembatalan klaim ketiga (2026-10-19)
+
+### Yang baru diukur: belum diperbaiki di Mesa 26.2.5
+
+Mesa 26.2.5 diambil dari PPA kisak (noble), **tidak diinstal** -- `.deb` diekstrak ke
+direktori sementara dan dijalankan dengan `LD_LIBRARY_PATH` +
+`VK_ICD_FILENAMES`. Tidak ada sudo, tidak ada perubahan sistem. Yang dipakai sudah
+dibuktikan dengan `LD_DEBUG=libs`:
+
+```
+/tmp/opencode/mesa26root/usr/lib/x86_64-linux-gnu/libvulkan_intel.so
+BuildID 9e30c0f3d8ad967dbeaecdb782a2f3f030cb05a1
+```
+
+| Mesa | arsitektur | hasil |
+|---|---|---|
+| 25.2.8 (sistem) | 64-bit | SIGSEGV |
+| 25.2.8 (sistem) | 32-bit | SIGSEGV |
+| 26.2.5 (kisak) | 64-bit | SIGSEGV |
+
+Stack di 26.2.5 sama kedalaman: 7 frame, semuanya di dalam `libvulkan_intel.so`, lalu
+`main`. Jadi dua hal yang tadinya hanya saya **dugaan** -- "juga crash di 64-bit" dan
+"tidak butuh fork" -- sekarang **terukur**, dan keduanya benar. Keduanya sempat
+saya tulis ke Tapani sebagai fakta; dia tidak mengoreksi, jadi saya tidak akan
+mengulangnya.
+
+i386 tidak diuji: PPA kisak untuk noble tidak menyediakan `mesa-vulkan-drivers:i386`.
+
+### Klaim llvmpipe dicabut -- untuk ketiga kalinya saya salah di harness yang sama
+
+`report.md` bagian [4] (laporan bug llvmpipe "dua atribut vertex") **dicabut seluruhnya**.
+Config yang saya klaim salah, dengan data yang benar, menghasilkan `covered=1536` di 32-
+dan 64-bit -- yaitu benar.
+
+Yang saya catsat di bagian [4] adalah kesalahan yang sama untuk ketiga kalinya. Semuanya satu sebab:
+
+| # | kesalahan | bagaimana ketahuan |
+|---|---|---|
+| 1 | struct 8 byte, stride diubah ke 28 | data lebih kecil dari yang dibaca |
+| 2 | filler 9.0f berjalan setelah posisi diisi | posisi tertimpa |
+| 3 | placeholder `//@@POSITIONS@@` tidak pernah diganti | `diff` antar dua berkas uji |
+
+Yang ketiga paling halus: 192 float bernilai 9.0f terunggah, segitiga degenerat, nol
+piksel, dan saya membacanya sebagai "driver salah".
+
+Pelajarannya satu kalimat: **cetak isi buffer yang benar-benar terunggah, lalu `diff` dua
+berkas uji.** Keduanya beberapa detik, dan keduanya membuktikan klaim saya berbohong.
+Saya hampir mengirim dua bug palsu ke developer Mesa; yang kedua masih tertahan hanya
+karena saya ragu, bukan karena saya benar.
+
+### Yang masih terbuka
+
+Masalah 0-piksel pada frame uji ada di `gfx::` atau di harness kita. Dengan data yang
+benar, program minimal yang meniru langkah-langkah loader **menggambar segitiga dengan
+benar** pada stride 28 dengan dua atribut. Jadi bukan llvmpipe. Belum ditemukan penyebabnya,
+dan tidak ada lagi yang bisa diklaim ke pihak mana pun sampai ketemu.

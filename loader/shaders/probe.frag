@@ -9,7 +9,11 @@
 #version 450
 
 layout(location = 0) in vec4 v_color;
-layout(location = 1) out vec4 out_color;
+// Location 0, and it has to be: the pipeline this shader is used with declares one colour attachment
+// (cb.attachmentCount = 1 in gfx_vulkan.cpp), so location 0 is the only output that has somewhere to go.
+// At location 1 every fragment was written to an attachment that does not exist: the clear survived, the
+// draw reported success, no validation error fired, and not one pixel was ever produced. See NOTES.md.
+layout(location = 0) out vec4 out_color;
 
 void main()
 {

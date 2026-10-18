@@ -83,8 +83,14 @@ void expected_pixel(uint32_t x, uint32_t y, uint8_t out[4])
 {
     // Pixel centre in clip space. The viewport is the whole target and the Y axis is flipped on the way to
     // the framebuffer, so both matter and both are one line each.
+    //
+    // The parentheses around the fraction are load-bearing. `1.0f - X * 2.0f - 1.0f` -- which is what this used
+    // to say -- is `(1 - X*2) - 1`, because `/`, `*` and `-` are all left-to-right at these precedences: it
+    // cancelled the leading 1.0f and left `-X*2`, putting ndc_y in [-0.02, -1.98] instead of [-0.98, 0.98].
+    // That reference covered 722 pixels where the correct one covers 962, and the 722 matched what this gate
+    // reported, which is how the mistake stayed invisible for so long. See NOTES.md.
     const float ndc_x = ((float)x + 0.5f) / (float)kWidth * 2.0f - 1.0f;
-    const float ndc_y = 1.0f - ((float)y + 0.5f) / (float)kHeight * 2.0f - 1.0f;
+    const float ndc_y = 1.0f - (((float)y + 0.5f) / (float)kHeight * 2.0f);
 
     // Barycentric coordinates by the edge-function form, which needs no normalisation and no special case
     // for one of the vertices being the origin.

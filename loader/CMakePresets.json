@@ -2,20 +2,6 @@
   "version": 6,
   "configurePresets": [
     {
-      "name": "win32",
-      "displayName": "Win32 (Visual Studio 2026)",
-      "generator": "Visual Studio 18 2026",
-      "architecture": "Win32",
-      "binaryDir": "${sourceDir}/build/win32"
-    },
-    {
-      "name": "win32-vs2022",
-      "displayName": "Win32 (Visual Studio 2022)",
-      "generator": "Visual Studio 17 2022",
-      "architecture": "Win32",
-      "binaryDir": "${sourceDir}/build/win32-vs2022"
-    },
-    {
       "name": "linux",
       "displayName": "Linux i386 (Ninja, 32-bit)",
       "generator": "Ninja",
@@ -29,8 +15,6 @@
     }
   ],
   "buildPresets": [
-    { "name": "win32-release", "configurePreset": "win32", "configuration": "RelWithDebInfo" },
-    { "name": "win32-debug", "configurePreset": "win32", "configuration": "Debug" },
     { "name": "linux", "configurePreset": "linux" }
   ],
   "testPresets": [

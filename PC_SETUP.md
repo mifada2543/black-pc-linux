@@ -1,4 +1,9 @@
-# Windows PC setup
+# Windows PC setup (archived port)
+
+> **This is the archived Windows port's setup, kept as history.** The project is Linux-only now: build it
+> with `loader/CMakePresets.json` (`cmake --preset linux`) and follow `docs/CARA-PASANG-GAME.md`. Nothing
+> below applies to the Linux loader, and the Windows sources it builds are not in git — they live in
+> `loader/windows/` on a machine that still has them.
 
 Developer setup for building, running and analysing the port on Windows (players only need `README.md`). Written as
 the handoff from the Mac, where the disc was extracted and analysed, to the PC.

@@ -4,19 +4,33 @@ Read `NOTES.md` (findings, build facts, environment) and `docs/ROADMAP.md` (7-ph
 
 ## What this project is
 
-A 32-bit Windows program that loads the user's own `game/default.xbe` and runs the original x86 code natively, with the Xbox kernel,
-D3D8, DSound and XAPI replaced by PC code (HLE, like Cxbx-Reloaded). Decompiling to C++ is incremental and secondary: first get the
-original code running, then replace subsystems with decompiled C++ in priority order. Decomp = functionally equivalent C++, not
-byte-matching (no XDK compiler). The work was started on a Mac and is being continued on a Windows PC.
+A **32-bit i386 Linux program** that loads the user's own `game/default.xbe` and runs the original x86
+code natively, with the Xbox kernel emulated in-process (HLE, like Cxbx-Reloaded). The process must be
+32-bit: long mode cannot execute the game's x86-32 code and the image bakes absolute addresses into
+itself. D3D8, DSound and XAPI are being replaced by Linux code — Vulkan, then SDL2 — but **that layer does
+not exist yet**, so the game cannot be played.
 
-## State (2026-10-04)
+This is a fork of the Windows port by Spark198rus. **The project is Linux-only now.** The original
+Windows implementation is archived in `loader/windows/`, which `.gitignore` excludes from git: it is the
+*invoice* for this code — the only place certain non-obvious workarounds are explained — not a second
+build, and nothing in `loader/CMakeLists.txt` refers to it. Read it for the "why" before porting anything;
+never port the mechanism without the reason.
 
-Done on the Mac: disc extracted to `game/`; Phase 1 gate passed; Ghidra analysis done (7,595 functions in memory); push-buffer risk assessed.
-Done on the PC: **Phase 4 gate passed**. `loader/` (CMake, Win32) builds `black.exe` + `blackrt.dll`. Build/run: `loader/README.md`; design and boot sequence: NOTES.md.
-Phase 5 (evening): D3D, DSound and input are HLE (Direct3D 9, NV2A vertex programs and register combiners translated to HLSL, XAudio2 mixer).
-The game runs through logos, title, menus and videos into the **first mission, which renders and plays with sound** at 30 fps.
-Fast test loop: `--skip-videos --press "20s:start,50s:a,56s:a,62s:a"` reaches gameplay in ~75 s. Findings and next steps: "Phase 5 progress" in NOTES.md.
-Setup for this machine: `PC_SETUP.md` (CMake is bundled with VS 18 Build Tools, not on PATH; see NOTES.md environment notes).
+## State (2026-10-18)
+
+Linux port, i386, in `loader/src` (44 files) with 17 test suites and 930 checks, all green without the
+game. Working: XBE parse, image map at `0x10000`, section copy, `%fs:` → `%gs:` rewriting (every
+displacement, including those inside the per-thread KPCR block), all **115** kernel imports resolved with
+**no stubs left** (102 implemented + 13 data exports), mini-SEH, the Xbox filesystem/memory/sync/thread/
+DPC layers, and the entry point run on a real thread created through the thread layer. Entry hooks for the
+XBE's D3D/DSOUND/XPP sections are installed (819 functions; 8 too short for a jump trap instead, and the
+signal bridge recognises them). A headless Vulkan device exists (`loader/src/gfx`) and is tested as far as
+this machine allows — its 32-bit drivers rasterise nothing, which is measured and reported, not assumed.
+
+**Not built:** D3D8 (so no drawing and no playable game), SDL2 host window/input/audio, and anything that
+needs the real image. `.agents/plan.md` holds the plan, the phase gates, the risk register and the open
+blockers; `docs/CARA-PASANG-GAME.md` is the Indonesian install/run guide. Build, run and the source layout
+are in `loader/README.md`; the archived port's own README is `loader/windows/README.md`.
 
 ## Hard rules
 
@@ -26,6 +40,11 @@ Setup for this machine: `PC_SETUP.md` (CMake is bundled with VS 18 Build Tools, 
 - The user supplies the dump; the loader reads `default.xbe` and assets from a path at runtime. Nothing game-derived is embedded in the loader.
 - Cxbx-Reloaded and xemu are GPL: read them as reference; do not paste their code into this project without the user deciding the license first.
 - Everything under `tools/` third-party clones and `tools/bin/` is local only (also git-ignored). macOS binaries in `tools/bin/` do not run on Windows.
+- **`loader/windows/` is the archived Windows port and is deliberately not in git** (`.gitignore`). Do not
+  "fix" that by committing it, do not add Linux build rules for it, and do not port a mechanism from it
+  without porting the comment that explains it. It stays buildable on Windows with MSVC (`loader/windows/CMakeLists.txt`);
+  two shared files stay outside it on purpose: `loader/src/sha1.*` (one SHA-1) and `loader/src/*_functions.inc`
+  (section tables, which are facts about the game build).
 
 ## Known facts that shape the design (details and addresses in NOTES.md)
 

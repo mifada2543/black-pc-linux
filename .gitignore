@@ -5,6 +5,13 @@ game/
 *.xiso
 *.bin.bak
 .agents
+.codebase-memory
+# The archived Windows port: the invoice for the Linux one, kept locally and deliberately not in git.
+# It is the record of *why* each workaround exists (see the comments in loader/windows/src), and it is
+# deliberately not a second build: nothing in loader/CMakeLists.txt refers to it, and the Linux port
+# compiles none of it. A clone without it builds and tests the Linux loader unchanged. Keep a copy
+# wherever you keep your own dumps -- the documentation in .agents/plan.md cites it by line number.
+loader/windows/
 
 # Third-party tooling is cloned/built locally, not vendored
 tools/extract-xiso/

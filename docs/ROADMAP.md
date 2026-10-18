@@ -1,6 +1,10 @@
 <!--
 Copy of the project's planning doc "BLACK Xbox to PC Port Roadmap", taken 2026-10-04.
 Findings made after this was written are in ../NOTES.md ("Findings that change the plan"), not edited in here.
+
+This roadmap describes the *Windows* port and is kept unchanged as history. The Linux port has its own
+plan, phase gates and risk register in ../.agents/plan.md; where the phases below mention MSVC, D3D 9,
+XAudio2 or XInput, the Linux equivalents are Vulkan, SDL2 and the read-only Xbox file layer.
 -->
 
 # BLACK Xbox to PC Port Roadmap

@@ -8,6 +8,11 @@ mesin ini kecuali bagian yang ditandai **belum terverifikasi** — yaitu bagian 
 
 ---
 
+> **Repo ini sekarang hanya Linux.** Kode port Windows asal tidak lagi ada di git: ada di
+> `loader/windows/` yang di-`gitignore`, sebagai *invoice* (catatan alasan di balik tiap workaround), bukan
+> build kedua. Clone baru tanpa folder itu tetap bisa build dan test. Tidak ada yang perlu Anda lakukan
+> soal ini —-build Windows memang tidak dilanjutkan.
+
 ## 0. Status jujur sekarang
 
 | Bisa | Belum |

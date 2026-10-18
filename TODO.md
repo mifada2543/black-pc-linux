@@ -1,10 +1,27 @@
 # TODO
 
-Open work on the BLACK PC port. Findings and addresses live in `NOTES.md`; this is the short list.
+Open work on the BLACK port. Findings and addresses live in `NOTES.md`; this is the short list.
+
+**Everything below the Linux section is the archived Windows port's list**, kept because it records what was
+still unverified when the Linux work started. The Windows sources are in `loader/windows/` and are not in
+git, so none of it is actionable without that folder.
+
+## Linux port (the actual work now)
+
+The plan, phase gates, risk register and blockers are in `.agents/plan.md`; this is only the order.
+
+1. **D3D8 foundation.** Port `xd3d.h` (the Xbox D3D8 ABI) and the device object layout; the HLE thunks
+   that forward arguments by a parameter spec (`loader/windows/src/d3d/dispatch.cpp`'s `make_thunk`) behind
+   the hook installer that now exists; then the draw path over the Vulkan device in `loader/src/gfx`.
+   Blocked in part: the NV2A shader microcode format needs the real image.
+2. **SDL2 host** — window, input, audio, replacing the XAudio2/XInput layer of the archive.
+3. **The Phase 1 gate**: run the real `default.xbe` to the first D3D call. Everything that can be verified
+   without the image already is (17 suites, 930 checks).
+
 
 ## Verify (fixed, waiting for a playtest)
 
-- [x] Fades: the game's gamma ramp (fade factor), now applied at present (`ramp_texture` in loader/src/d3d/device.cpp).
+- [x] Fades: the game's gamma ramp (fade factor), now applied at present (`ramp_texture` in loader/windows/src/d3d/device.cpp).
       User confirmed the fade works, and the in-game brightness slider now works too.
 - [ ] Picture vs the Xbox Series: compare screenshots of the same still screen with the same brightness slider setting
       (method in NOTES.md, "To check"). Also check the other fades: loading screen before missions, mission start after

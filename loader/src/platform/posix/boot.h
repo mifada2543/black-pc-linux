@@ -47,6 +47,11 @@ struct BootReport {
     uint32_t timedate = 0;
     std::string debug_path;
 
+    // Library sections (D3D/DSOUND/XPP): how many functions were found, and how many of their entries are
+    // ours now. Zero means the image is not the build these addresses came from, which is reported and
+    // otherwise left alone.
+    size_t lib_functions = 0, lib_patched = 0, lib_trapped = 0;
+
     bool has_tls = false;
     XbeTlsInfo tls{};
 

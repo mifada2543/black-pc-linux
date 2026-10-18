@@ -40,6 +40,9 @@ namespace {
 // next, unrelated fault.
 volatile sig_atomic_t g_in_bridge;
 
+// Set by the hook installer for the functions it could not jump-patch; see seh_set_breakpoint_probe.
+BreakpointProbe g_breakpoint_probe = nullptr;
+
 // Call a frame handler and return its disposition, handing it NT's fourth argument: a dispatcher
 // context whose first and only meaningful member on i386 is the registration pointer that a handler
 // may store into (the CRT's __unwind_handler does, during a collided unwind). The callee may not
@@ -304,6 +307,7 @@ void fill_record(ExceptionRecord *r, uint32_t code, const Context *c, siginfo_t 
 void fault_handler(int sig, siginfo_t *si, void *vctx)
 {
     auto *uc = (ucontext_t *)vctx;
+
     Context c;
     ExceptionRecord r;
     uint32_t code = EXCEPTION_ACCESS_VIOLATION;
@@ -321,6 +325,21 @@ void fault_handler(int sig, siginfo_t *si, void *vctx)
 
     fill_context(&c, uc);
     fill_record(&r, code, &c, si);
+
+    // A 0xCC the loader wrote, not a fault: the probe says which library function it was and ends the run,
+    // so it never becomes an Xbox exception. A probe that does not recognise the address returns false and
+    // the trap travels the normal path below, reported as a breakpoint exception.
+    if (sig == SIGTRAP && g_breakpoint_probe) {
+        const uint32_t trap_at = c.eip - 1; // past the 0xCC itself
+        if (g_breakpoint_probe(trap_at, c.eax, c.ecx, c.edx, (const uint32_t *)(uintptr_t)c.esp)) {
+            // A probe that returns true has handled the trap, so execution resumes *after* the 0xCC.
+            // Returning from the handler instead would re-run the same byte and trap again forever. In
+            // production the probe ends the run and never gets here; this is the path the tests take.
+            uc->uc_mcontext.gregs[REG_EIP] = trap_at + 1;
+            g_in_bridge = 0;
+            setcontext(uc);
+        }
+    }
 
     SehDispatch d;
     long rc = seh_dispatch(&r, &c, &d);
@@ -360,8 +379,17 @@ void seh_install_signal_bridge()
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGILL, &sa, nullptr);
     sigaction(SIGFPE, &sa, nullptr);
-    // SIGTRAP would be the int3 path (--probe). Left on the default action for now: the game code
-    // that raises it is patched by hooks.cpp on Windows and is not wired up yet here.
+    // SIGTRAP carries the traps the hook installer writes where a jump does not fit. The game has none of
+    // its own, so every SIGTRAP that reaches here is one of ours; a probe that does not recognise the
+    // address falls through to the normal path and is reported as a breakpoint exception.
+    sigaction(SIGTRAP, &sa, nullptr);
+}
+
+BreakpointProbe seh_set_breakpoint_probe(BreakpointProbe probe)
+{
+    BreakpointProbe previous = g_breakpoint_probe;
+    g_breakpoint_probe = probe;
+    return previous;
 }
 
 void seh_fatal(const ExceptionRecord *record, const Context *context)

@@ -142,6 +142,37 @@ static void *bugcheck_thread(void *)
     return nullptr;
 }
 
+// Map and resolve the fixture again in this process, so a scenario can change which ordinals are implemented
+// and run against the new table. Two things make this less obvious than it looks:
+//
+//   - The image cannot simply be resolved twice. The first pass overwrites every thunk slot with an
+//     *address*; a second pass would read those addresses back as ordinals and fail on the first one.
+//     So the fixture is mapped again from its bytes, which restores the ordinals.
+//   - The image object has to outlive the run. Its destructor unmaps, and the loader maps at 0x10000, so a
+//     reload whose image object is a local would leave the game running in an address range that nothing owns
+//     -- which is a segfault with no message, and looked for a long time like a bug in the thunk resolver.
+static bool reload_fixture()
+{
+    static XbePosix x;
+    static XbeImage img;
+    std::string err;
+    if (!x.load_from_memory(build(), err)) {
+        fprintf(stderr, "reload: %s\n", err.c_str());
+        return false;
+    }
+    img.unmap();
+    if (!img.map(x, err) || !img.copy_sections(err)) {
+        fprintf(stderr, "reload: %s\n", err.c_str());
+        return false;
+    }
+    img.patch_fs(nullptr);
+    if (!kernel_resolve_thunks(x, img, err)) {
+        fprintf(stderr, "reload: %s\n", err.c_str());
+        return false;
+    }
+    return true;
+}
+
 // Run the fixture's entry point and report the outcome and exit code the program would see.
 static int run_and_report(BootOutcome *out)
 {
@@ -192,21 +223,29 @@ int main()
          }),
           "KeBugCheck ends the run with code 4, so a bugcheck never looks like a clean exit");
 
-    // 3. --strict: the first unimplemented kernel call ends the run. The fixture calls stubbed ordinals
-    //    from game code, so this is the real path -- a stub reached from the game's own call site.
+    // 3. --strict: the first unimplemented kernel call ends the run. Every ordinal is implemented, so the
+    //    stub this needs is asked for rather than left in the table: ordinal 137 is held unimplemented for
+    //    the length of this check, which puts the stub in the fixture's own call site.
     check(ends_as(BootOutcome::Exited, 2, [&](BootOutcome *out) {
+             kernel_hold_unimplemented(137);
              kernel_set_strict(true);
+             if (!reload_fixture()) return DID_NOT_HAPPEN;
              const int code = run_and_report(out);
+             kernel_release_held();
              // The stub has to be the one the game reached, not a call from here.
              return kernel_stub_calls(137) >= 1 ? code : DID_NOT_HAPPEN;
          }),
           "--strict stops at the first unimplemented call, reached from game code, and exits 2");
 
-    // 4. Without --strict the same run only logs, which is what lets the fixture call stubbed ordinals at
-    //    all. boot_exit_code() is -1 because no exit was ever requested.
+    // 4. Without --strict the same call is only logged and the run finishes normally -- which is the whole
+    //    point of the flag. boot_exit_code() is -1 because no exit was ever requested.
     check(ends_as(BootOutcome::Returned, -1, [&](BootOutcome *out) {
+             kernel_hold_unimplemented(137);
              kernel_set_strict(false);
-             return run_and_report(out);
+             if (!reload_fixture()) return DID_NOT_HAPPEN;
+             const int code = run_and_report(out);
+             kernel_release_held();
+             return kernel_stub_calls(137) >= 1 ? code : DID_NOT_HAPPEN;
          }),
           "and without it, no exit is requested at all (code -1, which the program turns into 0)");
 

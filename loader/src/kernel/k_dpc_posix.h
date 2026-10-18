@@ -36,8 +36,12 @@ struct XKDPC {
     uint8_t Inserted;
     uint8_t Padding;
     XListEntry DpcListEntry;
-    void (*DeferredRoutine)(XKDPC *dpc, void *deferred_context, void *system_argument1,
-                            void *system_argument2);
+    // stdcall, because the game compiled the routine to pop its own four arguments: its machine code ends
+    // in `ret 16`. Calling it through a plain cdecl pointer would have the caller pop them as well, and the
+    // stack would come back sixteen bytes short. GCC implements stdcall on i386 -- the callee pops -- so
+    // this attribute is what keeps the game's stack intact.
+    void (__attribute__((stdcall)) *DeferredRoutine)(XKDPC *dpc, void *deferred_context, void *system_argument1,
+                                                    void *system_argument2);
     void *DeferredContext;
     void *SystemArgument1;
     void *SystemArgument2;
@@ -71,9 +75,9 @@ int64_t kdpc_now_100ns();
 
 // ---- exports ------------------------------------------------------------------------------------------
 
-extern "C" void __attribute__((stdcall)) KeInitializeDpc(XKDPC *Dpc,
-                                                          void (*DeferredRoutine)(XKDPC *, void *, void *, void *),
-                                                          void *DeferredContext);
+extern "C" void __attribute__((stdcall)) KeInitializeDpc(
+    XKDPC *Dpc, void (__attribute__((stdcall)) *DeferredRoutine)(XKDPC *, void *, void *, void *),
+    void *DeferredContext);
 extern "C" uint8_t __attribute__((stdcall)) KeInsertQueueDpc(XKDPC *Dpc, void *SystemArgument1,
                                                              void *SystemArgument2);
 extern "C" uint8_t __attribute__((stdcall)) KeRemoveQueueDpc(XKDPC *Dpc);

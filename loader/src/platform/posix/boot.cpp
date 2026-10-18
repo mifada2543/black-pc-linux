@@ -6,6 +6,7 @@
 #include "kernel/k_misc_posix.h"
 #include "kernel/k_thread_posix.h"
 #include "platform/posix/fs_patch.h"
+#include "d3d/d3d_hooks_posix.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
 
@@ -207,6 +208,25 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     // header the game hands it and copy the section where it belongs.
     kmisc_set_image(&img, &x);
 
+    // The library sections are hooked before the game's first instruction. Left alone they are NV2A and
+    // DSound code that talks to hardware this machine does not have, so the first call the game makes
+    // would fault inside a driver with nothing in the log to say which function it was. Every function
+    // gets an entry hook: the ones with a replacement jump to a thunk, the rest report themselves by name
+    // and stop the run. The addresses are from one known build, so this is a no-op for any other image --
+    // which is the honest outcome, not an error to fail the boot over.
+    {
+        xd3d::HookReport hooks{};
+        std::string hook_err;
+        if (xd3d::hooks_install_all(x.base, x.size_of_image, (uint8_t *)(uintptr_t)x.base, &hooks, hook_err)) {
+            rep.lib_functions = hooks.functions;
+            rep.lib_patched = hooks.patched;
+            rep.lib_trapped = hooks.trapped;
+        } else {
+            logc("hooks: the library sections were not hooked (%s) -- the game will run its own D3D code",
+                 hook_err.c_str());
+        }
+    }
+
     // The bridge is installed before anything can fault: from here on a fault becomes an exception the
     // game's own handlers get to see, instead of a process that dies where it stands.
     seh_install_signal_bridge();
@@ -220,6 +240,9 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     logc("fs: %d instructions rewritten to gs, %d unrecognised", rep.fs_patched, rep.fs_unknown);
     logc("kernel: %d imports resolved (%d implemented, %d data exports, %d logging stubs)", rep.thunks.imports,
          rep.thunks.implemented, rep.thunks.data_exports, rep.thunks.stubbed);
+    if (rep.lib_functions)
+        logc("hooks: %zu library functions: %zu patched, %zu trapped", rep.lib_functions, rep.lib_patched,
+             rep.lib_trapped);
     // The full stub list is a paragraph; on the console it drowns everything, so it goes to the log.
     if (rep.thunks.stubbed) logf("kernel: logging stubs for: %s", rep.thunks.stub_names.c_str());
     return true;

@@ -37,6 +37,7 @@ if(UNIX)
     src/kernel/k_file_posix.cpp
     src/kernel/k_thread_posix.cpp
     src/kernel/k_dpc_posix.cpp
+    src/d3d/d3d_hooks_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
@@ -129,6 +130,17 @@ if(UNIX)
   add_executable(test_xbe tests/test_xbe.cpp)
   target_link_libraries(test_xbe PRIVATE blackcore)
   add_test(NAME xbe COMMAND test_xbe)
+
+  # The library-section hook installer: every D3D/DSOUND/XPP function patched at its entry, checked
+  # against a synthetic image so the sizes and addresses come from the real tables and nothing else.
+  add_executable(test_d3d_hooks tests/test_d3d_hooks.cpp)
+  target_link_libraries(test_d3d_hooks PRIVATE blackcore)
+  add_test(NAME d3d_hooks COMMAND test_d3d_hooks)
+
+  # DPCs and kernel timers: the last six kernel ordinals, checked against what the game can observe.
+  add_executable(test_kdpc tests/test_kdpc.cpp)
+  target_link_libraries(test_kdpc PRIVATE blackcore)
+  add_test(NAME kdpc COMMAND test_kdpc)
 
   # The graphics device, headless: a real device, a real pipeline, real shaders, and a PNG written from the
   # result. This is the gate that says the Vulkan path works at all on this machine -- with no window and no

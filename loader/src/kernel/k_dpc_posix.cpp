@@ -1,6 +1,6 @@
 #include "kernel/k_dpc_posix.h"
 
-#include "kernel/k_thread_posix.h" // kthread_create, kthread_set_dpc_active
+#include "kernel/k_thread_posix.h" // kthread_create, kthread_set_dpc_active, kthread_set_irql
 #include "platform/posix/log.h"
 
 #include <errno.h>
@@ -21,6 +21,8 @@ pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t g_wake;
 bool g_wake_ready = false;
 bool g_started = false;
+
+bool g_atfork_registered = false;
 
 std::deque<XKDPC *> g_queue;
 std::vector<XKTIMER *> g_timers;
@@ -84,6 +86,7 @@ void __attribute__((stdcall)) dpc_worker(void *)
                     g_timers.erase(g_timers.begin() + i);
                     t->Header.Inserted = 0;
                 }
+                logf("dpc: timer expired (Dpc %p)", (void *)t->Dpc);
                 xk_signal_object(&t->Header);
                 if (t->Dpc)
                     insert_locked(t->Dpc, (void *)(uintptr_t)(uint32_t)now, (void *)(uintptr_t)(uint32_t)(now >> 32));
@@ -102,15 +105,22 @@ void __attribute__((stdcall)) dpc_worker(void *)
             }
         }
 
+        if (!run.empty()) logf("dpc: running %u deferred procedure(s)", (uint32_t)run.size());
         for (XKDPC *d : run) {
             // DISPATCH_LEVEL around the call, and DpcRoutineActive set while it runs: the game reads that flag
             // at fs:[0x58], and a few of its routines check it before touching shared state.
+            // The IRQL goes up in the thread's own block as well as in xsync's: game code reads KPCR.Irql at
+            // fs:[0x24] from the block, and a DPC that found zero there -- while the kernel thought it was at
+            // DISPATCH_LEVEL -- is exactly the sort of disagreement that costs an afternoon. xk_raise_irql
+            // only knows the xsync side, so the publication to fs:[0x24] is made here.
             const uint8_t old = xk_raise_irql(IRQL_DISPATCH);
+            kthread_set_irql(IRQL_DISPATCH);
             kthread_set_dpc_active(true);
             if (d->DeferredRoutine)
                 d->DeferredRoutine(d, d->DeferredContext, d->SystemArgument1, d->SystemArgument2);
             kthread_set_dpc_active(false);
             xk_lower_irql(old);
+            kthread_set_irql(old);
         }
 
         pthread_mutex_lock(&g_lock);
@@ -154,10 +164,30 @@ uint32_t kdpc_queue_count()
     return (uint32_t)g_queue.size();
 }
 
+// A child of fork() has this process's memory but none of its threads, and a flag saying the worker is
+// running is one of the things it inherits. That is how a forked child ends up waiting for a timer that
+// nothing will ever fire: the test forks, the child arms a timer from game code, and the boot thread spins
+// until the run times out with nothing in the log. So the child handler puts the worker's state back to
+// "not started" -- including re-initialising the mutex and the condition variable, which may have been held
+// by a thread that does not exist in the child any more.
+static void dpc_after_fork_in_child()
+{
+    g_started = false;
+    g_wake_ready = false;
+    pthread_mutex_init(&g_lock, nullptr);
+    pthread_cond_init(&g_wake, nullptr);
+    // Armed timers and queued DPCs are left alone: they are ordinary data, their targets are still mapped in
+    // the child, and the worker started by the next kdpc_init() will pick them up.
+}
+
 bool kdpc_init()
 {
     {
         Guard g;
+        if (!g_atfork_registered) {
+            g_atfork_registered = true;
+            pthread_atfork(nullptr, nullptr, dpc_after_fork_in_child);
+        }
         if (g_started) return true;
         pthread_condattr_t attr;
         pthread_condattr_init(&attr);
@@ -187,9 +217,9 @@ bool kdpc_init()
 // exports
 // ----------------------------------------------------------------------------------------------------------
 
-extern "C" void __attribute__((stdcall)) KeInitializeDpc(XKDPC *Dpc,
-                                                         void (*DeferredRoutine)(XKDPC *, void *, void *, void *),
-                                                         void *DeferredContext)
+extern "C" void __attribute__((stdcall)) KeInitializeDpc(
+    XKDPC *Dpc, void (__attribute__((stdcall)) *DeferredRoutine)(XKDPC *, void *, void *, void *),
+    void *DeferredContext)
 {
     if (!Dpc) return;
     Dpc->Type = (int16_t)XOBJ_DPC;

@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <set>
 #include <string>
 
 #include <sys/mman.h>
@@ -459,11 +460,33 @@ const char *kernel_export_name(uint32_t ordinal)
     return e ? e->name : "?";
 }
 
+// Ordinals a test has declared unimplemented, however many modules try to claim them. Every ordinal is
+// implemented now, which is the point of the work -- but --strict has a path that can only be exercised
+// through a stub, so the test asks for one deliberately instead of the loader carrying dead code for a
+// case that can no longer happen in production.
+static std::set<uint32_t> &held_ordinals()
+{
+    static std::set<uint32_t> held;
+    return held;
+}
+
+void kernel_hold_unimplemented(uint32_t ordinal)
+{
+    held_ordinals().insert(ordinal);
+    KExport *e = find_export(ordinal);
+    if (e) e->impl = nullptr;
+}
+
+void kernel_release_held()
+{
+    held_ordinals().clear();
+}
+
 bool kernel_bind_export(uint32_t ordinal, void *target)
 {
     KExport *e = find_export(ordinal);
     if (!e) return false;
-    e->impl = target;
+    e->impl = held_ordinals().count(ordinal) ? nullptr : target;
     return true;
 }
 
@@ -487,6 +510,12 @@ const KernelThunkStats &kernel_thunk_stats() { return g_stats; }
 
 bool kernel_resolve_thunks(const XbePosix &x, XbeImage &img, std::string &err)
 {
+    // The kernel's subsystems come up with its import table. The DPC worker is one of them: a game arms a
+    // timer in its start-up and waits on it, and without the worker that wait never ends. Starting it here
+    // rather than in the boot sequence means every path that has a working kernel gets it -- the boot
+    // sequence, the tests that drive the kernel directly, and anything else that resolves the table.
+    kdpc_init();
+
     g_stats = KernelThunkStats();
     if (!x.thunk_addr) {
         err = "the image has no kernel import table";

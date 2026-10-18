@@ -41,6 +41,11 @@ void kernel_set_trace(bool on);
 // on this port the flag used to be parsed and ignored, so an unimplemented call was only ever a log line.
 void kernel_set_strict(bool on);
 
+// Declare an ordinal unimplemented, whatever the HLE modules bind, and put it back afterwards. Only the
+// --strict path needs this: it can be tested by reaching a stub from game code, and there are no stubs left.
+void kernel_hold_unimplemented(uint32_t ordinal);
+void kernel_release_held();
+
 // For the HLE modules that land later: give an ordinal a real target, or point a data export's cell at
 // an address. kernel_resolve_thunks calls kernel_bind_implemented() first, which is where a new module
 // registers its ordinals; kernel_bind_export is for anything that needs to happen later than that.

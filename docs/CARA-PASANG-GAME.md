@@ -12,11 +12,11 @@ mesin ini kecuali bagian yang ditandai **belum terverifikasi** — yaitu bagian 
 
 | Bisa | Belum |
 |---|---|
-| Loader native 32-bit boot image XBE: parse, map, patch `fs:` → `gs:`, resolve 115 import | **Belum ada D3D8/game loop** — device Vulkan sudah ada, tapi belum ada yang menggambar game |
-| HLE kernel: memori, file, sync/IRQL, Rtl, thread, AV/HAL, crypto | **DPC/timer thread belum** (`KeSetTimer` & 5 ordinal lain masih stub) |
+| Loader native 32-bit boot image XBE: parse, map, patch `fs:` → `gs:`, resolve 115 import | **Belum ada D3D8/game loop** — device Vulkan sudah ada dan entry hook library section sudah terpasang, tapi belum ada pengganti HLE yang menggambar |
+| HLE kernel: memori, file, sync/IRQL, Rtl, thread, AV/HAL, crypto, **DPC/timer** (semua 115 ordinal terimplementasi) | Tidak ada stub ordinal lagi; yang belum ada apa pun di atas kernel adalah D3D8 |
 | Device Vulkan: target, depth, texture, sampler, pipeline, clear, readback, PNG | **Gambar belum ada**: driver 32-bit di mesin ini tidak merasterisasi apa pun (lihat §8) |
 | SDL2 host, audio, input | Audio & input belum |
-| 15 suite test, 854 check, hijau | Verifikasi terhadap image asli (menunggu `default.xbe`) |
+| 17 suite test, 930 check, hijau | Verifikasi terhadap image asli (menunggu `default.xbe`) |
 
 Artinya: begitu `default.xbe` ada, loader akan menjalankan kode game sedekat mungkin sampai panggilan
 grafis pertama — dan di situlah belum ada apa pun. Klaim yang tidak bisa dibuat hari ini: game-nya
@@ -120,7 +120,7 @@ tempat lain (misalnya flash disk).
 | `--xbe <path>` | file XBE (default `game/default.xbe`) |
 | `--info` | cetak header/section/import lalu keluar, tanpa map |
 | `--probe --timeout N` | masuk entry point, tunggu N detik, keluar |
-| `--trace` | semua baris detail + setiap panggilan stub ke console |
+| `--trace` | semua baris detail + setiap panggilan stub ke console (sekarang tidak ada stub, jadi `--trace` cuma menambah detail) |
 | `--strict` | panggilan kernel yang belum diimplementasi menghentikan run (keluar dengan kode 2), bukan cuma log |
 | `--log <path>` | file log (default `blacklinux.log`) |
 | `--hdd <path>` | folder writable untuk `\Device\Harddisk0` |
@@ -142,16 +142,25 @@ teb: %gs:0 = 0x... &xteb = 0x... K = 0xfffffde8      # jangkar per-thread, K dih
 file: \Device\CdRom0 -> ... (read-only), \Device\Harddisk0 -> ...
 memory: contiguous RAM at 0x80000000, 64 MB
 xbe: 'BLACK' retail build, base 0x00010000, entry 0x00101000, 3 sections, 115 kernel imports
-fs: 6 instructions rewritten to gs, 0 unrecognised
-kernel: 115 imports resolved (96 implemented, 13 data exports, 6 logging stubs)
-thread 'boot' created: routine 0x00101000 ... handle 0x40000000 id 1
+fs: 9 instructions rewritten to gs, 0 unrecognised
+hooks: the library sections were not hooked (D3D: ... is outside this image ... for another build)
+kernel: 115 imports resolved (102 implemented, 13 data exports, 0 logging stubs)
+dpc: worker thread 1 started (handle 0x40000002)
+thread 'boot' created: routine 0x00101000 ... handle 0x40000000 id 2
 ```
 
-`[k] UNIMPLEMENTED <Nama>(argumen) ordinal N, call #1` = stub. Ini **baris paling berguna di seluruh
-proyek**: begitu XBE asli ada, daftar ini langsung memberi tahu ordinal mana yang dipanggil game
-duluan, jadi itu yang dikerjakan berikutnya. 6 yang tersisa semuanya DPC/timer
-(`KeSetTimer`, `KeInitializeTimerEx`, `KeCancelTimer`, `KeInitializeDpc`, `KeInsertQueueDpc`,
-`KeRemoveQueueDpc`).
+Kalau `hooks:` berbunyi "these tables are for another build", itu **benar dan yang diharapkan**: alamat
+hook diambil dari satu build XBE yang sudah diketahui, dan image Anda belum tentu build itu. Hook baru dipasang
+begitu `default.xbe` yang build-nya cocok tersedia. Yang baru ada sekarang: setiap fungsi di section D3D/DSOUND/XPP
+ditambal di entry-nya, dan fungsi yang belum punya pengganti HLE akan **menyebut namanya lalu menghentikan run**
+(keluar dengan kode 1) alih-alih menjalankan kode NV2A asli di mesin tanpa GPU itu.
+
+`[k] UNIMPLEMENTED <Nama>(argumen) ordinal N, call #1` = stub. Dulu ini **baris paling berguna di
+seluruh proyek**: begitu XBE asli ada, daftar ini langsung memberi tahu ordinal mana yang dipanggil
+game duluan. Sekarang tidak ada stub sama sekali — 115 ordinal terimplementasi, 13 di antaranya data
+export yang dibaca (bukan dipanggil). Kalau baris ini muncul di log XBE asli, itu berarti ada ordinal
+yang tidak ada di `src/kernel/ktable_posix.cpp`, dan itu bug port ini, bukan game. Baris yang lebih
+berguna sekarang: `dpc: timer expired`, `fs patch:` per instruksi, dan `boot: the entry point returned`.
 
 Kode keluar: `0` normal (termasuk `HalReturnToFirmware(0)` = halt), `1` error fatal yang dilaporkan game
 atau gagal start, `2` argumen salah **atau** `--strict` menghentikan run, `4` bugcheck (`KeBugCheck`).

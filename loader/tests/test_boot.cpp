@@ -72,6 +72,13 @@ static uint32_t slot_at(XbeImage &img, uint32_t thunk_va, int index)
     return v;
 }
 
+static std::string to_hex(uint32_t v)
+{
+    char buf[16];
+    snprintf(buf, sizeof buf, "%02x", v);
+    return buf;
+}
+
 static uint32_t read_va(uint32_t va)
 {
     uint32_t v = 0;
@@ -117,11 +124,19 @@ static void test_resolve()
               "every import filled (" + std::to_string(st.imports) + "/" + std::to_string(kKernelImportCount) + ")");
         // The implemented set grows as HLE modules land, so this says what must be in it rather than
         // counting it: the two SEH ordinals (checked by address just below) and the memory layer's.
-        check(st.implemented >= 2 && st.implemented < st.imports,
-              "some ordinals are implemented and the rest are stubs (" + std::to_string(st.implemented) + " of " +
+        check(st.implemented >= 2,
+              "ordinals are implemented (" + std::to_string(st.implemented) + " of " +
                   std::to_string(st.imports) + ")");
         check(st.implemented + st.data_exports + st.stubbed == st.imports, "every import is accounted for");
-        check(!st.stub_names.empty(), "the rest are logging stubs: " + st.stub_names.substr(0, 60) + "...");
+        // Nothing is a logging stub any more. This check was "there are some" until the DPC ordinals landed;
+        // it is "there are none" now because a stub means an ordinal the game can call and get a log line
+        // back from, which is worse than refusing to boot.
+        check(st.stubbed == 0 && st.stub_names.empty(),
+              "no ordinal is left as a logging stub" +
+                  (st.stub_names.empty() ? std::string() : ": " + st.stub_names.substr(0, 60) + "..."));
+        check(st.implemented + st.data_exports == st.imports,
+              "every ordinal is either implemented or a data export (" + std::to_string(st.implemented) +
+                  " + " + std::to_string(st.data_exports) + " = " + std::to_string(st.imports) + ")");
 
         int zero_slots = 0;
         for (int i = 0; i < kKernelImportCount; i++)
@@ -174,22 +189,39 @@ static void test_resolve()
             return;
         }
         const uint8_t *code = b.img.at(TEXT_VA);
-        // Offsets from boot.dis. Every one of these is an fs access, and every one has to become gs: %fs:0
-        // faults on Linux, so an unpatched one is not a wrong value but a dead process.
-        check(code[0x33] == 0x65 && code[0x3A] == 0x65 && code[0x52] == 0x65,
-              "push dword [fs:0], mov [fs:0], esp and mov eax, [fs:0] all became gs:");
-        check(code[0x71] == 0x65, "and so did the epilogue's mov [fs:0], ecx");
-        check(code[0x18] == 0x65 && code[0x23] == 0x65, "the TLS slot's write and read became gs: too");
-        // 65 FF 35 disp32 and 65 89 25 disp32: the displacement starts three bytes into each instruction.
-        uint32_t disp_push, disp_store, disp_tls;
-        memcpy(&disp_push, code + 0x36, 4);
-        memcpy(&disp_store, code + 0x3D, 4);
-        memcpy(&disp_tls, code + 0x25, 4);
-        check(disp_push == teb_patch_offset(0) && disp_store == teb_patch_offset(0),
-              "the chain-head displacement landed on this thread's TEB field");
-        // 0xE1C is TLS slot 3, and the block's slot array starts at 0xE10, so this is the fourth pointer.
-        check(disp_tls == teb_patch_offset(0xE1C),
-              "the TLS slot displacement is K+0xE1C, which is slot 3 of this thread's array");
+        // kFsPatchOffsets is written by gen.sh from the disassembly: every instruction in the stub that
+        // touches %fs, with nothing picked by hand. The earlier version listed nine offsets copied from an
+        // older, shorter stub, so after any edit it was reading bytes of unrelated instructions -- and the
+        // patch could regress completely while every one of those checks still passed.
+        size_t gs_sites = 0;
+        std::string unpatched;
+        for (uint32_t off : kFsPatchOffsets) {
+            if (code[off] == 0x65)
+                gs_sites++;
+            else
+                unpatched += " 0x" + to_hex(off);
+        }
+        check(gs_sites == sizeof kFsPatchOffsets / sizeof kFsPatchOffsets[0],
+              "every %fs instruction in the stub became %gs:" + unpatched);
+        check(gs_sites >= 9, "and there are as many of them as the disassembly found (" +
+                                 std::to_string(gs_sites) + ")");
+
+        // The displacement of each patched instruction is K + the console's offset, and the console's
+        // offset is what the game means: fs:[0] is the exception chain head and fs:[0xE1C] is TLS slot 3.
+        uint32_t disp_head = 0, disp_tls = 0;
+        bool have_head = false, have_tls = false;
+        for (uint32_t off : kFsPatchOffsets) {
+            uint32_t disp = 0;
+            memcpy(&disp, code + off + 2, 4); // the prefix and opcode are two bytes; disp32 follows
+            if (disp == teb_patch_offset(0))
+                have_head = true;
+            if (disp == teb_patch_offset(0xE1C))
+                have_tls = true;
+        }
+        check(have_head, "the exception chain's displacement is K+0, this thread's TEB field");
+        check(have_tls, "and the TLS slot's is K+0xE1C, slot 3 of this thread's array");
+        (void)disp_head;
+        (void)disp_tls;
     }
 }
 
@@ -240,10 +272,27 @@ static void test_boot_execution()
           "and that slot belongs to the boot thread, not to the thread running the test");
     check(teb()->tls_slots[0] == 0 && teb()->tls_slots[1] == 0, "the rest of this thread's slots are untouched");
 
-    // Ordinals 129 and 149 are the two the fixture calls on purpose and that the HLE layers deliberately
-    // do not implement: one stdcall with no arguments, one with four. Each stub must drop exactly its own.
-    check(kernel_stub_calls(137) == 1 && kernel_stub_calls(149) == 1,
-          "both stubbed kernel calls arrived from game code, with the stack left balanced");
+    // The timer and the DPC. The boot stub armed a kernel timer from game code and spun until the DPC
+    // routine -- which is also game code -- ran and recorded what it saw. Nothing else in the fixture can
+    // reach the DPC worker thread, so this is the only end-to-end proof that timers fire and that a DPC runs
+    // at DISPATCH_LEVEL on a thread with its own KPCR.
+    check(read_va(TIMER_STATE_VA) == 1, "the boot stub armed a kernel timer (the timer path was taken)");
+    check(read_va(DPC_RAN_VA) == 1, "and the DPC ran when the timer expired");
+    check(read_va(DPC_IRQL_VA) == 2, "the DPC found the IRQL at DISPATCH_LEVEL (fs:[0x24] was 2)");
+    check(read_va(DPC_ACTIVE_VA) == 1, "and KPRCB.DpcRoutineActive was set while it ran (fs:[0x58])");
+    check(read_va(DPC_THREAD_VA) != 0, "it ran on a thread with a KTHREAD of its own (fs:[0x28])");
+    check(read_va(DPC_THREAD_VA) != (uint32_t)(uintptr_t)teb()->thread,
+          "and that thread is not the boot thread");
+    check(read_va(DPC_ARGS_VA) != 0, "the DPC got SystemArgument1, the 100ns time the timer fired at");
+
+    // The stub's first two calls go to real implementations now: KeRemoveQueueDpc(0) and KeSetTimer(0,0,0).
+    // What they prove has not changed -- each must drop exactly its own arguments, and one of them takes a
+    // LARGE_INTEGER by value, which is *two* stack slots. If the cleanup were wrong the stack would be short
+    // by four or eight bytes and every check below this one would fail in a way that reads like a kernel
+    // bug. So: both returned the documented "nothing to do" value, and the stub carried on working.
+    check(read_va(STUB0_RET_VA) == 0, "KeRemoveQueueDpc(0) arrived with its arguments and reported nothing removed");
+    check(read_va(STUB1_RET_VA) == 0,
+          "and KeSetTimer(0, 0, 0) arrived with four words of arguments, including the 64-bit due time");
     check(g_head_after == EXCEPTION_CHAIN_END,
           "the game's epilogue restored the chain (head 0x" + std::to_string(g_head_after) + ")");
 }
@@ -332,9 +381,8 @@ static void test_boot_from_file()
         check(stack_top != 0, "the boot thread recorded its stack top for the crash report");
         check(read_va(HANDLER_RAN_VA) == 0xC0DE, "the same SEH round trip happened through the file path");
         check(read_va(UNWIND_EAX_VA) == UNWIND_RV, "and the unwind returned the running ReturnValue");
-        check(kernel_stub_calls(137) == 2 && kernel_stub_calls(149) == 2,
-              "the stub call counters accumulated across both runs (" + std::to_string(kernel_stub_calls(137)) +
-                  " and " + std::to_string(kernel_stub_calls(149)) + ")");
+        check(read_va(DPC_RAN_VA) == 1 && read_va(DPC_IRQL_VA) == 2,
+              "the DPC ran at DISPATCH_LEVEL through the file path as well");
     }
 
     // A file that is not an XBE must be refused with a reason, not half-parsed.

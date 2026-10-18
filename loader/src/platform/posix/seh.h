@@ -237,5 +237,16 @@ extern "C" __attribute__((stdcall)) uint32_t seh_unwind(void *target_frame, void
 // through the chain instead of killing the process. Call once, after the image is mapped.
 void seh_install_signal_bridge();
 
+// A breakpoint the loader put there on purpose. Returns the previous probe, so a caller can put it back.
+//
+// This exists for one case: a library function whose entry is shorter than the five bytes a jump needs
+// cannot be patched with one, so it gets a single 0xCC instead and the trap is recognised here. The
+// Windows port does the same thing with a vectored exception handler (dispatch.cpp:int3_handler); without
+// this, SIGTRAP keeps its default action and the run dies with "trace/breakpoint trap" instead of the
+// report that says which library function was reached.
+using BreakpointProbe = bool (*)(uint32_t eip, uint32_t eax, uint32_t ecx, uint32_t edx,
+                                const uint32_t *frame);
+BreakpointProbe seh_set_breakpoint_probe(BreakpointProbe probe);
+
 // Report an unhandled exception the way hooks.cpp's crash reporter does, then let the process die.
 void seh_fatal(const ExceptionRecord *record, const Context *context);

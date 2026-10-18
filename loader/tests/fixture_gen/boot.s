@@ -17,12 +17,14 @@ boot_entry:
     push 0                             # ordinal 137 takes one argument
     mov eax, dword ptr [THUNK_STUB0]    # slot 31: ordinal 137, KeRemoveQueueDpc
     call eax
+    mov [STUB0_RET], eax                # a null DPC is not queued, so this is zero
     push 0                             # ordinal 149 takes four arguments
     push 0
     push 0
     push 0
     mov eax, dword ptr [THUNK_STUB1]    # slot 36: ordinal 149, KeSetTimer
     call eax
+    mov [STUB1_RET], eax                # a null timer is not armed, so this is zero
 
     # A kernel timer and its DPC, which is the only thing in the whole fixture that can reach the DPC
     # worker thread. The DPC routine is game code too: it records the IRQL and the DpcRoutineActive flag it
@@ -32,12 +34,21 @@ boot_entry:
     mov dword ptr [TIMER_STATE], 1     # "the timer path was taken", so a hang is distinguishable from a skip
     push 1                             # type 1: 10 ms resolution
     push TIMER                         # &timer
-    mov eax, dword ptr [THUNK_INITEX]  # slot for KeInitializeTimerEx
+    mov eax, dword ptr [THUNK_INITEX]  # slot 26: ordinal 113, KeInitializeTimerEx
     call eax
-    push DPC                           # the DPC to run on expiry
-    push -200000                       # negative: relative, 200000 * 100ns = 20 ms
-    push TIMER                         # &timer
-    mov eax, dword ptr [THUNK_SETTIMER]  # the same slot 36, ordinal 149
+    push 0                             # KeInitializeDpc(Dpc, Routine, Context): three arguments
+    push DPC_ADDR                      # the deferred routine, which is this stub's own boot_dpc
+    push DPC_OBJ                       # the DPC object to initialise
+    mov eax, dword ptr [THUNK_INITDPC]  # slot 24: ordinal 107, KeInitializeDpc
+    call eax
+    push DPC_OBJ                       # the fourth word: the DPC to run on expiry
+    push 0                             # the third word: the high half of the due time. A LARGE_INTEGER by value
+                                        # occupies *two* stack slots, so a three-word call here is read by the
+                                        # callee as DueTime = low + (Dpc << 32): an enormous absolute time that
+                                        # never comes due, and a DPC pointer read out of the stack.
+    push -200000                       # the second word: negative, so relative -- 200000 * 100ns = 20 ms
+    push TIMER                         # the first word: &timer
+    mov eax, dword ptr [THUNK_SETTIMER]  # slot 36: ordinal 149, the same cell the first call used
     call eax
 wait_for_dpc:
     cmp dword ptr [DPC_RAN], 0         # the DPC writes 1 into its own cell when it runs
@@ -78,9 +89,12 @@ boot_dpc:                             # KDPC_ROUTINE(Dpc, DeferredContext, Syste
     mov dword ptr [DPC_ACTIVE], eax
     mov eax, dword ptr fs:[0x28]      # KPRCB.CurrentThread: the KTHREAD this DPC is running on
     mov dword ptr [DPC_THREAD], eax
-    mov dword ptr [DPC_ARGS], dword ptr [esp+12]   # SystemArgument1, the low word of the 100ns time
+    mov eax, dword ptr [esp+12]      # SystemArgument1, the low word of the 100ns time
+    mov dword ptr [DPC_ARGS], eax
     mov dword ptr [DPC_RAN], 1
-    ret
+    ret 16                           # stdcall: the DPC pops its own four arguments, as the console's did
+                                    # (the kernel's worker calls it through a stdcall pointer, so a plain
+                                    #  ret would leave sixteen bytes of arguments on the stack)
 
 .globl boot_handler
 boot_handler:                          # long handler(record, establisher, context, dispatcher)

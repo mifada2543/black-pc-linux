@@ -45,6 +45,7 @@ if(UNIX)
     src/d3d/vertex_posix.cpp
     src/shader/nv2a_vsh_posix.cpp
     src/shader/nv2a_psh_posix.cpp
+    src/shader/material_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
@@ -260,6 +261,18 @@ if(UNIX)
     add_executable(test_nv2a_psh tests/test_nv2a_psh.cpp)
     target_link_libraries(test_nv2a_psh PRIVATE blackcore shaderc_rt)
     add_test(NAME nv2a_psh COMMAND test_nv2a_psh)
+
+    # The whole chain, ending in something the driver accepts. Labelled `gpu` because it needs a device; it
+    # uses llvmpipe, so it is skipped by the 77 convention on a machine with no Vulkan at all.
+    add_executable(test_material tests/test_material.cpp)
+    target_link_libraries(test_material PRIVATE blackcore shaderc_rt)
+    add_test(NAME material COMMAND test_material)
+    set_tests_properties(material PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
+
+    add_executable(test_managed_buffer tests/test_managed_buffer.cpp)
+    target_link_libraries(test_managed_buffer PRIVATE blackcore)
+    add_test(NAME managed_buffer COMMAND test_managed_buffer)
+    set_tests_properties(managed_buffer PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
   else()
     message(STATUS "libglslang absent -- the shader runtime test is not registered")
   endif()

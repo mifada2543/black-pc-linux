@@ -544,6 +544,81 @@ CLIPPLANE dianggap "tidak mengambil texture" sehingga koordinatnya tidak didekla
 menjawab dari **satu switch** (`mode_needs()`). Duplikasi yang bisa lapuk lebih buruk daripada kode yang
 salah.
 
+### Jembatan material — dari mikrocode sampai pipeline yang hidup (2026-10-19)
+
+`src/shader/material_posix.{h,cpp}`. Di sinilah dua separuh penerjemahan berhenti jadi teks dan menjadi
+sesuatu yang bisa dijalankan. Rantainya, ujung ke ujung:
+
+```
+NV2A mikrocode -> GLSL -> SPIR-V -> VkShaderModule -> VkGraphicsPipeline
+```
+
+`test_material`, **12 check**, dan ini tes pertama yang **membangun sesuatu yang diterima driver**. Tes
+sebelumnya berhenti di SPIR-V, yang membuktikan terjemahannya berbentuk benar dan tidak membuktikan
+apakah kedua separuh bisa dipakai bersama — dan "apakah" bukan formalitas: vertex shader yang menulis
+koordinate tekstur di satu lokasi dan fragment shader yang membacanya di lokasi lain adalah pipeline yang
+ditolak driver. llvmpipe yang menjalankan ini; di mesin ini ia tidak meraster, dan itu tidak masalah,
+karena yang diuji adalah pipeline-nya, bukan pikselnya.
+
+**Tiga keputusan yang diambil, dan alasannya:**
+
+1. **Material tanpa program pixel tetap bisa menggambar.** Pipeline grafis butuh dua tahap dan tidak ada
+   pipeline bertahap satu, jadi glslang diberi fragment shader yang meneruskan varying apa adanya. Yang
+   menulis warna dari vertex shader itulah yang dilakukan konsol untuk apa pun tanpa program pixel — dan
+   yang dilakukan probe A0 juga.
+2. **Kunci cache menyimpan jumlah instruksi, bukan hanya alamat pointer.** Mikrokode tinggal di dalam
+   image game, jadi dua program bisa berbagi alamat pada waktu berbeda; kunci dari alamat saja akan
+   menyebut mereka material yang sama.
+3. **Sampler 2D dan sampler kube mengambil setengah layout yang terpisah** (binding 0-3 dan 4-7).   Dahulu keduanya memakai nomor yang sama untuk tahap yang sama: itu compile kalau hanya satu jenis
+   dipakai, dan **gagal saat pembuatan pipeline** kalau keduanya dipakai — artinya gagal lambat.
+
+### Pool MANAGED, dan lima cacat yang hampir lolos (2026-10-19)
+
+`D3DPOOL_MANAGED` tidak ada di Vulkan. Yang dimiliki game di konsol adalah satu sifat: memori yang
+ditunjuk game adalah memori yang dibaca GPU. Di sini sifat itu harus dibangun ulang dari dua salinan, dan
+yang membuatnya tetap masuk akal adalah **rentang kotor**. Game yang mengunci vertex buffer lalu menulis
+ulang satu segitiga tidak boleh membayar seluruh adegan.
+
+| Bagian | Letak |
+|---|---|
+| `update_buffer` — unggah per-rentang dari offset | `src/gfx/gfx_vulkan.cpp` |
+| `download_buffer` — baca balik, untuk menguji dan untuk jalur baca | `src/gfx/gfx_vulkan.cpp` |
+| `managed_buffer_*` — buat, tandai, flush, ikat, hancurkan | `src/gfx/gfx_vulkan.cpp` |
+| `test_managed_buffer` — **31 check** | `tests/test_managed_buffer.cpp` |
+
+Yang diperiksa tes ini adalah isi bytes, bukan status flag. Pelacak rentang yang melaporkan rentang benar
+tetapi menyalin byte yang salah lebih buruk daripada tidak ada pelacak sama sekali, karena kelihatannya
+benar. Karena itu setiap langkah membaca balik buffer perangkat, dan buffer penampungnya diisi 0xEE lebih
+dulu supaya buffer yang tidak pernah ditulis tidak bisa terlihat cocok.
+
+**Lima cacat nyata ditemukan di sini, dan kelimanya lolos karena lulus untuk alasan yang salah.** Itu yang
+layak dicatat, bukan buffer-nya sendiri:
+
+1. **Penggabungan rentang kotor punya dua cabang yang isinya identik.** Keadaan bersih dicatat sebagai
+   `0,0`, lalu penandaan berikutnya melebarinya menjadi `[0, hi)`: salinan penuh, untuk yang sebenarnya
+   menulis 64 byte di tengah buffer. Diperbaiki dengan flag `dirty` yang eksplisit, karena keadaan bersih
+   harus bisa dibedakan dari rentang yang kebetulan kosong.
+2. **Buffer penampung dihancurkan selagi salinan yang menyebutnya belum dijalankan.** Itu pemakaian
+   memori yang sudah dibebaskan, dan gejalanya tidak terlihat dari mana pun: byte yang keluar tetap benar,
+   karena driver memakai ulang memori itu. Sekarang buffer ditahan dalam `g_staging_pending` dan dilepas
+   di `end_frame` setelah menunggu.
+3. **Command buffer frame dikirim tanpa `vkEndCommandBuffer`.** Itu pelanggaran aturan yang diabaikan
+   llvmpipe untuk pass dan draw, tetapi langsung segfault begitu alirnya juga berisi `vkCmdCopyBuffer`.
+4. **`vkCmdCopyBuffer` direkam di dalam pass dynamic-rendering.** Dilarang, dan `begin_frame` membuka pass
+   dengan segera sehingga setiap unggahan masuk ke dalamnya. Sekarang pass baru dibuka oleh hal pertama
+   yang benar-benar menggambar. `bind_textures` punya masalah yang sama dan diperbaiki dengan mengakhiri
+   pass lebih dulu, baru merekam barrier-nya.
+5. **llvmpipe 32-bit segfault di `vkCmdCopyBuffer` kalau tujuannya `DEVICE_LOCAL`.** Diukur, bukan
+   disimpulkan: salinan yang sama dengan tujuan yang host-coherent berjalan. Pada perangkat bertipe CPU,
+   buffer memakai memori host. Itu bukan pintasan, melainkan apa adanya memorinya, dan alternatifnya
+   membuat driver mati.
+
+Nomor 5 menjelaskan sesuatu yang tidak masuk daftar. Pada llvmpipe, unggahan menjadi `memcpy` — persis
+yang desirable. Maka permintaan sebuah frame bukan lagi sebuah invarian: salinan melalui command buffer
+membutuhkan frame, sedangkan salinan ke memori yang sudah dipetakan tidak membutuhkan apa pun, dan menolak
+yang kedua berarti menolak sesuatu yang sudah berhasil. Yang diperiksa adalah invarian sebenarnya: tidak
+pernah diam-diam tidak terjadi, dan tidak pernah gagal sambil lupa rentangnya.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

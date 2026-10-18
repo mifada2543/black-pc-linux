@@ -32,6 +32,36 @@ VkQueue g_queue;
 uint32_t g_queue_family;
 VkCommandPool g_pool;
 VkCommandBuffer g_cmd;
+
+// Whether a dynamic-rendering pass is open on g_cmd. Several commands may not be recorded while it
+// is -- a buffer copy and a layout barrier among them -- and recording one anyway is undefined
+// behaviour that a driver is free to answer with a crash. Everything that needs to know asks this.
+bool g_pass_open = false;
+
+// Whether the chosen device is a CPU rasteriser. There is no such thing as device-local memory on
+// one, and asking for it is not merely wasteful: 32-bit llvmpipe (Mesa 25.2.8) segfaults inside
+// vkCmdCopyBuffer when the destination is DEVICE_LOCAL. Measured, not inferred -- the same copy
+// with a host-coherent destination runs. So buffers on a CPU device get host memory, and the
+// mapping they come with turns every upload into the memcpy it would have wanted to be anyway.
+bool g_device_is_cpu = false;
+
+// The pass's attachments. Declared up here because ensure_pass(), which opens the pass, is far
+// above the code that sets them.
+Image *g_color;
+Image *g_depth;
+
+// Staging buffers that a recorded copy still refers to.
+//
+// This list exists because of a use-after-free that reads as fine as anything else. A copy is recorded into
+// the frame's command buffer and the staging buffer it names is destroyed on the spot; the copy has not run
+// yet, and when the frame is submitted it runs against memory the driver has been free to reuse. It works
+// more often than not, which is what makes it dangerous -- the bytes come out right, right up until a reuse
+// lands somewhere that matters, and then the process dies somewhere else entirely. The frame's copies are
+// finished once end_frame has waited, and that is where these are released.
+std::vector<Buffer> g_staging_pending;
+
+// A handle, not a pointer, so that the D3D layer can hold one without naming a Vulkan type (section 3.2).
+std::vector<ManagedBuffer> g_managed;
 bool g_recording;
 AdapterInfo g_adapter;
 std::string g_error;
@@ -104,6 +134,7 @@ namespace {
 VkCommandBuffer begin_pass(Image *color, Image *depth)
 {
     if (color->format == VK_FORMAT_UNDEFINED || !color->view) return VK_NULL_HANDLE;
+    if (g_pass_open) return g_cmd; // one pass at a time; a second Begin would be an error, not a no-op
 
     VkRenderingAttachmentInfo color_attach;
     memset(&color_attach, 0, sizeof color_attach);
@@ -147,13 +178,15 @@ VkCommandBuffer begin_pass(Image *color, Image *depth)
     if (depth && depth->view) info.pDepthAttachment = &depth_attach;
 
     vkCmdBeginRendering(g_cmd, &info);
+    g_pass_open = true;
     return g_cmd;
 }
 
 void end_pass()
 {
-    if (!g_recording) return;
+    if (!g_recording || !g_pass_open) return;
     vkCmdEndRendering(g_cmd);
+    g_pass_open = false;
 }
 
 void barrier(VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags src_access,
@@ -348,9 +381,66 @@ uint32_t new_layout_slot()
     return next++;
 }
 
+// A command buffer of its own, for work whose answer is a return value.
+//
+// The frame's command buffer cannot do that job. While a pass is open the buffer is in the executable state
+// and may not even be ended, let alone submitted, and a readback has no way around it: the caller wants the
+// bytes when the call returns, not at the end of the frame. So it gets a buffer that is begun, recorded,
+// ended, submitted, waited and freed in one go.
+//
+// This is not a shortcut. Recording the readback into the frame instead is the version that looks right and
+// silently returns whatever the staging buffer happened to be holding -- a recycled allocation -- because a
+// barrier and a vkQueueWaitIdle do not submit anything. Two of the first few checks here passed for exactly
+// that reason, on memory that happened to hold the right bytes.
+VkCommandBuffer one_shot_begin()
+{
+    if (!ready()) return VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cai;
+    memset(&cai, 0, sizeof cai);
+    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool = g_pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(g_device, &cai, &cmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkCommandBufferBeginInfo bi;
+    memset(&bi, 0, sizeof bi);
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+        vkFreeCommandBuffers(g_device, g_pool, 1, &cmd);
+        return VK_NULL_HANDLE;
+    }
+    return cmd;
+}
+
+void one_shot_end(VkCommandBuffer cmd)
+{
+    if (cmd == VK_NULL_HANDLE) return;
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si;
+    memset(&si, 0, sizeof si);
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_queue);
+    vkFreeCommandBuffers(g_device, g_pool, 1, &cmd);
+}
+
 VkCommandBuffer ensure_recording()
 {
     if (!g_recording && !begin_frame()) return VK_NULL_HANDLE;
+    return g_cmd;
+}
+
+// A frame is recording and a pass is open on it, which is what anything that draws or sets dynamic state
+// needs. The pass opens here rather than at the start of the frame so that a transfer or a layout barrier
+// recorded before the first draw has somewhere legal to go.
+VkCommandBuffer ensure_pass()
+{
+    if (!ensure_recording()) return VK_NULL_HANDLE;
+    if (!g_pass_open && !begin_pass(g_color, g_depth)) return VK_NULL_HANDLE;
     return g_cmd;
 }
 
@@ -504,6 +594,7 @@ bool init()
         g_adapter.vendor_id = p.vendorID;
         g_adapter.device_id = p.deviceID;
         g_adapter.device_type = (int)p.deviceType;
+        g_device_is_cpu = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
         g_adapter.max_image_dimension_2d = p.limits.maxImageDimension2D;
         g_adapter.name = p.deviceName;
         chosen = (int)index;
@@ -633,6 +724,12 @@ bool init()
     memset(&pci, 0, sizeof pci);
     pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pci.queueFamilyIndex = g_queue_family;
+    // Resettable, because the frame's buffer is reset and re-begun every frame rather than ended.
+    //
+    // Not transient, even though one-shot buffers come out of this pool (one_shot_begin). Transient is for
+    // waiting on one submission with a fence while others are in flight; a one-shot here submits and then
+    // calls vkQueueWaitIdle, which the spec allows either way, and on llvmpipe 1: `TRANSIENT_BIT` plus a
+    // still-recording frame buffer in the same pool segfaulted inside the driver on the first submit.
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     r = vkCreateCommandPool(g_device, &pci, nullptr, &g_pool);
     if (r != VK_SUCCESS) return fail("no command pool", r);
@@ -652,6 +749,15 @@ bool init()
 void shutdown()
 {
     if (g_device) vkDeviceWaitIdle(g_device);
+    // A frame that was begun and never submitted still holds staging the driver never read from.
+    for (size_t i = 0; i < g_staging_pending.size(); i++) {
+        if (g_device) destroy_buffer(&g_staging_pending[i]);
+    }
+    g_staging_pending.clear();
+    for (size_t i = 0; i < g_managed.size(); i++) {
+        if (g_device) destroy_buffer(&g_managed[i].device);
+    }
+    g_managed.clear();
     if (g_device && g_pool) vkDestroyCommandPool(g_device, g_pool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
@@ -714,6 +820,9 @@ bool create_buffer(Buffer *b, VkDeviceSize size, VkBufferUsageFlags usage, bool 
         return false;
     }
     if (size == 0) size = 4;
+    // See g_device_is_cpu. A request for device-local memory on a CPU rasteriser is honoured as a request for
+    // host memory, because that is what the memory is and because the alternative crashes the driver.
+    if (g_device_is_cpu) host_visible = true;
     b->size = size;
 
     VkBufferCreateInfo bci;
@@ -814,7 +923,8 @@ bool upload_buffer(Buffer *b, const void *data, VkDeviceSize size)
                          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                          0, 0, nullptr, 1, &bar, 0, nullptr);
-    destroy_buffer(&staging);
+    // Not destroyed here: the copy naming it has not run yet. See g_staging_pending.
+    g_staging_pending.push_back(staging);
     return true;
 }
 
@@ -1095,6 +1205,11 @@ bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count)
     // The placeholder is made *before* the frame starts. Creating it involves a barrier to move a texture into
     // shader-read layout, and a barrier that changes an image's layout does not belong inside a render pass.
     Placeholder &ph = placeholder();
+    // A pass the game already started drawing into is closed first, rather than the barrier being recorded
+    // into it anyway. Closing costs a pass boundary and the next draw opens a new one; the alternative is a
+    // command the specification does not allow, which a driver may answer either by ignoring the barrier --
+    // leaving the texture in the wrong layout -- or by crashing.
+    if (g_pass_open) end_pass();
     if (!ensure_recording()) return false;
 
     // The pool has room for one set, and the previous bind's set is freed rather than leaked: the game
@@ -1149,6 +1264,187 @@ bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count)
 // d3d/ names these codes as plain integers and never sees a VkFormat, which is the rule in section 3.2.
 static_assert((uint32_t)xd3d::VF_UNPACKED == 0u, "the vertex-format codes have been renumbered");
 static_assert((uint32_t)xd3d::VF_NONE == 19u, "gfx_format_for_vertex_code and VertexFormatCode have drifted apart");
+
+// Upload a range starting at `offset`. Split out from upload_buffer because the two want different things
+// from the caller and one of them is the common case: a fresh upload replaces everything, while a managed
+// buffer's flush replaces only what the game touched since the last one.
+bool update_buffer(Buffer *b, VkDeviceSize offset, VkDeviceSize size, const void *data)
+{
+    if (!b || !b->buffer || !data || size == 0) return false;
+    if (offset + size > b->size) return false; // a range past the end is a caller bug, not a short write
+
+    if (b->mapped) {
+        memcpy((uint8_t *)b->mapped + offset, data, (size_t)size);
+        return true;
+    }
+
+    Buffer staging;
+    if (!create_buffer(&staging, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true)) return false;
+    memcpy(staging.mapped, data, (size_t)size);
+
+    VkCommandBuffer cmd = ensure_recording();
+    if (!cmd) {
+        destroy_buffer(&staging);
+        return false;
+    }
+    VkBufferCopy copy{0, offset, size};
+    vkCmdCopyBuffer(cmd, staging.buffer, b->buffer, 1, &copy);
+    VkBufferMemoryBarrier bar;
+    memset(&bar, 0, sizeof bar);
+    bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.buffer = b->buffer;
+    bar.offset = offset;
+    bar.size = size;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 1, &bar, 0, nullptr);
+    // Not destroyed here: the copy naming it has not run yet. See g_staging_pending.
+    g_staging_pending.push_back(staging);
+    return true;
+}
+
+bool download_buffer(const Buffer *b, VkDeviceSize offset, VkDeviceSize size, void *out)
+{
+    if (!b || !b->buffer || !out || size == 0) return false;
+    if (offset + size > b->size) return false;
+
+    // A host-visible buffer is its own staging, so the answer is a memcpy and no command at all.
+    if (b->mapped) {
+        memcpy(out, (const uint8_t *)b->mapped + offset, (size_t)size);
+        return true;
+    }
+
+    Buffer staging;
+    if (!create_buffer(&staging, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) return false;
+    // Its own command buffer, submitted and waited here: the answer is a return value, and the frame's
+    // buffer cannot be submitted while a pass is open. See one_shot_begin.
+    VkCommandBuffer cmd = one_shot_begin();
+    if (cmd == VK_NULL_HANDLE) {
+        destroy_buffer(&staging);
+        return false;
+    }
+    VkBufferCopy copy{offset, 0, size};
+    vkCmdCopyBuffer(cmd, b->buffer, staging.buffer, 1, &copy);
+    VkBufferMemoryBarrier bar;
+    memset(&bar, 0, sizeof bar);
+    bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bar.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    bar.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    bar.srcQueueFamilyIndex = bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.buffer = b->buffer;
+    bar.offset = offset;
+    bar.size = size;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &bar, 0,
+                         nullptr);
+    one_shot_end(cmd);
+    memcpy(out, staging.mapped, (size_t)size);
+    destroy_buffer(&staging);
+    return true;
+}
+
+// ---- managed buffers ----
+
+
+uint32_t managed_buffer_create(void *host, uint32_t bytes, VkBufferUsageFlags usage, const char **err)
+{
+    if (err) *err = nullptr;
+    if (!host || bytes == 0) {
+        if (err) *err = "a managed buffer needs memory and a size";
+        return 0;
+    }
+    // Transfer destination is added rather than required: the caller asks for vertex or index usage, and the
+    // copy across needs this one as well. Asking the caller to remember that would be asking for a bug.
+    ManagedBuffer m;
+    m.host = host;
+    m.bytes = bytes;
+    if (!create_buffer(&m.device, bytes, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false)) {
+        if (err) *err = last_error();
+        return 0;
+    }
+    // Everything is dirty at first: the game has been writing this memory since before it existed here.
+    m.dirty = true;
+    m.dirty_lo = 0;
+    m.dirty_hi = bytes;
+    g_managed.push_back(m);
+    return (uint32_t)g_managed.size(); // handles are one-based, so zero can mean "none"
+}
+
+ManagedBuffer *managed_buffer_at(uint32_t handle)
+{
+    if (handle == 0 || handle > g_managed.size()) return nullptr;
+    return &g_managed[handle - 1];
+}
+
+size_t managed_buffer_count() { return g_managed.size(); }
+
+void managed_buffer_mark_dirty(uint32_t handle, uint64_t lo, uint64_t hi)
+{
+    ManagedBuffer *m = managed_buffer_at(handle);
+    if (!m) return;
+    if (hi > m->bytes) hi = m->bytes; // a range past the end is clamped, not copied out of bounds
+    if (lo >= hi) return;
+    // Accumulate rather than replace. Two writes to opposite ends of a buffer have to produce one copy
+    // spanning both; keeping only the newer one would lose the earlier write without saying so.
+    // Whether to accumulate or to start over is decided by a flag and not by the numbers, because a clean
+    // buffer has to be told apart from a dirty one whose range happens to be empty. Spelling the clean
+    // state as 0,0 and then widening it with a new mark gives [0, hi) -- a full copy from the start of the
+    // buffer for what was a 64-byte write in the middle, which is the exact cost this is here to avoid.
+    if (m->dirty) {
+        if (lo < m->dirty_lo) m->dirty_lo = lo;
+        if (hi > m->dirty_hi) m->dirty_hi = hi;
+    } else {
+        m->dirty_lo = lo;
+        m->dirty_hi = hi;
+        m->dirty = true;
+    }
+    m->ever_uploaded = false;
+}
+
+bool managed_buffer_flush(uint32_t handle, const char **err)
+{
+    ManagedBuffer *m = managed_buffer_at(handle);
+    if (err) *err = nullptr;
+    if (!m) {
+        if (err) *err = "no such managed buffer";
+        return false;
+    }
+    if (!m->dirty) return true; // nothing changed since the last flush, which is the common case
+
+    const uint64_t lo = m->dirty_lo, hi = m->dirty_hi;
+
+    const bool ok = update_buffer(&m->device, lo, hi - lo, (const uint8_t *)m->host + lo);
+    if (!ok) {
+        // The range is deliberately *not* cleared: a failed copy has to be retried, and forgetting it here
+        // would leave the device buffer stale with nothing to say so.
+        if (err) *err = last_error();
+        return false;
+    }
+    m->dirty = false;
+    m->dirty_lo = m->dirty_hi = 0;
+    m->ever_uploaded = true;
+    return true;
+}
+
+bool managed_buffer_bind(uint32_t handle, uint32_t binding, VkDeviceSize offset)
+{
+    ManagedBuffer *m = managed_buffer_at(handle);
+    if (!m) return false;
+    return bind_vertex_buffer(&m->device, binding, offset);
+}
+
+void managed_buffer_destroy(uint32_t handle)
+{
+    ManagedBuffer *m = managed_buffer_at(handle);
+    if (!m) return;
+    destroy_buffer(&m->device);
+    m->host = nullptr;
+    m->bytes = 0;
+}
 
 VkFormat gfx_format_for_vertex_code(uint32_t code)
 {
@@ -1400,8 +1696,6 @@ void destroy_pipeline(Pipeline *p)
 // ---- frames ----
 
 namespace {
-Image *g_color;
-Image *g_depth;
 VkViewport g_viewport{0, 0, 1, 1, 0, 1};
 VkRect2D g_scissor{{0, 0}, {1, 1}};
 bool g_scissor_set = false;
@@ -1460,10 +1754,9 @@ bool begin_frame()
     }
 
     g_scissor_set = false; // a frame starts with no scissor, which is a different thing from a 1x1 one
-    if (!begin_pass(g_color, g_depth)) {
-        g_recording = false;
-        return false;
-    }
+    // Deliberately no pass here. A pass is opened by the first thing that draws -- see ensure_pass -- because
+    // a buffer copy or a layout barrier recorded between here and there is legal, and recorded after it is
+    // not. Opening the pass eagerly is what put every upload inside one.
     return true;
 }
 
@@ -1476,7 +1769,7 @@ bool set_pipeline(const Pipeline *p)
 
 bool set_viewport(float x, float y, float w, float h, float min_z, float max_z)
 {
-    if (!ensure_recording()) return false;
+    if (!ensure_pass()) return false;
     // No Y flip, which is the thing worth being sure about: D3D's NDC y = -1 is the *top* of the viewport and
     // Vulkan's is too, so a positive height maps the console's picture straight through. An earlier version
     // negated the height "to flip Y like the Xbox" and drew the game upside down -- the console convention is
@@ -1493,7 +1786,7 @@ bool set_viewport(float x, float y, float w, float h, float min_z, float max_z)
 
 bool set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    if (!ensure_recording()) return false;
+    if (!ensure_pass()) return false;
     g_scissor_set = true;
     // The Xbox's scissor rectangle is unsigned, and Vulkan's offsets are signed while its extent is not,
     // so the conversions are spelled out. A caller that computed a negative width would otherwise get a
@@ -1525,14 +1818,14 @@ bool bind_index_buffer(const Buffer *b, VkIndexType type)
 
 bool draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex)
 {
-    if (!ensure_recording()) return false;
+    if (!ensure_pass()) return false;
     vkCmdDraw(g_cmd, vertex_count, instance_count, first_vertex, 0);
     return true;
 }
 
 bool draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset)
 {
-    if (!ensure_recording()) return false;
+    if (!ensure_pass()) return false;
     vkCmdDrawIndexed(g_cmd, index_count, instance_count, first_index, vertex_offset, 0);
     return true;
 }
@@ -1549,6 +1842,13 @@ bool end_frame()
     end_pass();
     g_recording = false;
 
+    // Ended before it is submitted. Submitting a command buffer that is still recording is invalid usage,
+    // and llvmpipe 1.2 tolerates it for a pass and a draw but segfaults once the stream also holds a
+    // vkCmdCopyBuffer -- which is what the managed buffer's upload is, and what made this crash only once a
+    // test actually flushed a buffer. Nothing had been caught here before because nothing else in the frame
+    // tripped it.
+    if (vkEndCommandBuffer(g_cmd) != VK_SUCCESS) return fail("vkEndCommandBuffer", VK_ERROR_UNKNOWN);
+
     VkSubmitInfo si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1560,6 +1860,11 @@ bool end_frame()
     // than a slow frame, and the D3D8 layer's present path decides when to wait anyway.
     r = vkQueueWaitIdle(g_queue);
     if (r != VK_SUCCESS) return fail("vkQueueWaitIdle", r);
+
+    // The frame has finished, so every copy it named has run and the staging it borrowed can go. Leaving
+    // them would be merely wasteful; releasing them early is what crashes.
+    for (size_t i = 0; i < g_staging_pending.size(); i++) destroy_buffer(&g_staging_pending[i]);
+    g_staging_pending.clear();
     return true;
 }
 
@@ -1586,8 +1891,14 @@ bool clear_color(const float rgba[4])
     memcpy(g_pass_clear_colour, rgba, sizeof g_pass_clear_colour);
     g_pass_clear = true;
 
-    // No frame yet: the clear becomes the next pass's loadOp, which begin_pass consumes.
-    if (!g_recording) return begin_frame();
+    // No frame yet: the clear becomes the next pass's loadOp, which begin_pass consumes. The pass has to be
+    // opened here rather than left for the next draw, because a loadOp is fixed when the pass begins -- and a
+    // pass opened by a draw afterwards would load whatever was there and throw the clear away. That is what
+    // beginning the frame eagerly used to do for free, and losing it silently drops the clear.
+    if (!g_recording) {
+        if (!begin_frame()) return false;
+        return begin_pass(g_color, g_depth) != VK_NULL_HANDLE;
+    }
 
     // A frame in progress: close the pass and open another on the same attachments that starts cleared. A pass
     // may end and another begin on the same attachments, which makes this a legal mid-frame clear -- and on
@@ -1598,7 +1909,7 @@ bool clear_color(const float rgba[4])
 
 bool clear_color_rect(const float rgba[4], uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
-    if (!g_recording && !begin_frame()) return false;
+    if (!ensure_pass()) return false; // as in clear_depth
     VkClearAttachment ca;
     memset(&ca, 0, sizeof ca);
     ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1617,7 +1928,9 @@ bool clear_color_rect(const float rgba[4], uint32_t x, uint32_t y, uint32_t w, u
 // that survives a rectangle and because a depth clear does not stop later draws on the driver in question.
 bool clear_depth(float value)
 {
-    if (!g_recording && !begin_frame()) return false;
+    // ensure_pass, not ensure_recording: vkCmdClearAttachments belongs inside a pass, and a frame that has
+    // begun but not yet drawn has no pass open.
+    if (!ensure_pass()) return false;
     VkClearAttachment ca;
     memset(&ca, 0, sizeof ca);
     ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -1692,6 +2005,7 @@ bool read_color(const Image *img, void *out)
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_cmd;
+    vkEndCommandBuffer(g_cmd); // as in end_frame: a buffer is submitted in the executable state
     vkQueueSubmit(g_queue, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(g_queue);
 

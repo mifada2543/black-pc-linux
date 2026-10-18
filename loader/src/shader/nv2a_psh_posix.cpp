@@ -10,6 +10,11 @@
 namespace xd3d {
 namespace {
 
+// Where the cube samplers start in the pipeline's set of eight. Has to agree with gfx's descriptor set
+// layout, which is eight combined image samplers in one binding.
+constexpr uint32_t kCubeBindingBase = 4;
+
+
 // What one texture mode needs. This exists so that the three things that must agree -- which varyings the
 // shader declares, which samplers it declares, and what code it emits -- are answered from one switch.
 //
@@ -237,13 +242,20 @@ std::string psh_to_glsl(const PixelShaderDef &d, uint32_t tex_cube, const char *
     s += "};  // no instance name: the operands below name these directly\n";
     // Only the samplers this program reads. A sampler declared and never written is a descriptor that reads
     // undefined, and one bound and never declared is a descriptor the driver cannot account for.
+    // The 2D and cube samplers for one stage must not claim the same binding. The pipeline layout has eight
+    // combined image samplers in one set, so the two kinds get disjoint halves: 0-3 for 2D and 4-7 for
+    // cube. Sharing a number compiles when only one kind is used and fails at pipeline creation when both
+    // are -- which is to say, it fails late.
     for (uint32_t i = 0; i < 4; i++) {
         if (sam.used_2d & (1u << i)) {
             snprintf(b, sizeof b, "layout(binding = %u) uniform sampler2D %s;\n", i, sampler_2d(i));
             s += b;
         }
+    }
+    for (uint32_t i = 0; i < 4; i++) {
         if (sam.used_cube & (1u << i)) {
-            snprintf(b, sizeof b, "layout(binding = %u) uniform samplerCube %s;\n", i, sampler_cube(i));
+            snprintf(b, sizeof b, "layout(binding = %u) uniform samplerCube %s;\n",
+                     kCubeBindingBase + i, sampler_cube(i));
             s += b;
         }
     }

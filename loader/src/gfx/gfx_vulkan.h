@@ -120,7 +120,59 @@ void destroy_buffer(Buffer *b);
 // Replace a buffer's contents from host memory. On a device-local buffer this is a staging copy and a
 // barrier; on a host-visible one it is a memcpy. `size` may be less than the buffer's, for the partial
 // updates LockRect(..., D3DLOCK_DISCARD) turns into on the other side.
+// `usage` must include VK_BUFFER_USAGE_TRANSFER_DST for upload_buffer to work.
 bool upload_buffer(Buffer *b, const void *data, VkDeviceSize size);
+
+// Upload a *range*, starting at `offset` in the buffer. upload_buffer overwrites the whole thing from zero,
+// which is what a fresh upload wants and what a dirty range does not: a D3DPOOL_MANAGED vertex buffer is
+// re-locked and partly rewritten many times a frame, and copying all of it each time is the difference
+// between a vertex buffer costing nothing and costing a frame's bandwidth.
+bool update_buffer(Buffer *b, VkDeviceSize offset, VkDeviceSize size, const void *data);
+
+// Copy a buffer's contents back into host memory, for a caller that has to read what the GPU saw. This is
+// how the tests check that an upload landed, and how any path that reads back a resource will do it.
+// `b` must have been created with host-visible memory or be copied through staging; either way the answer
+// is in `out`.
+bool download_buffer(const Buffer *b, VkDeviceSize offset, VkDeviceSize size, void *out);
+
+// ---- D3DPOOL_MANAGED ----
+//
+// A managed resource is one the game writes through a pointer it holds and the GPU reads through a
+// different, device-local copy. Vulkan has no such thing, so the two halves are here: the host block stays
+// writable and cheap, and the range the game actually touched is what gets copied across.
+//
+// The dirty range matters more than it looks. Locking a vertex buffer and rewriting one triangle must not
+// cost a copy of the whole scene, and the console got that for free because the memory *was* the memory.
+// Tracking the range is what buys it back.
+
+struct ManagedBuffer {
+    void *host = nullptr; // what Lock hands the game; the game's own writes land here
+    uint32_t bytes = 0;
+    Buffer device; // the DEVICE_LOCAL copy the pipeline reads
+    uint64_t dirty_lo = 0;
+    uint64_t dirty_hi = 0;
+    bool dirty = false; // whether the range above means anything; see mark_dirty
+    bool ever_uploaded = false;
+};
+
+// Create the device-side half. `host` is memory the caller already owns and keeps writing to; this does not
+// take ownership of it, because the game's reference to it outlives any pool the loader might have.
+uint32_t managed_buffer_create(void *host, uint32_t bytes, VkBufferUsageFlags usage, const char **err);
+
+// Note that the game changed [lo, hi). Ranges accumulate rather than replace: two writes to opposite ends
+// of the buffer must produce one copy spanning both, not one copy that loses the first.
+void managed_buffer_mark_dirty(uint32_t handle, uint64_t lo, uint64_t hi);
+
+// Copy whatever is dirty across, and forget it. Returns false only when there was something to copy and the
+// copy failed; "nothing to do" is a success, because that is the common case between frames.
+bool managed_buffer_flush(uint32_t handle, const char **err);
+
+bool managed_buffer_bind(uint32_t handle, uint32_t binding, VkDeviceSize offset);
+void managed_buffer_destroy(uint32_t handle);
+
+// For tests and for the draw path: the buffer behind a handle, and the count of them.
+ManagedBuffer *managed_buffer_at(uint32_t handle);
+size_t managed_buffer_count();
 
 // ---- images ----
 

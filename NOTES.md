@@ -103,61 +103,154 @@ sendiri. Yang dicatat di sini adalah alasan dan temuan yang tidak terlihat dari 
    dimaksudkan: console tidak menaruh pitch di field itu untuk surface selebar itu, dan jalur upload
    menghitungnya sendiri dari lebar x bpp (persis seperti `texture_level_offset()` di port Windows).
 
-## A0 — gate Vulkan 32-bit: hasil, koreksi, dan yang masih terbuka (2026-10-18)
+## A0 — gate Vulkan 32-bit: yang terukur, yang diperbaiki, yang belum (2026-10-18)
 
-Alat: `loader/tests/probe_vk32.cpp` (juga dibangun sebagai `build/linux/vk_probe32`) untuk gate per device, dan
-`loader/tools/vk_intel_diag.cpp` untuk diagnosis pemicu. Keduanya bisa dijalankan manual.
+Alat: `loader/tests/probe_vk32.cpp` (dibangun juga sebagai `build/linux/vk_probe32`) untuk gate per device, dan
+`loader/tools/vk_intel_diag.cpp` untuk mencari pemicunya per primitif. Keduanya aman dijalankan manual.
 
-### Yang terukur di device ini
+### Hasil pengukuran per primitif
 
-| Device | Device | Memori/buffer | Image (+device-local) | View | Descriptor | **Pipeline** | Submit kosong | Barrier | Dynamic rendering | **Transfer (`vkCmdFillBuffer`)** | Raster |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Intel ADL GT2, **32-bit** | OK | OK | OK | OK | OK | **OK** | OK | OK | OK | **CRASH (SIGSEGV)** | tidak bisa diuji |
-| Intel ADL GT2, **64-bit** | OK | OK | OK | OK | OK | **OK** | OK | OK | OK | **CRASH (SIGSEGV)** | tidak bisa diuji |
-| llvmpipe, 32-bit | OK | OK | OK | OK | OK | OK | OK | OK | OK | OK | **0 fragmen** |
+`vk_intel_diag` punya 16 kasus dan dijalankan pada setiap device yang ada. Setelah kasus G diperbaiki,
+**32 dari 32 kasus selamat** (16 x Intel + 16 x llvmpipe), termasuk perintah transfer.
 
-### Tiga koreksi terhadap kesimpulan yang salah
+| Primitif | Intel ADL GT2 | llvmpipe |
+|---|---|---|
+| device, queue, command pool, api 1.0 dan 1.3 | OK | OK |
+| buffer + memori (host-visible coherent, dan tanpa coherent) | OK | OK |
+| image 16x16 + view | OK | OK |
+| image + memori DEVICE_LOCAL + barrier layout | OK | OK |
+| **image DEPTH (D32_SFLOAT)** + DEVICE_LOCAL + barrier | OK | OK |
+| image dengan TRANSFER_DST/SRC + barrier | OK | OK |
+| descriptor set layout, pool, `vkAllocateDescriptorSets` | OK | OK |
+| **`vkCmdFillBuffer` (transfer, buffer sungguhan)** | **OK** | OK |
+| `vkCmdPipelineBarrier` (top-of-pipe, dan HOST stage) | OK | OK |
+| dynamic rendering begin/end tanpa pipeline | OK | OK |
+| instance kedua di anak proses | OK | OK |
+| rasterisasi | belum bisa diuji | **0 fragmen** |
 
-1. **`dynamicRendering` tidak pernah diaktifkan.** `begin_frame()` merekam `vkCmdBeginRendering` (dynamic
-   rendering), dan dynamic rendering adalah *fitur* yang harus diaktifkan saat device dibuat — device dibuat
-   hanya dengan `VkPhysicalDeviceFeatures` (Vulkan 1.0) tanpa `VkPhysicalDeviceVulkan13Features` sama sekali.
-   Setiap frame adalah undefined behaviour: llvmpipe menerimanya, driver yang ketat menewaskan. **Diperbaiki**:
-   fitur ditanyakan dengan `vkGetPhysicalDeviceFeatures2` dan diaktifkan lewat `pNext`; device tanpa fitur
-   sekarang ditolak dengan pesan, bukan mati di frame pertama.
-2. **Probe kami sendiri yang menghakimi driver.** Probe di `gfx::init()` memakai `vkCmdFillBuffer` pada buffer
-   `TRANSFER_DST` — dan itulah yang segfault di Intel. Presifnya: probe menilai driver dengan pekerjaan yang
-   **tidak pernah dilakukan game** (game menggambar dan menulis push buffer, tidak pernah transfer), sehingga
-   GPU yang bisa dipakai berubah jadi "mati saat submit". **Diperbaiki**: probe memakai `vkCmdPipelineBarrier`.
-3. **Bukan masalah 32-bit.** Hasil yang sama di build 64-bit: ANV Mesa 25.2.8 segfault pada perintah transfer
-   **di kedua bitness**. Jadi ini bug driver pada versi Mesa yang terpasang, bukan batasan proses 32-bit —
-   dan karena itu render server 64-bit (A0b) **tidak** otomatis menyelamatkannya.
+Gate `vk_probe32` pada device yang sama: Intel **mati di `end_frame`** (signal 11) -- submit dengan pipeline
+nyata dan draw nyata. llvmpipe melewati seluruh langkah dan **tidak meraster** (0 fragmen; 722 piksel berbeda
+dan referensi mencakup tepat 722 piksel, jadi segitiga memang tidak digambar). Jalur clear + readback
+llvmpipe sudah diverifikasi byte per byte.
+
+### Empat koreksi terhadap kesimpulan yang salah
+
+1. **`dynamicRendering` tidak pernah diaktifkan — bug kita, diperbaiki.** `begin_frame()` merekam
+   `vkCmdBeginRendering`, dan dynamic rendering adalah *fitur* yang harus diaktifkan saat device dibuat. Device
+   dibuat hanya dengan `VkPhysicalDeviceFeatures` (Vulkan 1.0), tanpa `VkPhysicalDeviceVulkan13Features` sama
+   sekali, jadi **setiap frame adalah undefined behaviour**. Diperbaiki: ditanyakan lewat
+   `vkGetPhysicalDeviceFeatures2`, diaktifkan lewat `pNext`, dan device tanpa fitur itu ditolak dengan pesan.
+2. **`read_color` mengembalikan urutan byte gambar (BGRA) sementara header menyebut RGBA — bug kita,
+   diperbaiki.** Semua PNG yang ditulis dari readback punya merah dan biru tertukar. Ditambah
+   `gfx::write_png_from_color_target()`.
+3. **Probe `gfx::init()` memakai `vkCmdFillBuffer` — diganti `vkCmdPipelineBarrier`.** Alasan desainnya tetap
+   sahih dan tidak bergantung pada driver: game hanya menggambar dan menulis push buffer, jadi probe
+   sebaiknya menguji perintah yang memang ada di jalur game. **Tapi alasan yang pernah ditulis untuk
+   keputusan ini salah** -- lihat butir 4.
+4. **Kasus G mengisi `VK_NULL_HANDLE` -- bug diagnosa kita, dan ini membatalkan sebuah kesimpulan besar.**
+   `vkCmdFillBuffer` direkam di baris 177, sementara buffer-nya baru dibuat di baris 219 dan baru diassign
+   ke `transfer_buffer` di baris 259. Jadi fill selalu menunjuk handle yang tidak pernah dibuat: perilaku
+   tidak terdefinisi. Semua driver crash, ANV maupun llvmpipe. Karena itu "Mesa 25.2.8 crash pada perintah
+   transfer di dua bitness" **tidak pernah terukur** -- tidak ada perintah transfer yang pernah diuji.
+   Diperbaiki: fill direkam setelah buffer ada dan memorinya ter-bind, dengan penjaga yang mencetak
+   keadaan alih-alih lolos diam-diam.
+
+### Dua kesimpulan yang dicabut
+
+- **"Bug Mesa ANV pada perintah transfer" dicabut.** Tidak ada bukti driver bermasalah; 32/32 kasus
+  selamat. Kemungkinan "coba versi Mesa lain" yang sebelumnya diminta ke user **tidak perlu dijalankan**.
+- **"A0b (render server 64-bit) adalah arsitektur di mesin ini, bukan fallback" dicabut.** Alasannya
+  adalah bug di atas: A0b dijelaskan oleh driver yang sama yang dianggap rusak, dan sekarang
+  tidak ada alasan itu berdiri. A0b kembali menjadi pilihan arsitektur, bukan kesimpulan terukur.
 
 ### Yang masih terbuka
 
-- **Gate A0 belum tuntas:** setelah fitur diaktifkan, A0 masih mati di
-  `create_targets` pada Intel. Semua primitif yang dipakai jalur render sudah terisolasi satu per satu di
-  `vk_intel_diag` dan semuanya selamat (termasuk memori DEVICE_LOCAL), jadi ada satu perbedaan lagi antara
-  `create_image()` dan kasus O yang belum teridentifikasi. Jejak per-panggilan ada di gate (`STEP ...`), jadi
-  titik berikutnya narrowed tanpa menebak.
-- **llvmpipe 0 fragmen**, dan itu bukan sesuatu yang bisa diukur di sini: 722 piksel berbeda dari referensi, dan
-  referensi mencakup tepat 722 piksel — segitiga tidak digambar sama sekali, sisanya memang clear. Berguna
-  untuk menguji jalur API, tidak untuk menggambar apa pun.
+- **Intel masih crash saat submit draw nyata**, di `end_frame`. Semua primitif sudah terisolasi satu per satu
+  di `vk_intel_diag` dan semuanya lolos, jadi yang belum diuji hanya **kombinasinya**: dynamic rendering +
+  pipeline + transisi layout + draw dalam satu submit, dengan vertex buffer yang benar-benar ter-bind dan
+  di-upload. Ini satu-satunya crash yang tersisa dan belum dijelaskan.
+- **Belum diuji di 64-bit**, dan itulah satu-satunya sumbu yang belum diperiksa. Karena tidak ada lagi
+  indikasi driver rusak, hasil 64-bit kini jadi pertanyaan arsitektur yang sesungguhnya: Intel yang crash
+  di proses 32-bit mungkin saja menggambar dengan benar di proses 64-bit, atau crash-nya menunjuk sesuatu
+  pada kode kita yang belum ketahuan.
+- **llvmpipe tidak meraster** (0 fragmen), dan itu terukur, bukan dugaan. Berguna untuk menguji jalur API
+  (clear, upload, readback, pipeline, format), tidak untuk menggambar.
 
-### Tindakan yang hanya bisa dilakukan user
+### Apa yang diketahui tentang crash Intel (backtrace, 18 Oktober 2026 sore)
 
-**Coba versi Mesa lain untuk i386.** Driver ANV yang terpasang (25.2.8) terbukti rusak pada perintah transfer,
-dan itu crash yang sama di kedua bitness — jadi kandidat lain adalah versi Mesa yang lebih lama/lebih baru
-(PPA PPA, atau paket dari distro lain). Kalau salah satu tidak crash pada `vkCmdFillBuffer`, gate A0 bisa
-dipertahankan dan A0b tidak diperlukan. Cara cek cepat:
+Diperiksa dengan `gdb --batch -ex 'set follow-fork-mode child' -ex run -ex 'info registers' -ex bt`
+pada `./build/linux/vk_probe32`. Hasilnya tidak pernah masuk ke kode kita:
 
 ```
-./build/linux/vk_probe32          # gate per device (0 = drew, 1 = did not, 77 = no hardware GPU)
-./build/linux/vk_intel_diag       # pemicu per primitif, kasus G = transfer
+Thread 2.1 received signal SIGSEGV
+#0  0xe6d170b2  ?? () from /lib/i386-linux-gnu/libvulkan_intel.so
+#1  0xe6d05b0f  ?? () dari libvulkan_intel.so
+...
+#6  0xe70aa908  ?? () dari libvulkan_intel.so
+#7  probe_child (physical_index=...) at src/gfx/gfx_vulkan.cpp:321   <-- vkQueueSubmit
+#8  gfx::init () at src/gfx/gfx_vulkan.cpp:471
+#9  main () at tests/probe_vk32.cpp:383
 ```
 
-Kalau **semua** versi Mesa yang bisa dicoba masih crash pada transfer, keputusan arsitekturnya menjadi:
-**A0b (render server 64-bit) tetap jalur Intel** — karena satu-satunya driver yang bisa dipakai di mesin ini
-adalah ANV, dan ia harus dipakai dari proses 64-bit.
+Register pada saat crash:
+
+```
+eax 0x0        eip 0xe6d170b2
+=> movl $0x5000000,(%eax)      <-- tulis ke NULL
+   movl $0x4d430005,0x14(%esp)  <-- opcode perintah GPU Intel
+```
+
+Jadi: **tulis ke NULL di dalam ANV**, saat driver sedang menyusun aliran perintahnya. `0x4d` adalah
+awalan perintah register di backend Intel; driver sedang menulis kata perintah itu ke buffer tujuan
+yang null. Bukan kode kita yang menunjuk memori buruk -- tidak ada satu pun frame kode kita besides
+titik pemanggilan.
+
+### Yang sudah disingkirkan satu per satu
+
+| Dugaan | Cara diuji | Hasil |
+|---|---|---|
+| Perintah transfer | kasus G diisi buffer sungguhan | **bukan** -- selamat |
+| Perintah barrier | barrier dihapus, command buffer kosong | **bukan** -- tetap crash |
+| `fork` | `BLACKLINUX_PROBE_NO_FORK=1`, probe jalan inline | **bukan** -- tetap crash |
+| Ukuran buffer 256 | diganti 4096 | **bukan** -- tetap crash |
+| Memory type (loop tanpa `break` memilih yang terakhir) | diubah ke HOST_VISIBLE\|HOST_COHERENT + `break` | **bukan** -- tetap crash (perbaikannya tetap dipertahankan) |
+| Urutan: buffer sebelum command pool | buffer dipindah setelah `vkBeginCommandBuffer` | **bukan** -- tetap crash |
+| Queue family | family 0 = `0x1f` (GRAPHICS\|COMPUTE\|TRANSFER\|SPARSE), 1 family saja | bukan |
+| Handle `VkPhysicalDevice` warisan orang tua | kasus Q: anak enumerate sendiri | **bukan** -- kasus Q selamat |
+
+### Batas yang jujur dari investigating ini
+
+Program yang ditulis dari nol (`tools/vk_intel_diag.cpp`) menjalankan **34 dari 34** kasus di mesin
+yang sama -- termasuk pipeline, dynamic rendering, descriptor, image depth, dan transfer -- dan
+**selamat semua**. Probe loader, yang urutannya nyaris sama, **crash di prosesnya sendiri**. Karena
+urutan panggilan Vulkan-nya nyaris identik dan hanya salah satu yang selamat, sisa masalahnya berada
+di **proses** (lingkungan eksekusi), bukan di urutan panggilan itu sendiri -- dan itu belum
+berhasil persempit.
+
+**Untuk mengikat nama fungsinya** perlu simbol debug: paket `libvulkan-intel-dbgsym` untuk
+`libvulkan-intel.so` build-id `0372f4e0…` (hanya user yang bisa memasang paket). Tanpa itu, 7 frame
+itu tetap tanpa nama.
+
+### Konsekuensi arsitektur yang paling penting
+
+**Gate dijalankan juga sebagai binary 64-bit** (build manual dengan `g++ -m64`, bukan bagian dari
+build resmi). Hasilnya: **Intel crash dengan signal 11 juga di 64-bit**, pada langkah yang sama.
+Jadi **A0b (render server 64-bit) tidak menutup masalah ini** -- ia memakai driver yang sama, dan
+driver itulah yang crash. A0b bukan lagi pilihan yang terlihat dari sini.
+
+### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
+
+Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada
+build 32-bit, tapi tanah jebakan:
+
+- **Handle Vulkan dicampur antar-tipe** di dua tempat (`VkDeviceMemory` ke variabel `VkBuffer` sekitar baris
+  750, `VkImageView` ke `VkDeviceMemory` sekitar 875). Di build 32-bit semua handle non-dispatchable adalah
+  pointer, jadi penukarannya compiles dan bekerja; di 64-bit tiap handle punya tipe berbeda dan build gagal.
+  Artinya kode itu **tipe-salah tetapi kebetulan benar** di proses 32-bit yang memang satu-satunya target
+  sekarang, dan akan rusak diam-diam kalau loader suatu saat dibuild 64-bit.
+- `gfx_vulkan.cpp` memakai `logf` dari `blackcore`, sementara `blackcore` menautkan `gfx` -- **siklus dua
+  pustaka statis** yang belum dideklarasikan, jadi target baru yang menautkan `blackcore` gagal link dengan
+  `undefined reference to logf`. Sudah dideklarasikan (`target_link_libraries(gfx PRIVATE blackcore)`).
 
 ## Loader design (Phase 4, `loader/`)
 

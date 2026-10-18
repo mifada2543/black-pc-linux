@@ -29,6 +29,8 @@
 
 #include <stdint.h>
 
+#include <vector>
+
 #include <vulkan/vulkan.h>
 
 namespace {
@@ -43,7 +45,7 @@ enum Work {
     WORK_MEMORY,      // allocate and bind device memory for a buffer
     WORK_IMAGE,       // a small image
     WORK_DESCRIPTORS, // a descriptor set layout, a pool, and an allocated set (nothing written into it)
-    WORK_FILL,        // vkCmdFillBuffer on a transfer destination -- exactly what gfx's own probe does
+    WORK_FILL,        // vkCmdFillBuffer on a created, memory-bound transfer destination
     WORK_BARRIER,      // a memory barrier at the top-of-pipe/bottom-of-pipe stages
     WORK_BARRIER_HOST, // the same barrier with HOST as the source stage: what the loader's probe records
     WORK_AS_LOADER,     // the loader's probe, step for step: HOST_VISIBLE memory without COHERENT, and a barrier
@@ -53,6 +55,7 @@ enum Work {
     WORK_IMAGE_XFER,    // the same, but with TRANSFER_DST in the usage flags
     WORK_IMAGE_LOCAL,   // image + DEVICE_LOCAL memory + barrier: exactly what create_color_target() does
     WORK_DEPTH,         // the same, but a D32_SFLOAT depth image: the other half of create_targets
+    WORK_REENUM,        // as WORK_AS_LOADER, but the child enumerates its own VkPhysicalDevice (probe_child does)
 };
 
 struct Case {
@@ -78,6 +81,7 @@ const Case kCases[] = {
     {"N: sama, dengan TRANSFER_DST", VK_API_VERSION_1_3, WORK_IMAGE_XFER},
     {"O: image + DEVICE_LOCAL + barrier", VK_API_VERSION_1_3, WORK_IMAGE_LOCAL},
     {"P: DEPTH image + DEVICE_LOCAL", VK_API_VERSION_1_3, WORK_DEPTH},
+    {"Q: physical device milik anak sendiri", VK_API_VERSION_1_3, WORK_REENUM},
 };
 
 VkInstance make_instance(uint32_t api_version)
@@ -104,6 +108,22 @@ int run_case(const Case &c, VkPhysicalDevice physical, const char *device_name)
         printf("      vkCreateInstance(api %u.%u) gagal\n", VK_VERSION_MAJOR(c.api_version),
                VK_VERSION_MINOR(c.api_version));
         return 2;
+    }
+
+    // Every other case is handed a VkPhysicalDevice handle created in the parent, before the fork. The
+    // loader's probe_child does the opposite: it creates its own instance and enumerates its own handles.
+    // Q asks that question directly, because a handle that crosses a fork is a much less common path than
+    // one an application takes, and it is the one difference left between the probe (which dies on submit)
+    // and case J (which survives).
+    if (c.work == WORK_REENUM) {
+        uint32_t ndev = 0;
+        vkEnumeratePhysicalDevices(instance, &ndev, nullptr);
+        if (ndev) {
+            std::vector<VkPhysicalDevice> devs(ndev);
+            vkEnumeratePhysicalDevices(instance, &ndev, devs.data());
+            physical = devs[0];
+            printf("      device di-enumerate ulang di anak; ");
+        }
     }
 
     uint32_t queue_count = 0;
@@ -174,13 +194,6 @@ int run_case(const Case &c, VkPhysicalDevice physical, const char *device_name)
         vkCmdPipelineBarrier(cmd, src, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
         printf("barrier(%s) direkam; ", c.work == WORK_BARRIER ? "top-of-pipe" : "host");
     }
-    if (c.work == WORK_FILL) {
-        // The command the loader's probe records. Nothing before this differs from case D, so if this is the
-        // one that dies, the finding is precise: the 32-bit Intel driver dies on a transfer command, and the
-        // game never issues one -- so its driver is usable for the game's own path.
-        vkCmdFillBuffer(cmd, transfer_buffer, 0, 256, 0xDEADBEEFu);
-        printf("vkCmdFillBuffer direkam; ");
-    }
     if (c.work == WORK_DYNAMIC) {
         // Enough to make the driver build a render pass on the fly: begin rendering on a 16x16 attachment and
         // end it. No image is bound, because there is no memory allocated -- if this gets as far as the
@@ -216,6 +229,7 @@ int run_case(const Case &c, VkPhysicalDevice physical, const char *device_name)
         bci.usage = (c.work == WORK_FILL) ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VkBuffer buffer = VK_NULL_HANDLE;
+        bool bound = false;
         if (vkCreateBuffer(device, &bci, nullptr, &buffer) != VK_SUCCESS) {
             printf("vkCreateBuffer gagal; ");
         } else {
@@ -251,12 +265,25 @@ int run_case(const Case &c, VkPhysicalDevice physical, const char *device_name)
                     printf("vkAllocateMemory gagal; ");
                 } else {
                     vkBindBufferMemory(device, buffer, memory, 0);
+                    bound = true;
                     printf("memori ok; ");
                 }
             }
         }
 
-        if (c.work == WORK_FILL) transfer_buffer = buffer;
+        // Recorded here, not earlier. The first version of this case recorded the fill *before* the buffer
+        // existed, so it filled VK_NULL_HANDLE: undefined behaviour that crashed every driver -- Intel and
+        // llvmpipe alike -- and therefore told us nothing about transfer commands at all. A fill on a buffer
+        // with no memory bound is equally invalid, so both conditions are checked before recording.
+        if (c.work == WORK_FILL) {
+            transfer_buffer = buffer;
+            if (buffer != VK_NULL_HANDLE && bound) {
+                vkCmdFillBuffer(cmd, buffer, 0, 256, 0xDEADBEEFu);
+                printf("vkCmdFillBuffer direkam; ");
+            } else {
+                printf("buffer tanpa memori, fill dilewati (bukan crash); ");
+            }
+        }
 
         if (c.work == WORK_IMAGE_BARRIER || c.work == WORK_IMAGE_XFER || c.work == WORK_IMAGE_LOCAL ||
             c.work == WORK_DEPTH) {

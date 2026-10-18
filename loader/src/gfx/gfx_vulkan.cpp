@@ -254,13 +254,10 @@ static void probe_child(uint32_t physical_index)
     // A 256-byte buffer and a barrier. Both exist so the command buffer is not empty -- an empty submit would
     // not prove the driver can execute anything, which is the question being asked.
     //
-    // It used to be a transfer: this buffer plus `vkCmdFillBuffer`. That is where the 32-bit Intel driver
-    // segfaults, measured (loader/tools/vk_intel_diag.cpp case G: empty submits, dynamic rendering, memory,
-    // images and descriptor allocation all survive; the first transfer command does not). It is a poor probe,
-    // not because the driver is unusable but because **the game never issues a transfer command** -- it draws
-    // and it writes push buffers -- so the probe was judging the driver by work this port will never ask of it,
-    // and turning a usable GPU into "crashes on submit". A barrier is a real command in the same path, and it
-    // is one the game's own workload does contain.
+    // It used to be a transfer: this buffer plus `vkCmdFillBuffer`. The reason to drop it stands on its own and
+    // does not depend on how any driver behaves: **the game never issues a transfer command** -- it draws and
+    // it writes push buffers -- so probing with one judges the driver by work this port will never ask of it.
+    // A barrier is a real command, and it is one the game's own workload does contain.
     VkBufferCreateInfo bci;
     memset(&bci, 0, sizeof bci);
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -272,10 +269,23 @@ static void probe_child(uint32_t physical_index)
     vkGetBufferMemoryRequirements(dev, buffer, &req);
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+    // Host-visible *and* coherent, falling back to plain host-visible. This loop used to have no `break`, so it
+    // kept the LAST host-visible type rather than a coherent one -- an arbitrary heap choice. It was tested as
+    // a possible cause of the Intel submit crash and turned out not to be one, but the rule is now the same one
+    // create_buffer() uses (HOST_VISIBLE | HOST_COHERENT), so there is one rule for host access, not two.
     uint32_t type = UINT32_MAX;
-    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
-        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+    uint32_t fallback = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if (!(req.memoryTypeBits & (1u << i))) continue;
+        const VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+        if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+        if (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) {
             type = i;
+            break;
+        }
+        if (fallback == UINT32_MAX) fallback = i;
+    }
+    if (type == UINT32_MAX) type = fallback;
     if (type == UINT32_MAX) probe_exit(PROBE_REFUSED);
     VkMemoryAllocateInfo mai;
     memset(&mai, 0, sizeof mai);
@@ -747,7 +757,13 @@ bool create_buffer(Buffer *b, VkDeviceSize size, VkBufferUsageFlags usage, bool 
         if (r != VK_SUCCESS) {
             vkDestroyBuffer(g_device, b->buffer, nullptr);
             vkFreeMemory(g_device, b->memory, nullptr);
-            b->buffer = b->memory = VK_NULL_HANDLE;
+            // Separate statements, deliberately: a chain (b->buffer = b->memory = VK_NULL_HANDLE) hands
+            // VkDeviceMemory's value to a VkBuffer slot. It happens to work in this i386 build because every
+            // non-dispatchable handle is a plain pointer here, but it does not compile in a 64-bit build,
+            // where the two handle types are distinct.
+            b->buffer = VK_NULL_HANDLE;
+            b->memory = VK_NULL_HANDLE;
+            b->mapped = nullptr;
             return fail("vkMapMemory (buffer)", r);
         }
     }
@@ -872,7 +888,10 @@ bool create_image(Image *img, uint32_t width, uint32_t height, VkFormat format, 
     if (r != VK_SUCCESS) {
         vkDestroyImage(g_device, img->image, nullptr);
         vkFreeMemory(g_device, img->memory, nullptr);
-        img->image = img->memory = img->view = VK_NULL_HANDLE;
+        // Separate statements, not a chain -- see the note in create_buffer().
+        img->image = VK_NULL_HANDLE;
+        img->memory = VK_NULL_HANDLE;
+        img->view = VK_NULL_HANDLE;
         return fail("vkCreateImageView", r);
     }
     layout_of(*img) = VK_IMAGE_LAYOUT_UNDEFINED;

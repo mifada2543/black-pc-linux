@@ -22,6 +22,7 @@
 #include "input/bindings_posix.h"
 
 #include "input/mouselook_posix.h"
+#include "input/input_detail_posix.h"
 
 #include "platform/posix/log.h"
 
@@ -379,8 +380,10 @@ void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16
     if (left) lx_val -= 32767;
     if (right) lx_val += 32767;
 
-    ly = static_cast<int16_t>(std::clamp(ly_val, -32767, 32767));
-    lx = static_cast<int16_t>(std::clamp(lx_val, -32767, 32767));
+    // Apply left stick config (deadzone/sensitivity)
+    const auto &ls_cfg = input_detail::get_config().left_stick;
+    ly = static_cast<int16_t>(std::clamp(static_cast<int>(ly_val * ls_cfg.sensitivity), -32767, 32767));
+    lx = static_cast<int16_t>(std::clamp(static_cast<int>(lx_val * ls_cfg.sensitivity), -32767, 32767));
 
     // Fire (A button) - Left mouse
     bool fire = is_key_pressed(g_keys[GA_FIRE][0], focus) || is_key_pressed(g_keys[GA_FIRE][1], focus);

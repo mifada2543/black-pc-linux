@@ -939,6 +939,89 @@ Implementasi layer input Linux (SDL2) yang memetakan keyboard/mouse/gamepad ke X
 
 **Test:** Clean rebuild 0 Vk* di d3d/, 30/30 suite, 1.721 check, SPIR-V byte-identik.
 
+### A8: Input detail — deadzone, sensitivity, rumble (2026-10-19)
+
+`src/input/input_detail_posix.{h,cpp}` — layer detail input (deadzone, sensitivity curve, rumble pattern) dari XBE config.
+
+**Files:**
+| File | Fungsi |
+|---|---|
+| `input_detail_posix.h` | API: `StickConfig`, `TriggerConfig`, `RumbleEffect`, `GamepadConfig`, `rumble_start/stop/update`, `sdl_axis_to_norm` |
+| `input_detail_posix.cpp` | Implementasi: radial deadzone, sensitivity curve, trigger curve, rumble attack/decay, SDL axis mapping |
+
+**Features:**
+| Komponen | Detail |
+|---|---|
+| **Stick deadzone** | Radial deadzone (preserve direction), configurable per stick, sensitivity & acceleration curve |
+| **Trigger curve** | Deadzone + power curve (slow start), configurable per trigger |
+| **Rumble** | Attack/sustain/decay phases, duration, per-event patterns (recoil, explosion, damage, vehicle, heartbeat) |
+| **SDL mapping** | `sdl_axis_to_norm` / `sdl_trigger_to_norm` apply config to raw SDL input |
+
+**Integration:**
+- `bindings_posix.cpp`: left stick keyboard movement uses `left_stick.sensitivity`
+- `xinput_posix.cpp`: `XInputSetState` uses `rumble_start` + SDL haptic fallback
+- Hook for XBE override: `load_from_xbe()` (stub, ready for XBE config parsing)
+
+**Default config (BLACK FPS):**
+| Stick | Deadzone | Sens | Accel | Invert |
+|---|---|---|---|---|
+| Left (move) | 0.15 | 1.0 | 0.0 | false |
+| Right (look) | 0.12 | 1.2 | 0.1 | true |
+
+| Rumble | Low | High | Dur | Attack | Decay |
+|---|---|---|---|---|---|
+| Recoil | 0 | 60000 | 150ms | 0 | 100ms |
+| Explosion | 40000 | 60000 | 500ms | 50ms | 200ms |
+| Damage | 20000 | 40000 | 200ms | 0 | 100ms |
+| Vehicle | 30000 | 20000 | 1000ms | 100ms | 300ms |
+| Heartbeat | 10000 | 30000 | 1000ms | 200ms | 500ms |
+
+**Hook XBE:** `load_from_xbe()` stub siap, nanti parsing config dari XBE resources.
+
+### A9: Audio/Video decoder integration — WMA/XMV stream decode (2026-10-19)
+
+`src/audio/stream_decode_posix.{h,cpp}` — integrasi decoder WMA/XMV ke DirectSound streams.
+
+**Files:**
+| File | Fungsi |
+|---|---|
+| `stream_decode_posix.h` | API: `Stream`, `stream_open/decode/close/pause`, `stream_submit_audio`, `stream_get_video_frame`, callback |
+| `stream_decode_posix.cpp` | Implementasi: wrap `decoder::AudioDecoder`/`VideoDecoder`, buffer management, packet decode → mixer |
+
+**Arsitektur:**
+```
+DirectSoundCreateStream (WMA/XMV format)
+    ↓
+stream_open() → decoder::audio_open/video_open (FFmpeg via decoder_posix)
+    ↓
+Stream callback / game pushes packets
+    ↓
+stream_decode() → decoder::audio_decode/video_decode → PCM float / RGBA
+    ↓
+audio_out::submit() / RGBA texture for video
+```
+
+**Format support:**
+| Format | Codec | Output |
+|---|---|---|
+| WMA (0x161/0x162) | WMV2 | float stereo 48 kHz → audio_out mixer |
+| XMV (0x163) | WMV3/VC-1 | RGBA frames → GPU texture |
+
+**Features:**
+- Audio: packet decode → float stereo → `audio_out::submit()` (10 ms blocks)
+- Video: packet decode → RGBA frame → `stream_get_video_frame()` for GPU upload
+- Pause/resume/eof handling
+- Callback for packet completion (matches DirectSound stream callback)
+- Thread-safe decoder state per stream
+
+**Integration points (ready for XBE):**
+- `DirectSoundCreateStream` HLE → `stream_open()` with format tag + extradata
+- Stream callback → `stream_set_callback()` for packet completion
+- Game packet push → `stream_decode()` → mixer
+- Video frame → `stream_get_video_frame()` → GPU texture upload (when XBE available)
+
+**Test:** Clean rebuild 0 error, 30/30 suite, 1.721 check.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

@@ -93,8 +93,10 @@ if(UNIX)
     src/input/xinput_posix.cpp
     src/input/bindings_posix.cpp
     src/input/mouselook_posix.cpp
+    src/input/input_detail_posix.cpp
     src/audio/output_posix.cpp
     src/audio/decoder_posix.cpp
+    src/audio/stream_decode_posix.cpp
     src/shader/nv2a_vsh_posix.cpp
     src/shader/nv2a_psh_posix.cpp
     src/shader/material_posix.cpp

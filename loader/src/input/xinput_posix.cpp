@@ -4,6 +4,7 @@
 
 #include "input/bindings_posix.h"
 #include "input/mouselook_posix.h"
+#include "input/input_detail_posix.h"
 
 #include "platform/posix/log.h"
 #include "platform/posix/options.h"
@@ -227,8 +228,16 @@ uint32_t XD3D_STDCALL XInputSetState(void *h, uint8_t *pFeedback)
     uint16_t left = *reinterpret_cast<uint16_t *>(pFeedback + 68);
     uint16_t right = *reinterpret_cast<uint16_t *>(pFeedback + 70);
 
+    // Use input_detail rumble system
+    input_detail::RumbleEffect effect;
+    effect.low_freq = left;
+    effect.high_freq = right;
+    effect.duration_ms = 500; // default duration
+
     for (int i = 0; i < 4; i++) {
         if (g_pads[i].ctrl) {
+            input_detail::rumble_start(i, effect);
+            // Also apply directly via SDL for immediate feedback
             SDL_Joystick *joy = SDL_GameControllerGetJoystick(g_pads[i].ctrl);
             if (joy) {
                 SDL_Haptic *haptic = SDL_HapticOpenFromJoystick(joy);

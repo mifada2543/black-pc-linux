@@ -238,7 +238,7 @@ static bool draw_the_triangle(const void *frag_spirv, size_t frag_size, std::vec
               gfx::set_pipeline(&pipe) &&
               gfx::set_viewport(0, 0, (float)kWidth, (float)kHeight, 0.0f, 1.0f) &&
               gfx::set_scissor(0, 0, kWidth, kHeight) && gfx::bind_vertex_buffer(&verts, 0, 0) &&
-              gfx::draw(3, 1, 0) && gfx::end_frame();
+              gfx::draw(gfx::TopologyTriangles, 3, 1, 0) && gfx::end_frame();
     if (ok) {
         pixels->assign(kWidth * kHeight * 4, 0);
         ok = gfx::read_color(&target, pixels->data());
@@ -372,7 +372,7 @@ static void test_textured_draw_in_a_child()
         if (!gfx::begin_frame() || !gfx::set_pipeline(&pipe) ||
             !gfx::set_viewport(0, 0, (float)kWidth, (float)kHeight, 0.0f, 1.0f) ||
             !gfx::set_scissor(0, 0, kWidth, kHeight) || !gfx::bind_vertex_buffer(&verts, 0, 0) ||
-            !gfx::draw(3, 1, 0) || !gfx::end_frame())
+            !gfx::draw(gfx::TopologyTriangles, 3, 1, 0) || !gfx::end_frame())
             _exit(127);
 
         std::vector<uint8_t> pixels(kWidth * kHeight * 4);

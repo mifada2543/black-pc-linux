@@ -196,7 +196,7 @@ static ChildOutcome run_gate_on_current_device()
     step("set_viewport");  ok = ok && gfx::set_viewport(0, 0, (float)kWidth, (float)kHeight, 0.0f, 1.0f);
     step("set_scissor");   ok = ok && gfx::set_scissor(0, 0, kWidth, kHeight);
     step("bind_vertices"); ok = ok && gfx::bind_vertex_buffer(&verts, 0, 0);
-    step("draw");          ok = ok && gfx::draw(3, 1, 0);
+    step("draw");          ok = ok && gfx::draw(gfx::TopologyTriangles, 3, 1, 0);
     step("end_frame");
     ok = ok && gfx::end_frame();
     if (!ok) {
@@ -255,7 +255,7 @@ static ChildOutcome run_gate_on_current_device()
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < kSubmitRounds; i++) {
         if (!gfx::begin_frame() || !gfx::clear_color(background) || !gfx::set_pipeline(&pipe) ||
-            !gfx::bind_vertex_buffer(&verts, 0, 0) || !gfx::draw(3, 1, 0) || !gfx::end_frame())
+            !gfx::bind_vertex_buffer(&verts, 0, 0) || !gfx::draw(gfx::TopologyTriangles, 3, 1, 0) || !gfx::end_frame())
             break;
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);

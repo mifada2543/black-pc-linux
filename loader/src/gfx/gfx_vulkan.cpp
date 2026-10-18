@@ -60,6 +60,16 @@ Image *g_depth;
 // finished once end_frame has waited, and that is where these are released.
 std::vector<Buffer> g_staging_pending;
 
+// The one reusable index buffer. Rewritten whenever the caller has different indices: a draw that needs
+// indices nearly always needs the same ones as the last draw, and allocating per draw would be the
+// largest cost in a frame made entirely of quads.
+Buffer g_index_buffer;
+uint64_t g_index_capacity = 0;
+
+// Whether the frame has a pipeline bound. A draw without one is recorded anyway and faults at submit,
+// so the draw path asks first and skips with a reason.
+bool g_pipeline_bound = false;
+
 // A handle, not a pointer, so that the D3D layer can hold one without naming a Vulkan type (section 3.2).
 std::vector<ManagedBuffer> g_managed;
 bool g_recording;
@@ -758,6 +768,7 @@ void shutdown()
         if (g_device) destroy_buffer(&g_managed[i].device);
     }
     g_managed.clear();
+    if (g_index_buffer.buffer) destroy_buffer(&g_index_buffer);
     if (g_device && g_pool) vkDestroyCommandPool(g_device, g_pool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
     if (g_instance) vkDestroyInstance(g_instance, nullptr);
@@ -1754,16 +1765,20 @@ bool begin_frame()
     }
 
     g_scissor_set = false; // a frame starts with no scissor, which is a different thing from a 1x1 one
+    g_pipeline_bound = false; // and with no pipeline, which a new frame has to be told about again
     // Deliberately no pass here. A pass is opened by the first thing that draws -- see ensure_pass -- because
     // a buffer copy or a layout barrier recorded between here and there is legal, and recorded after it is
     // not. Opening the pass eagerly is what put every upload inside one.
     return true;
 }
 
+bool pipeline_is_bound() { return g_pipeline_bound; }
+
 bool set_pipeline(const Pipeline *p)
 {
-    if (!ensure_recording() || !p || !p->pipeline) return false;
+    if (!ensure_pass() || !p || !p->pipeline) return false;
     vkCmdBindPipeline(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->pipeline);
+    g_pipeline_bound = true;
     return true;
 }
 
@@ -1816,17 +1831,35 @@ bool bind_index_buffer(const Buffer *b, VkIndexType type)
     return true;
 }
 
-bool draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex)
+bool bind_index_buffer_upload(const void *indices, VkDeviceSize bytes)
+{
+    if (!indices || bytes == 0) return false;
+    if (bytes > g_index_capacity) {
+        // Rounded up so that a mesh that grows by a handful of indices does not reallocate. Power of two,
+        // because that is the only growth policy that never reallocates more than half the time.
+        uint64_t want = g_index_capacity ? g_index_capacity : 4096;
+        while (want < (uint64_t)bytes) want *= 2;
+        if (g_index_buffer.buffer) destroy_buffer(&g_index_buffer);
+        if (!create_buffer(&g_index_buffer, want, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true)) return false;
+        g_index_capacity = want;
+    }
+    if (!update_buffer(&g_index_buffer, 0, bytes, indices)) return false;
+    return bind_index_buffer(&g_index_buffer, VK_INDEX_TYPE_UINT16);
+}
+
+bool draw(Topology topology, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex)
 {
     if (!ensure_pass()) return false;
-    vkCmdDraw(g_cmd, vertex_count, instance_count, first_vertex, 0);
+    vkCmdDraw(g_cmd, vertex_count, instance_count, first_vertex, (VkPrimitiveTopology)topology);
     return true;
 }
 
-bool draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset)
+bool draw_indexed(Topology topology, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                  int32_t vertex_offset)
 {
     if (!ensure_pass()) return false;
-    vkCmdDrawIndexed(g_cmd, index_count, instance_count, first_index, vertex_offset, 0);
+    vkCmdDrawIndexed(g_cmd, index_count, instance_count, first_index, vertex_offset,
+                     (VkPrimitiveTopology)topology);
     return true;
 }
 

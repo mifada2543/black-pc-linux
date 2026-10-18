@@ -184,10 +184,11 @@ static void test_the_table()
             if (rows[i].addr == rows[j].addr) clashes++;
     check_eq(clashes, 0, "no two rows claim the same entry point");
 
-    // The tables that are not here yet must say so, rather than being absent from a walk over "the tables".
-    size_t n = 1;
-    check(resource_rows(&n) == nullptr && n == 0, "the resource table is empty and says so");
-    check(draw_rows(&n) == nullptr && n == 0, "and so is the draw table");
+        // All three tables are filled now, so a walk over "the tables" visits every row and every one of them
+    // has been checked. The per-table specifics live with their own tests.
+    size_t resources = 0, draws = 0;
+    check(resource_rows(&resources) != nullptr && resources == 18, "and the resource table is there as well");
+    check(draw_rows(&draws) != nullptr && draws == 3, "and so is the draw table");
 }
 
 // ---- what the state functions actually do ----

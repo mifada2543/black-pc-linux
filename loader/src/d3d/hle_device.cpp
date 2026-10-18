@@ -18,6 +18,9 @@
 //     counted object and the game will Release it.
 #include "d3d/device_posix.h"
 
+#include "d3d/resource_posix.h"
+#include "d3d/vshader_store_posix.h"
+
 #include "d3d/hle_table_posix.h"
 
 #include "platform/posix/log.h"
@@ -125,8 +128,12 @@ void XD3D_STDCALL D3DDevice_SetTexture(uint32_t Stage, Resource *pTexture)
 {
     if (Stage >= TEXTURESTAGE_COUNT) return;
     pb_flush();
+    // Whatever this stage held may have been released to zero while it was here, and kept only because
+    // freeing it then would have been a use-after-free. It comes off the stage now, so it can go.
+    Resource *previous = state().textures[Stage];
     state().textures[Stage] = pTexture;
     dev_field<Resource *>(DEV_TEXTURES + Stage * 4) = pTexture;
+    if (previous && previous != pTexture) resource_release_if_unbound(previous);
 }
 
 // ---- vertex shader ----
@@ -338,19 +345,28 @@ void XD3D_STDCALL D3D_UpdateFogState() {}
 
 // ---- shaders and their constants ----
 
-// CreateVertexShader: translating NV2A microcode into SPIR-V is A5. What is settled here is the handle
-// convention, because the game stores the handle and compares it -- bit 0 marks a real shader. With no
-// translation there is nothing to hand back, and a caller given a handle it could pass to SetVertexShader
-// and DeleteVertexShader would fault later, far from the call at fault. D3DERR_INVALIDCALL is the console's
-// own answer for a program it would not take, and it is one the game can see and report.
+// CreateVertexShader: the program and its declaration are copied out of the game's buffers and kept, and
+// the handle is an index into that shelf with bit 0 set. The convention is the console's and the game relies
+// on it: a handle with bit 0 clear is a fixed-function vertex format, set by passing the FVF straight to
+// SetVertexShader, and any scheme of ours that claimed bit 0 for itself would turn every fixed-function
+// draw into a shader lookup that misses.
+//
+// What is deliberately not here: the translation. It happens per draw rather than per creation, because the
+// pipeline that consumes the SPIR-V also depends on the render target's format and the render states, and
+// caching a translation at creation would be a cache with no idea what it is for. The microcode is copied
+// all the same, because the game owns both buffers and may reuse them.
 uint32_t XD3D_STDCALL D3DDevice_CreateVertexShader(const uint32_t *pDeclaration, const uint32_t *pFunction,
                                                   uint32_t *pHandle, uint32_t Usage)
 {
-    (void)pDeclaration;
-    (void)pFunction;
-    (void)Usage;
     if (!pHandle) return D3D_E_POINTER;
-    return D3DERR_INVALIDCALL;
+    const char *why = nullptr;
+    const uint32_t handle = vertex_program_create(pDeclaration, pFunction, Usage, &why);
+    if (!handle) {
+        logf("[d3d] CreateVertexShader refused: %s", why ? why : "?");
+        return D3DERR_INVALIDCALL;
+    }
+    *pHandle = handle;
+    return D3D_OK;
 }
 
 // Delete still has to clear the binding: a deleted shader left bound means the next draw reads a shader
@@ -358,6 +374,7 @@ uint32_t XD3D_STDCALL D3DDevice_CreateVertexShader(const uint32_t *pDeclaration,
 void XD3D_STDCALL D3DDevice_DeleteVertexShader(uint32_t Handle)
 {
     if (state().vertex_shader == Handle) state().vertex_shader = 0;
+    vertex_program_destroy(Handle);
 }
 
 // One register is four floats, so a register's worth is 16 bytes and `count` is in registers. A register
@@ -541,20 +558,6 @@ const Hle *device_rows(size_t *count)
 {
     *count = sizeof kDeviceTable / sizeof kDeviceTable[0];
     return kDeviceTable;
-}
-
-// The other two tables are A4's; declared here so a test that walks "all the tables" does not have to know
-// that yet, and so it fails loudly rather than silently skipping them.
-const Hle *resource_rows(size_t *count)
-{
-    *count = 0;
-    return nullptr;
-}
-
-const Hle *draw_rows(size_t *count)
-{
-    *count = 0;
-    return nullptr;
 }
 
 } // namespace xd3d

@@ -42,6 +42,9 @@ if(UNIX)
     src/d3d/device_posix.cpp
     src/d3d/hle_table_posix.cpp
     src/d3d/hle_device.cpp
+    src/d3d/resource_posix.cpp
+    src/d3d/vshader_store_posix.cpp
+    src/d3d/draw_posix.cpp
     src/d3d/vertex_posix.cpp
     src/shader/nv2a_vsh_posix.cpp
     src/shader/nv2a_psh_posix.cpp
@@ -273,6 +276,14 @@ if(UNIX)
     target_link_libraries(test_managed_buffer PRIVATE blackcore)
     add_test(NAME managed_buffer COMMAND test_managed_buffer)
     set_tests_properties(managed_buffer PROPERTIES LABELS "gpu" SKIP_RETURN_CODE 77)
+
+    add_executable(test_resource tests/test_resource.cpp)
+    target_link_libraries(test_resource PRIVATE blackcore)
+    add_test(NAME resource COMMAND test_resource)
+
+    add_executable(test_draw_posix tests/test_draw_posix.cpp)
+    target_link_libraries(test_draw_posix PRIVATE blackcore)
+    add_test(NAME draw_posix COMMAND test_draw_posix)
   else()
     message(STATUS "libglslang absent -- the shader runtime test is not registered")
   endif()

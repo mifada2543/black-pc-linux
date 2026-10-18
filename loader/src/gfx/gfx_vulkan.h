@@ -336,8 +336,25 @@ bool set_viewport(float x, float y, float w, float h, float min_z, float max_z);
 bool set_scissor(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 bool bind_vertex_buffer(const Buffer *b, uint32_t binding, VkDeviceSize offset);
 bool bind_index_buffer(const Buffer *b, VkIndexType type);
-bool draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex);
-bool draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset);
+
+// An index buffer that is rewritten whenever the caller has different indices.
+//
+// One buffer, reused. A draw that needs indices almost always needs the same ones as the last draw, and
+// allocating a buffer per draw would be the largest cost in a frame made entirely of quads. Grown to fit
+// what it is given and never shrunk, because the game does not stop changing its mind.
+bool bind_index_buffer_upload(const void *indices, VkDeviceSize bytes);
+
+// Whether a pipeline is bound on the frame. A draw without one is recorded anyway and faults later, so the
+// draw path asks first and skips with a reason.
+bool pipeline_is_bound();
+// The five topologies Vulkan has. The console named ten primitive types and had its own reasons for the
+// difference -- quads and fans among them -- so this is a plain enum rather than a VkPrimitiveTopology:
+// d3d/ picks one of these without naming a Vulkan type, and this file maps it.
+enum Topology { TopologyPoints = 0, TopologyLines, TopologyLineStrip, TopologyTriangles, TopologyTriangleStrip };
+
+bool draw(Topology topology, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex);
+bool draw_indexed(Topology topology, uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                  int32_t vertex_offset);
 bool set_scissor_enable(bool on);
 
 // Clear the whole bound target. With no frame in progress this starts one, which is what the "reset the target

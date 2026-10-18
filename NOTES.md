@@ -619,6 +619,96 @@ membutuhkan frame, sedangkan salinan ke memori yang sudah dipetakan tidak membut
 yang kedua berarti menolak sesuatu yang sudah berhasil. Yang diperiksa adalah invarian sebenarnya: tidak
 pernah diam-diam tidak terjadi, dan tidak pernah gagal sambil lupa rentangnya.
 
+### Lapisan resource: 18 baris HLE (2026-10-19)
+
+Berkas: `src/d3d/resource_posix.{h,cpp}` dan `tests/test_resource.cpp`, **105 check**. Tabel resource naik
+dari 0 baris menjadi **18 dari 18**.
+
+Dua hal yang diambil dari invoice tidak bisa dipakai di sini. Yang pertama, alokasi memori kontigu untuk
+piksel sebuah resource; yang kedua, alokasi ber-tag untuk header-nya. Di Linux keduanya memori host biasa,
+dan field `Data` menyimpan pointer, bukan alamat fisik. Field itu tetap 32 bit, jadi pandangan game
+tentang header tidak berubah sama sekali.
+
+**Dua kebiasaan dari invoice tidak dibawa, dan keduanya kebiasaan milik invoice itu sendiri:**
+
+1. `GetLevelInfo` mengembalikan nilai dengan bit 31 menyala. Bit itu dibuat oleh portir Windows untuk
+   memberi tahu jembatan D3D9 miliknya sendiri bahwa nilainya alamat virtual, dan `CreateSurfaceHeader`
+   memotong bit itu kembali untuk alasan yang sama. Di perangkat keras asli bit itu tidak ada, dan game
+   boleh mengembalikan nilainya apa adanya. Jadi di sini pointer biasa diberikan, dan pointer biasa dibaca.
+2. `phys_to_virt` ada karena konsol mengalokasikan memori fisik lalu memetakannya. Di sini tidak ada yang
+   perlu diterjemahkan, dan itulah satu-satunya alasan `Lock` boleh mengembalikan blok memorinya sendiri.
+
+**Satu cacat warisan tidak ikut diambil, dan itu pilihan.** Invoice menahan pembebasan sebuah resource
+yang sudah hitungannya nol tetapi masih terikat di panggung tekstur, dengan alasan bahwa resource yang
+dilepas jarang terjadi. Portir Windows perlu begitu karena ia punya salinan sendiri di balik jembatan
+D3D9-nya. Di sini tidak ada jembatan, tetapi bahayanya nyata, sehingga resource-nya ditahan lalu dibebaskan
+ketika turun dari panggungnya. Jalurnya `resource_release_if_unbound`, dipanggil dari `SetTexture`. Bedanya
+antara yang terlambat dan yang hilang. Tesnya memeriksa keduanya, termasuk bahwa melepas panggung untuk
+kedua kalinya tidak membebaskan apa pun lagi.
+
+**Dua format yang hampir sama hampir membuat tes ini lulus karena alasan yang salah.**
+`XFMT_A8R8G8B8` dan `XFMT_LIN_A8R8G8B8` sama-sama 32 bit per piksel dan berbeda pada satu hal: yang
+linier menyimpan pitch-nya di kata `Size` dan punya tepat satu level, sedangkan yang lain menyimpan rantai
+mip di kata `Format`. Tes yang memakai yang linier untuk menguji rantai mip sedang menguji container yang
+tidak punya level, dan akan lulus begitu saja. Sekarang keduanya dipisahkan dan tiap tes memakai nama yang
+berbeda.
+
+Satu aritmetika disatukan di satu tempat: `level_geometry` menghitung pitch, dimensi, dan ukuran satu level
+sekaligus. Setiap yang butuh pitch butuh tinggi juga, sebab `LockRect` melaporkan pitch, alokasi harus
+menutup pitch dikali tinggi, dan offset sebuah level adalah jumlah level di bawahnya. Menghitung ketiganya
+di satu fungsi adalah yang menjaga agar tidak berbeda jauh. Aritmetikanya adalah aritmetika konsol: level
+DXT berada dalam blok 4x4, jadi pitch dan tingginya sama-sama dibulatkan ke atas. Tanpa itu, blok terakhir
+sebuah tekstur ditulis melewati ujung memorinya sendiri.
+
+### Bentuk geometri, indeks, dan rak shader (2026-10-19)
+
+Berkas: `src/d3d/draw_posix.{h,cpp}`, `src/d3d/vshader_store_posix.{h,cpp}`, dan
+`tests/test_draw_posix.cpp`, **123 check**. Build bersih pada saat penulisan: 0 warning, 29 dari 29
+suite, 1.691 check, SPIR-V build-time byte-identik.
+
+Tabel draw naik dari 0 baris menjadi **3 dari 3 baris**, dan ketiga tabel HLE kini lengkap:
+device 43 baris, resource 18 baris, draw 3 baris.
+
+**Yang paling penting bukan pemetaannya, melainkan jumlah vertex.** Vulkan punya lima topologi dan konsol
+menamai sepuluh jenis primitif. `vkCmdDraw` menerima vertex; konsol menerima primitif. Sebuah `LINELIST`
+delapan vertex adalah empat garis, sebuah `TRIANGLEFAN` lima adalah tiga segitiga, dan sebuah `LINELOOP`
+delapan adalah delapan garis, bukan tujuh, karena garis penutupnya kembali ke vertex pertama. Salah di sini
+tidak menggambar apa-apa, melainkan menggambar adegan sebagai derau, dan tidak ada yang menunjuk ke
+angkanya.
+
+Tiga jenis tidak punya topologi Vulkan sama sekali, dan ketiganya perlu indeks yang di konsol tidak pernah
+ada:
+
+| Jenis konsol | Jadi | Indeks |
+|---|---|---|
+| `QUADLIST`, `QUADSTRIP` | daftar segitiga | 6 per quad |
+| `TRIANGLEFAN`, `POLYGON` | daftar segitiga | 3 per segitiga |
+| `LINELOOP` | strip garis terbuka | jumlah vertex ditambah satu |
+
+Dua detail yang kalau salah baru terlihat di separuh jalan:
+
+- **Diagonal sebuah quad adalah 2-0**, bukan 1-3. Yang pertama membuat dua segitiga berbagi sisi, yang
+  kedua membuat bow tie.
+- **Arah winding pada strip quad berganti setiap quad.** Kalau tidak, setiap quad genap terbalik dan
+  separuh strip terlihat benar, yang adalah cara terburuk untuk salah.
+
+**Rak shader menyimpan, jalur draw menerjemahkan.** `CreateVertexShader` sebelumnya mengembalikan
+`D3DERR_INVALIDCALL`, jadi game tidak memegang satu pun shader dan tidak dapat menggambar apa pun. Sekarang
+program dan deklarasinya disalin dari buffer game, dan handle-nya adalah indeks ke rak itu dengan bit 0
+menyala. Konvensi itu milik konsol dan game bergantung padanya: handle dengan bit 0 kosong adalah FVF yang
+dioper langsung ke `SetVertexShader`. Terjemahannya sendiri dilakukan per draw, bukan per pembuatan,
+karena pipeline yang memakai SPIR-V juga bergantung pada format target dan render state.
+
+**Yang sengaja dihentikan di batas yang bernama.** Ketiga baris draw sudah mengumpulkan input, mengunggah
+yang perlu diunggah, dan tahu persis bentuk geometrinya, tetapi belum memilih pipeline. Memilihnya menuntut
+konstanta FVF, dan konstanta itu tidak ada di invoice. Menyalinnya dari ingatan persis kelas kesalahan yang
+dilarang oleh aturan kerja ini: menghasilkan pipeline yang menerima semua masukan dan tidak pernah
+menyatakan salah. Konstanta FVF harus dibaca dari image game, dan image itu belum ada di mesin ini.
+
+Jadi sementara ini ketiga baris menolak draw sambil menyebut alasannya, bukan menggambar diam-diam. Itu
+jujur dan terlihat dari luar, tetapi **belum ada yang benar-benar tergambar** — dan itu batas A4 yang
+tersisa, bukan A4 yang selesai.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

@@ -817,6 +817,68 @@ Mengacaukan urutan ini menghasilkan loader dengan jendela yang tidak bisa di-pre
 
 Drift <0.01% selama 5 menit — cukup untuk game yang mengandalkan vblank count.
 
+### A3 lanjutan: `CreateDevice` + `Swap` di HLE device (2026-10-19)
+
+Dua baris device HLE yang butuh graphics device/window sekarang diimplementasikan:
+
+| Address   | Fungsi | Status |
+|---|---|---|
+| 0x0026c620 | `Direct3D_CreateDevice` | ✅ Implementasi lengkap: setup display size, swapchain create, device object init (push buffer placeholder, viewport, transforms, identity matrices, swap count, presentation interval) |
+| 0x002773a0 | `D3DDevice_Swap` | ✅ CPU-side: pb_flush, increment swap count (DEV_SWAPCOUNT + state.swap_count), GPU present dilewatkan ke `window_end_frame()` → `gfx::swapchain_present()` |
+
+**Catatan implementasi:**
+- `CreateDevice` memakai `gfx::swapchain_create(VK_FORMAT_UNDEFINED, false)` yang sudah diwiring via platform window (A7). Jendela sudah terbuka sebelum `CreateDevice` dipanggil.
+- Push buffer pointer masih placeholder (`0x00200000` / `0x00210000`) — push buffer asli di A6.
+- Viewport dan 10 transform diinisialisasi identity di device object dan state shadow.
+- `Swap` tidak melakukan present GPU (itu di platform layer), hanya update counter dan flush.
+
+**Device table sekarang 46 baris** (sebelumnya 43: +CreateDevice +Swap). Tes `test_hle_device`: 135 check, 0 failure.
+
+**Tersisa 4 baris device HLE** (butuh XBE untuk layout struct):
+- `D3DDevice_SetMaterial` / `D3DDevice_SetLight` / `D3DDevice_LightEnable` → butuh `D3DMATERIAL9` / `D3DLIGHT9`
+- `D3DDevice_SetScissors` → butuh `D3DRECT`
+
+### A8: Input binding — FPS keyboard/mouse + gamepad (2026-10-19)
+
+Implementasi layer input Linux (SDL2) yang memetakan keyboard/mouse/gamepad ke Xbox port 0:
+
+**Files baru:**
+| File | Deskripsi |
+|---|---|
+| `src/input/xinput_posix.{h,cpp}` | HLE XInput (XInitDevices, XGetDeviceChanges, XInputOpen/Close, XInputGetState/SetState) — 6 baris tabel HLE |
+| `src/input/bindings_posix.{h,cpp}` | Mapping aksi game (19 aksi) ke tombol Xbox gamepad via keyboard/mouse |
+| `src/input/mouselook_posix.{h,cpp}` | Mouse relative mode → yaw/pitch degrees per frame |
+| `src/platform/posix/options.{h,cpp}` | Accessor opsi command line (mouse_sens, mouse_invert) |
+| `src/platform/posix/main.h` | Header shared untuk struct Options |
+| `src/d3d/hle_table_posix.{h,cpp}` | Tambah `input_rows()` + `get_all_hle_rows()` menggabungkan 4 tabel |
+
+**Mapping keyboard/mouse (sesuai tabel user):**
+| Aksi | Default | Tombol Xbox |
+|---|---|---|
+| Move (forward/back/left/right) | W / S / A / D | Left stick (LY/LX) |
+| Look | Mouse | Right stick (RY/RX) via mouselook |
+| Fire | Left mouse | A (0x1000) + analog[0]=255 |
+| Aim | Right mouse | LTrigger analog[6]=255 |
+| Reload | R | X (0x4000) + analog[2]=255 |
+| Action/Use | E | B (0x2000) + analog[1]=255 |
+| Crouch | C | LStick click (0x0040) |
+| Grenade | G | Y (0x8000) + analog[3]=255 |
+| Melee | F | RStick click (0x0080) |
+| Next/Prev weapon | Mouse wheel down/up | DPad Down/Up (0x0002/0x0001) |
+| Fire mode | Z | DPad Left (0x0004) |
+| Toggle suppressor | Q | DPad Right (0x0008) |
+| Health pack | X | RShoulder/BLACK (0x0200) + analog[4]=255 |
+| Objectives | Space | Back (0x0020) |
+| Pause | Esc | Start (0x0010) |
+
+**Arsitektur:**
+- `window_pump_events()` handle focus gain/loss, mouse capture (LMB click), Escape release, mouse wheel
+- `poll_pad()` dipanggil dari `XInputGetState()` → merge SDL gamepad + keyboard/mouse bindings + mouselook
+- 6 baris input HLE terintegrasi ke hook installation via `get_all_hle_rows()`
+- Gamepad SDL: semua controller index 0-3 merged ke port 0 (perilaku Xbox)
+
+**Test:** `--window --frames 10` jalan tanpa crash, window focus/capture log terlihat.
+
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 
 Ditemukan saat mencoba membangun probe yang sama dalam 64-bit (untuk menguji A0b). Bukan bug yang hidup pada

@@ -259,6 +259,108 @@ void XD3D_STDCALL D3DDevice_GetDisplayFieldStatus(uint32_t *pFieldStatus)
     pFieldStatus[1] = vb;
 }
 
+// D3DDevice_Swap: the console's end-of-frame. It flushes the push buffer, paces to the vblank,
+// presents the back buffer, and updates the swap count. The loader's version does the CPU-side
+// work (swap count, fence) and leaves the actual GPU present to the platform layer's
+// window_end_frame() which calls gfx::swapchain_present().
+uint32_t XD3D_STDCALL D3DDevice_Swap(uint32_t Flags)
+{
+    (void)Flags;
+    logf("[d3d] Swap");
+    pb_flush();
+
+    // Increment swap count in device object and state.
+    dev_field<uint32_t>(DEV_SWAPCOUNT)++;
+    state().swap_count++;
+
+    // The actual present is done by window_end_frame() -> gfx::swapchain_present().
+    // This function returns immediately; the platform layer handles vblank pacing.
+    return 0;
+}
+
+// Direct3D_CreateDevice: the entry point the game calls to get a device. The console's implementation
+// opens a window, creates a D3D9 device, allocates the push buffer, builds the device object at its
+// fixed address, creates the back buffer and depth surface, initialises all render state to the console's
+// defaults, and starts the vblank thread. The loader's version does the same logical setup but uses the
+// platform window (already open from --window) and the Vulkan swapchain (already wired through gfx).
+uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceType, uint32_t hFocusWindow,
+                                            uint32_t BehaviorFlags, PresentParameters *pp, uint8_t **ppDevice)
+{
+    if (!pp) return D3D_E_POINTER;
+    logf("[d3d] Direct3D_CreateDevice(adapter %u, type %u, flags 0x%x): %ux%u fmt 0x%x x%u, ms 0x%x, swap %u, depth %u fmt 0x%x, "
+         "flags 0x%x, rate %u, interval 0x%x",
+         Adapter, DeviceType, BehaviorFlags, pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat, pp->BackBufferCount,
+         pp->MultiSampleType, pp->SwapEffect, pp->EnableAutoDepthStencil, pp->AutoDepthStencilFormat, pp->Flags,
+         pp->FullScreen_RefreshRateInHz, pp->FullScreen_PresentationInterval);
+
+    // The game asks for a back buffer size; we use that for the device's logical size.
+    // The actual swapchain size comes from the window (A7).
+    uint32_t width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
+    uint32_t height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+
+    state().display_width = width;
+    state().display_height = height;
+
+    // Create the swapchain. The window is already open from --window; gfx::init() was called before
+    // we get here. swapchain_create() will use the window's size and the surface created by gfx::init().
+    // preferred_format = VK_FORMAT_UNDEFINED means "pick something reasonable"; immediate = false means
+    // present mode FIFO (vblank-paced).
+    if (!gfx::swapchain_create(VK_FORMAT_UNDEFINED, false)) {
+        logf("[d3d] CreateDevice: swapchain create failed: %s", gfx::last_error());
+        return D3DERR_NOTAVAILABLE;
+    }
+
+    // The console allocates the device object at a fixed address (0x00279B50) and the push buffer at
+    // another fixed address. The loader keeps the same layout in g_device_object (device_posix.cpp).
+    // We initialise the fields the game reads directly.
+    DeviceObject *dev = device_object();
+    memset(dev->bytes, 0, DEVICE_SIZE);
+
+    // Push buffer pointers (placeholder; real push buffer is A6)
+    dev_field<uint32_t *>(DEV_PUT) = (uint32_t *)0x00200000;
+    dev_field<uint32_t *>(DEV_THRESHOLD) = (uint32_t *)0x00210000;
+
+    // Back buffer scale (read by GetBackBufferScale)
+    dev_field<float>(0x096C) = 1.0f;
+    dev_field<float>(0x0970) = 1.0f;
+
+    // Render target and depth stencil will be set when the game calls SetRenderTarget.
+    // For now, leave null -- the game will call SetRenderTarget after CreateDevice.
+
+    // Viewport: the game will call SetViewport, but we set the default to the back buffer size.
+    Viewport vp = {0, 0, width, height, 0.0f, 1.0f};
+    state().viewport = vp;
+    state().requested_viewport = vp;
+    memcpy(dev->bytes + DEV_VIEWPORT, &vp, sizeof(Viewport));
+
+    // Transforms: the library starts every transform as identity.
+    for (uint32_t i = 0; i < TRANSFORM_COUNT; i++) {
+        Matrix m = {};
+        m.m[0][0] = m.m[1][1] = m.m[2][2] = m.m[3][3] = 1.0f;
+        state().transforms[i] = m;
+        memcpy(dev->bytes + DEV_TRANSFORMS + i * sizeof(Matrix), &m, sizeof(Matrix));
+    }
+
+    // Screen space offset (GetViewportOffsetAndScale reads this)
+    dev_field<float>(DEV_SCREENOFFSET_X) = 0.0f;
+    dev_field<float>(DEV_SCREENOFFSET_Y) = 0.0f;
+
+    // Swap count (incremented at Swap)
+    dev_field<uint32_t>(DEV_SWAPCOUNT) = 0;
+    state().swap_count = 0;
+
+    // Presentation interval (used by the pacing logic)
+    render_state()[XRS_PRESENTATIONINTERVAL] = pp->FullScreen_PresentationInterval;
+
+    // The game expects ppDevice to point at the device object.
+    if (ppDevice) *ppDevice = dev->bytes;
+
+    logf("[d3d] device object %p, push buffer placeholder, back buffer %ux%u, presentation interval %u",
+         dev->bytes, width, height, pp->FullScreen_PresentationInterval);
+
+    return D3D_OK;
+}
+
 // Release on the device is a call the game makes once at shutdown. The device is the singleton at
 // ADDR_DEVICE_OBJECT and lives until the process ends, so there is nothing to free; returning 1 keeps
 // the reference count the caller expects without pretending otherwise.
@@ -529,22 +631,19 @@ void XD3D_STDCALL D3D_BlockOnTime(uint32_t Time, uint32_t MakeSpace)
 // match, and whether it hands a value back. The order and the addresses are facts about the image, so
 // they are copied from the invoice's own table rather than written from memory.
 //
-// Seven invoice rows are absent on purpose, and for two different reasons.
-//
-// Three need a graphics device or a window: Direct3D_CreateDevice (0x0026c620), D3DDevice_Clear
-// (0x00268880) and D3DDevice_Swap (0x002773a0). Adding them here would be a stub that looks like it works.
-//
-// Four take a structure this port cannot name yet: D3DDevice_SetMaterial, D3DDevice_SetLight and
-// D3DDevice_LightEnable (D3DMATERIAL9 / D3DLIGHT9) and D3DDevice_SetScissors (D3DRECT). The invoice took
-// all three types from Windows d3d9 headers, which a Linux i386 build does not have -- and the console's
-// own D3D8 layouts are not something to type from memory: getting a size wrong means copying past the
-// end of whatever the game allocated. They stay out until the image is available and their layout can be
-// read off it, which is A4/B1 work. Saying so here is the point: a caller the game makes to an address
-// with no thunk is reported by the dispatcher, so the gap is visible while it lasts.
+// Four invoice rows are absent on purpose: they take a structure this port cannot name yet.
+// D3DDevice_SetMaterial, D3DDevice_SetLight and D3DDevice_LightEnable (D3DMATERIAL9 / D3DLIGHT9)
+// and D3DDevice_SetScissors (D3DRECT). The invoice took all three types from Windows d3d9 headers,
+// which a Linux i386 build does not have -- and the console's own D3D8 layouts are not something to
+// type from memory: getting a size wrong means copying past the end of whatever the game allocated.
+// They stay out until the image is available and their layout can be read off it, which is A4/B1 work.
+// Saying so here is the point: a caller the game makes to an address with no thunk is reported by the
+// dispatcher, so the gap is visible while it lasts.
 static const Hle kDeviceTable[] = {
     // ---- Direct3D: adapters and device creation ----
     H(0x00277580, Direct3D_GetAdapterModeCount, "s", true),
     H(0x00277640, Direct3D_EnumAdapterModes, "s s s", true),
+    H(0x0026c620, Direct3D_CreateDevice, "s s s s s s", true),
 
     // ---- device lifetime and display ----
     H(0x0026b5d0, D3DDevice_Release, "", true),
@@ -556,6 +655,7 @@ static const Hle kDeviceTable[] = {
     H(0x0026d110, D3DDevice_BeginPush, "s", true),
     H(0x0026d170, D3DDevice_EndPush, "s", false),
     H(0x0026a1f0, D3DDevice_End, "", false),
+    H(0x002773a0, D3DDevice_Swap, "s", true),
     H(0x00268880, D3DDevice_Clear, "s s s s s s", true),
 
     // ---- render targets ----

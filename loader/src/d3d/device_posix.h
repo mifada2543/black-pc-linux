@@ -125,6 +125,10 @@ void pb_flush();
 // same reason pb_flush() is: one place for A4 to make real.
 void pb_reset();
 
+// Global frame counter accessors (for input layer and other subsystems)
+uint32_t frame_count();
+void frame_count_increment();
+
 // The NV2A screen-space transform: screen = clip / w * scale + offset. This is the pair of four-float
 // vectors D3DDevice_GetViewportOffsetAndScale hands back, and what the screen-space epilogue of an
 // XDK-compiled vertex shader reads out of vertex constants 58 and 59. It is a pure function of the

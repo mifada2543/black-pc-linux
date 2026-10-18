@@ -48,6 +48,9 @@ static SDL_Window *g_window = nullptr;
 static char g_last_error[256] = "";
 static bool g_size_changed = false;
 static uint32_t g_frames = 0;
+static bool g_has_focus = false;
+static bool g_mouse_captured = false;
+static int g_mouse_wheel = 0;
 
 void window_log_err(const char *fmt, const char *detail)
 {
@@ -165,10 +168,37 @@ bool window_pump_events()
             if (e.window.event == SDL_WINDOWEVENT_RESIZED ||
                 e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 g_size_changed = true;
+            } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                g_has_focus = true;
+                logf("[platform] window focus gained");
+            } else if (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                g_has_focus = false;
+                g_mouse_captured = false;
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+                logf("[platform] window focus lost");
             }
             break;
         case SDL_QUIT:
             return false;
+        case SDL_MOUSEWHEEL:
+            g_mouse_wheel += e.wheel.y; // positive = up, negative = down
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+            // Click in window captures mouse for mouselook
+            if (e.button.button == SDL_BUTTON_LEFT && g_has_focus && !g_mouse_captured) {
+                g_mouse_captured = true;
+                SDL_SetRelativeMouseMode(SDL_TRUE);
+                logf("[platform] mouse captured");
+            }
+            break;
+        case SDL_KEYDOWN:
+            // Escape releases mouse capture
+            if (e.key.keysym.sym == SDLK_ESCAPE && g_mouse_captured) {
+                g_mouse_captured = false;
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+                logf("[platform] mouse released (Escape)");
+            }
+            break;
         default:
             break;
         }
@@ -267,6 +297,37 @@ bool window_end_frame()
 uint32_t window_frames()
 {
     return g_frames;
+}
+
+// Window focus state
+bool window_has_focus()
+{
+    return g_has_focus;
+}
+
+// Mouse capture state
+bool window_mouse_captured()
+{
+    return g_mouse_captured;
+}
+
+void window_set_mouse_captured(bool captured)
+{
+    g_mouse_captured = captured;
+    if (g_window) {
+        SDL_SetRelativeMouseMode(captured ? SDL_TRUE : SDL_FALSE);
+    }
+}
+
+// Mouse wheel delta
+int window_mouse_wheel()
+{
+    return g_mouse_wheel;
+}
+
+void window_add_mouse_wheel(int delta)
+{
+    g_mouse_wheel += delta;
 }
 
 } // namespace platform

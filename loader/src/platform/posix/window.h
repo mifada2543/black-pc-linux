@@ -87,4 +87,15 @@ bool window_end_frame();
 // checks rather than "it ran for a while".
 uint32_t window_frames();
 
+// Window focus state (for input layer)
+bool window_has_focus();
+
+// Mouse capture state (relative mode for mouselook)
+bool window_mouse_captured();
+void window_set_mouse_captured(bool captured);
+
+// Mouse wheel delta (accumulated since last frame, consumed by input layer)
+int window_mouse_wheel();
+void window_add_mouse_wheel(int delta);
+
 } // namespace platform

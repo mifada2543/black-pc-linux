@@ -260,12 +260,10 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
         xd3d::HookReport hooks{};
         std::string hook_err;
 
-        // The HLE replacements come from the device table. They were not wired in before: install_section
-        // used its `hle` argument only to decide "leave this native" and "too small to jump", so a row with
-        // a real implementation ended up behind the name-and-stop thunk like every other function. The game
-        // therefore stopped at its first D3D call regardless of how much of the console was already ported.
-        size_t device_count = 0;
-        const xd3d::Hle *device_rows = xd3d::device_rows(&device_count);
+        // The HLE replacements come from all tables: device, resource, draw, and input.
+        const xd3d::Hle *hle_rows = nullptr;
+        size_t hle_count = 0;
+        xd3d::get_all_hle_rows(&hle_rows, &hle_count);
 
         // The guard needs the image's own sections. XbePosix parsed them already; asking it is cheaper and
         // less duplicative than re-reading the section headers here.
@@ -276,8 +274,8 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
 
         const bool probe = getenv("BLACKLINUX_TRACE") != nullptr;
         if (xd3d::hooks_install_all_with_hle(x.base, x.size_of_image, (uint8_t *)(uintptr_t)x.base,
-                                              spans.empty() ? nullptr : spans.data(), spans.size(), device_rows,
-                                              device_count, &hooks, probe, hook_err)) {
+                                              spans.empty() ? nullptr : spans.data(), spans.size(), hle_rows,
+                                              hle_count, &hooks, probe, hook_err)) {
             rep.lib_functions = hooks.functions;
             rep.lib_patched = hooks.patched;
             rep.lib_trapped = hooks.trapped;

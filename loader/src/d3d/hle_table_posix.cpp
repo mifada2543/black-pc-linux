@@ -1,6 +1,9 @@
 #include "d3d/hle_table_posix.h"
 
 #include "d3d/thunk_posix.h"
+#include "input/xinput_posix.h"
+
+#include <vector>
 
 namespace xd3d {
 
@@ -26,6 +29,31 @@ TableReport build_table(const Hle *rows, size_t count, std::vector<void *> *thun
         }
     }
     return report;
+}
+
+const Hle *input_rows(size_t *count)
+{
+    return xinput::hle_input_table(count);
+}
+
+void get_all_hle_rows(const Hle **rows, size_t *count)
+{
+    static std::vector<Hle> combined;
+    if (combined.empty()) {
+        size_t c;
+        const Hle *r;
+
+        r = device_rows(&c);
+        combined.insert(combined.end(), r, r + c);
+        r = resource_rows(&c);
+        combined.insert(combined.end(), r, r + c);
+        r = draw_rows(&c);
+        combined.insert(combined.end(), r, r + c);
+        r = input_rows(&c);
+        combined.insert(combined.end(), r, r + c);
+    }
+    *rows = combined.data();
+    *count = combined.size();
 }
 
 } // namespace xd3d

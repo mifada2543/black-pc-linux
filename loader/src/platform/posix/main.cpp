@@ -29,38 +29,24 @@
 #include "platform/posix/log.h"
 #include "platform/posix/window.h"
 #include "platform/posix/timing.h"
+#include "platform/posix/main.h"
+#include "platform/posix/options.h"
 #include "gfx/gfx_vulkan.h"
 
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
 
+// Global options instance (set after parsing)
+Options *g_options = nullptr;
+
 namespace {
 
 constexpr const char *kVersion = "0.2.0 (linux)";
 
-struct Options {
-    std::string xbe = "game/default.xbe";
-    std::string log = "blacklinux.log";
-    // Where \Device\Harddisk0 lives. Empty means "use the default under XDG_DATA_HOME", which is what a
-    // player's writable console data belongs in: the game's own folder is the DVD and stays read-only.
-    std::string hdd;
-    bool doctor = false;
-    bool probe = false;
-    bool window = false;
-    bool info = false;
-    bool trace = false;
-    bool strict = false;
-    bool help = false;
-    bool version = false;
-    uint32_t timeout_s = 15;
-    // --window's frame budget and size. The size defaults to whatever the device state says the back
-    // buffer is (640x480 until the game asks for something else), which is the same number GetDisplayMode
-    // reports and therefore the same number the game sizes its back buffer from.
-    uint32_t frames = 60;
-    uint32_t window_width = 0;
-    uint32_t window_height = 0;
-};
+const Options &get_options() { return *g_options; }
+float get_mouse_sens() { return g_options ? g_options->mouse_sens : 1.0f; }
+bool get_mouse_invert() { return g_options ? g_options->mouse_invert : false; }
 
 void usage()
 {
@@ -343,5 +329,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "blacklinux %s\n", kVersion);
         return 0;
     }
+    options_set_instance(&o);
     return run(o);
 }

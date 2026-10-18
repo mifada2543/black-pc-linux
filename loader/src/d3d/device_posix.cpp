@@ -20,6 +20,9 @@ DeviceObject *g_device_object_ptr = &g_device_object;
 
 DeviceState g_state;
 
+// Global frame counter (mirrors Windows g_frame_count in device.cpp)
+uint32_t g_frame_count = 0;
+
 } // namespace
 
 DeviceState &state() { return g_state; }
@@ -41,6 +44,9 @@ uint32_t *stream_source(int stream)
     if (stream < 0 || stream >= 16) return nullptr;
     return g_streams_ptr + stream * 2;
 }
+
+uint32_t frame_count() { return g_frame_count; }
+void frame_count_increment() { g_frame_count++; }
 
 void pb_flush()
 {

@@ -1,4 +1,29 @@
 // Pipeline cache implementation.
+//
+// SCAFFOLDING. Nothing calls this file yet. `grep -rl pipeline_cache src/` returns this source and its own
+// header and nothing else: no draw row, no HLE entry, no device function reaches PipelineCache::get_or_create,
+// build_pipeline_key, or pipeline_cache(). It compiles and it is internally consistent, but "compiles" is
+// the only thing that has been demonstrated about it. Nothing here has ever produced a drawn pixel, so
+// treat the code below as untested against real output.
+//
+// What is actually implemented, stated narrowly:
+//   - build_vertex_spirv() translates a VertexProgram out of the vertex shader store through vsh_to_glsl
+//     and compiles it with glslang. It is reachable code on paper only, because no draw path calls it.
+//   - build_pipeline_from_key() refuses the fixed-function path (below) and refuses the pixel-shader path
+//     (below). Those two refusals are the only outcomes this function can currently produce, so today every
+//     call would fail -- and since nothing calls it, today it fails nothing either.
+//
+// What remains, and why it is not done here:
+//   (a) The fixed-function FVF path. Vertex shader handle 0 means the console's fixed-function vertex
+//       format, which needs the FVF constants read out of the game image (src/d3d/vertex_posix.h, D3DFVF_*).
+//       Those constants are not available, so there is no way to know what transform a given FVF code means.
+//   (b) Pixel shader resolution. See build_pipeline_from_key() -- there is no pixel shader store to consult.
+//   (c) Wiring this into the draw rows in src/d3d/draw_posix.cpp so a draw actually asks for a pipeline.
+//       That is real A4 work and is blocked behind (a); it is not attempted rather than half-attempted here.
+//
+// The pass-through fragment shader below is honest ONLY for a draw that bound no pixel shader. It is not a
+// stand-in for one. Substituting it where the game set a pixel shader would draw the game's geometry with
+// a fixed colour and look plausible, which is the failure mode this comment exists to rule out.
 #include "d3d/pipeline_cache_posix.h"
 
 #include "d3d/vertex_posix.h"
@@ -45,11 +70,18 @@ bool build_vertex_spirv(const VertexProgram *vp, std::vector<uint32_t> *out_spir
     return true;
 }
 
-// Build SPIR-V for pixel shader from PixelShaderDef
+// Build SPIR-V for pixel shader from PixelShaderDef.
+//
+// `ps` is the *only* place a pass-through fragment shader belongs in this file, and a null `ps` is the only
+// honest reason to use one: it means the game bound no pixel shader, so there is no material to lose. The
+// caller refuses the `pixel_shader_handle != 0` case outright rather than reaching here with a null `ps`,
+// because on this port a non-zero handle cannot be told apart from "resolved to nothing" -- there is no
+// pixel shader store to look it up in (see build_pipeline_from_key).
 bool build_pixel_spirv(const PixelShaderDef *ps, std::vector<uint32_t> *out_spirv, const char **err)
 {
     if (!ps) {
-        // No pixel shader - use a trivial pass-through
+        // No pixel shader bound. Pass through the vertex colour and nothing else; this is a correct fragment
+        // stage for that case and an incorrect one for every other case, which is why the caller gates it.
         static const char *pass_through_frag = R"(
 #version 450
 layout(location = 0) in vec4 v_color;
@@ -105,37 +137,32 @@ bool build_pipeline_from_key(const PipelineKey &key, gfx::Pipeline *out, const c
     }
 
     // Get pixel shader SPIR-V
+    //
+    // There is no pixel shader store in this port, so a non-zero handle cannot be resolved to a
+    // PixelShaderDef and this must refuse rather than guess:
+    //   - src/d3d/vshader_store_posix.h provides the vertex side only (vertex_program_create /
+    //     vertex_program). There is no pixel equivalent; src/d3d/ has no pshader store file.
+    //   - D3DDevice_SetPixelShader (src/d3d/hle_device.cpp:577) stores the raw handle in
+    //     state().pixel_shader and translates nothing; its own comment says "A5 does the translation, so
+    //     there is nothing to copy in yet".
+    //   - CreatePixelShader is not implemented at all. It appears nowhere in src/ except a comment in
+    //     pipeline_cache_posix.h.
+    // So the handle the game holds points at nothing this loader can read. Building build_pixel_spirv()'s
+    // pass-through here would compile, would cache, and would draw every pixel of the game's material as one
+    // fixed colour -- wrong output that survives review because it still animates. Refuse and let the caller
+    // report it; that failure is a log line, this one is a corrupted frame.
     std::vector<uint32_t> fragment_spirv;
     if (key.pixel_shader_handle != 0) {
-        // Pixel shader handling would go here
-        // For now, use pass-through
-        static const char *pass_through_frag = R"(
-#version 450
-layout(location = 0) in vec4 v_color;
-layout(location = 0) out vec4 f_color;
-void main() { f_color = v_color; }
-)";
-        size_t spirv_size = 0;
-        uint32_t *spirv = compile_glsl_to_spirv(pass_through_frag, SHADER_STAGE_FRAGMENT, &spirv_size, err);
-        if (!spirv) {
-            return false;
-        }
-        fragment_spirv.assign(spirv, spirv + spirv_size / sizeof(uint32_t));
-        free_shader_spirv(spirv);
-    } else {
-        static const char *pass_through_frag = R"(
-#version 450
-layout(location = 0) in vec4 v_color;
-layout(location = 0) out vec4 f_color;
-void main() { f_color = v_color; }
-)";
-        size_t spirv_size = 0;
-        uint32_t *spirv = compile_glsl_to_spirv(pass_through_frag, SHADER_STAGE_FRAGMENT, &spirv_size, err);
-        if (!spirv) {
-            return false;
-        }
-        fragment_spirv.assign(spirv, spirv + spirv_size / sizeof(uint32_t));
-        free_shader_spirv(spirv);
+        *err = "pixel shader handle is set but this port has no pixel shader store: CreatePixelShader is "
+               "not implemented and D3DDevice_SetPixelShader only records the handle, so it cannot be "
+               "resolved to a PixelShaderDef. Refusing instead of drawing with a pass-through that would "
+               "ignore the game's material.";
+        return false;
+    }
+    // Handle 0: the game bound no pixel shader, so the pass-through in build_pixel_spirv is the correct
+    // fragment stage rather than a substitute for a missing one.
+    if (!build_pixel_spirv(nullptr, &fragment_spirv, err)) {
+        return false;
     }
 
     // Convert VertexFormatCode to gfx::VertexAttribute for attributes

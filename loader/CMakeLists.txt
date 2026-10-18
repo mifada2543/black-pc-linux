@@ -96,7 +96,9 @@ if(UNIX)
     src/input/input_detail_posix.cpp
     src/audio/output_posix.cpp
     src/audio/decoder_posix.cpp
-    src/audio/stream_decode_posix.cpp
+    # src/audio/stream_decode_posix.cpp is deliberately absent: it wraps the decoders in
+    # decoder_posix.cpp, and without FFmpeg those are null-returning stubs, so this file would wrap
+    # nothing. It is added below, under the same HAVE_FFMPEG test that decides whether A9 is built.
     src/shader/nv2a_vsh_posix.cpp
     src/shader/nv2a_psh_posix.cpp
     src/shader/material_posix.cpp
@@ -282,6 +284,11 @@ if(HAVE_FFMPEG)
   target_include_directories(blackcore PUBLIC ${AVCODEC_INCLUDE_DIR})
   target_link_libraries(blackcore PUBLIC ${FFMPEG_LIBS})
   target_compile_definitions(blackcore PUBLIC HAVE_FFMPEG=1)
+  # The stream layer is only meaningful on top of a real decoder, so it is built only here. Added here
+  # rather than in the source list above because HAVE_FFMPEG is not decided until line ~267, after
+  # add_library(blackcore). Built unconditionally it was unreachable code that emitted seven
+  # -Wunused-function warnings and implied an A9 decoder that does not exist.
+  target_sources(blackcore PRIVATE src/audio/stream_decode_posix.cpp)
 endif()
   # The loader itself. There is no stub and no DLL on Linux: the program maps the image over its own
   # address space, so main() is the whole entry point (src/platform/posix/boot.h has the sequence).

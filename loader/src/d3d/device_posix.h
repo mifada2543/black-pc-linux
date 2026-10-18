@@ -67,7 +67,9 @@ struct DeviceState {
     float ps_constants[PS_CONSTANT_COUNT][4] = {};
 
     uint32_t swap_count = 0;
-    uint32_t frame_count = 0;
+    // No frame counter here on purpose. There is one, at xd3d::frame_count() below, and it is the one the
+    // input layer reads; a second copy sitting next to swap_count with nothing writing it is the kind of
+    // field that gets read later by someone assuming it is live. D3DDevice_Swap advances the real one.
     uint32_t gpu_time = 0;     // SetFence's counter, mirrored into the device object at DEV_GPUTIME
     uint32_t vblank_count = 0; // drives GetDisplayFieldStatus's field parity
 

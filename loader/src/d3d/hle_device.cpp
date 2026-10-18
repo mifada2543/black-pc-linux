@@ -25,6 +25,7 @@
 
 #include "d3d/hle_table_posix.h"
 
+#include "kernel/k_memory_posix.h" // NtAllocateVirtualMemory / NtFreeVirtualMemory, for the push buffer
 #include "platform/posix/log.h"
 
 #include <string.h>
@@ -273,9 +274,160 @@ uint32_t XD3D_STDCALL D3DDevice_Swap(uint32_t Flags)
     dev_field<uint32_t>(DEV_SWAPCOUNT)++;
     state().swap_count++;
 
+    // The frame counter the input layer reads to tell play from menus
+    // (bindings::in_play -> xd3d::frame_count). Without this call nothing ever incremented it, so it stayed
+    // at 0 forever and in_play() was false on every frame. The console's equivalent is the ++g_frame_count in
+    // the Windows port's D3DDevice_Swap (windows/src/d3d/device.cpp:1296); this is the same counter, in the
+    // same place, under this port's own name.
+    frame_count_increment();
+
     // The actual present is done by window_end_frame() -> gfx::swapchain_present().
     // This function returns immediately; the platform layer handles vblank pacing.
     return 0;
+}
+
+// ---- the push buffer's own storage ----
+//
+// The console had a fixed-size segment at a fixed address, and game code writes command words into it without
+// asking anybody first: MakeRequestedSpace hands back the write cursor, BeginPush hands back the cursor with
+// room for a primitive, and the game writes through whatever pointer it is given. Both of those return DEV_PUT
+// (see the push buffer section below), so the address in DEV_PUT has to be memory that exists. This port used
+// to store the console's own two addresses there and hand them to the game, and neither address is mapped in
+// this process: the first word a game wrote was a segfault rather than a wrong picture.
+//
+// What replaced them is the Windows port's VirtualAlloc call and nothing else. PUSH_BYTES below is that file's
+// constant, the threshold is 64 KB below the end for the same reason it is there, and the allocation is
+// NtAllocateVirtualMemory from this loader's own kernel memory module -- the same Windows entry point under its
+// Xbox name, asked for with the same MEM_COMMIT | MEM_RESERVE | PAGE_READWRITE, and on this host an anonymous
+// mapping below 2 GB that k_memory_posix keeps in its region table so MmQueryVirtualMemory and
+// MmQueryAllocationSize can answer for it. Freed with NtFreeVirtualMemory, so the region's lifetime is the
+// device's and not the process's.
+//
+// The alternatives in this loader were each rejected for a reason, not by taste:
+//
+//   * MmAllocateContiguousMemoryEx is what the console's *physical* memory is for -- surfaces, NV2A instance
+//     memory, anything the GPU reaches by physical address -- and the push buffer is none of those: it is
+//     written by the CPU and, until A6, read by nobody. Half a megabyte of the 64 MB contiguous pool would go
+//     to a scratch buffer the GPU never sees.
+//   * gfx::managed_buffer_create does not allocate the host block at all. It takes memory the caller already
+//     owns and mirrors it to a VkBuffer, and its host half has to outlive any pool here because the game's
+//     reference does. It answers "how do I get a device-local copy of bytes I already have", not "where do I
+//     get 512 KB".
+//   * ExAllocatePoolWithTag is the console's kernel pool. The Windows port did not allocate the push buffer
+//     from the pool, and the pool's blocks carry a header the console's kernel queries for a size; there is
+//     no reason for this one to look like a pool block.
+
+constexpr uint32_t PUSH_BYTES = 512 * 1024; // the Windows port's PUSH_BYTES (device.cpp), verbatim
+constexpr uint32_t PUSH_HEADROOM = 0x4000;  // headroom in dwords -- 64 KB -- kept above the threshold
+constexpr uint32_t PUSH_GUARD = 16;         // the guard dwords a push has to leave before the threshold
+
+// The segment and its length in dwords. Null and zero until Direct3D_CreateDevice allocates them, which is
+// what the "no device yet" answer in BeginPush is about.
+static uint32_t *g_push_base = nullptr;
+static uint32_t g_push_dwords = 0;
+
+// Give the segment back, and leave the cursor null so that a caller asking for space after the device has gone
+// gets the null answer rather than an address that has been unmapped. Safe to call when there is nothing to
+// free, so it is also the first thing the allocator below does.
+static void push_buffer_free()
+{
+    if (!g_push_base) return;
+    void *base = g_push_base;
+    uint32_t bytes = g_push_dwords * sizeof(uint32_t);
+    g_push_base = nullptr;
+    g_push_dwords = 0;
+    dev_field<uint32_t *>(DEV_PUT) = nullptr;
+    dev_field<uint32_t *>(DEV_THRESHOLD) = nullptr;
+    NtFreeVirtualMemory(&base, &bytes, MEM_RELEASE);
+    logf("[d3d] push buffer released");
+}
+
+// Allocate the segment, replacing one that is already there. Freeing first is what makes a second
+// Direct3D_CreateDevice a re-create rather than a leak: the game is allowed to call this again, and 512 KB a
+// time is a leak big enough to see.
+static uint32_t *push_buffer_create()
+{
+    push_buffer_free();
+
+    void *base = nullptr;
+    uint32_t bytes = PUSH_BYTES;
+    if (NtAllocateVirtualMemory(&base, 0, &bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) != KM_SUCCESS ||
+        !base) {
+        logc("[d3d] CreateDevice: %u KB of push buffer could not be allocated", PUSH_BYTES / 1024);
+        return nullptr;
+    }
+    // mmap hands back zeroed pages and VirtualAlloc did too, so this is redundant on both paths. It is here
+    // because "a fresh push buffer reads as zero" is something the game can rely on, and a promise should not
+    // rest on what an allocator happens to do.
+    memset(base, 0, bytes);
+    g_push_base = (uint32_t *)base;
+    g_push_dwords = bytes / sizeof(uint32_t); // page-rounded; PUSH_BYTES is already a whole number of pages
+    return g_push_base;
+}
+
+// Is this one of our cursors? Everything below does arithmetic on the cursor, and arithmetic on a pointer that
+// is not inside our allocation is not a bounds check -- it is undefined behaviour that usually reads as a
+// plausible answer. A cursor from anywhere else (a test's stand-in for the segment, a game that got a pointer
+// before this device existed) is passed through untouched instead of being compared against our address.
+static bool push_buffer_holds(const uint32_t *p)
+{
+    if (!p || !g_push_base) return false;
+    const uint64_t a = (uint64_t)(uintptr_t)p, base = (uint64_t)(uintptr_t)g_push_base;
+    return a >= base && a - base < (uint64_t)g_push_dwords * sizeof(uint32_t);
+}
+
+// Dwords between the cursor and the threshold, counted in 64 bits so that neither the subtraction nor the
+// comparison below can wrap. The console's own test is `put + Count + 16 >= threshold` evaluated on pointers,
+// and `put + Count` for a Count a game can put in a register leaves the segment -- and, on a 32-bit host, the
+// whole address space -- before the comparison happens, so a request of a few megabytes wrapped round and
+// compared as though it were a small one. The numbers are the console's; only the arithmetic is not.
+static uint64_t push_dwords_to_threshold(const uint32_t *put)
+{
+    const int64_t d = (int64_t)(uintptr_t)dev_field<uint32_t *>(DEV_THRESHOLD) - (int64_t)(uintptr_t)put;
+    return d > 0 ? (uint64_t)d : 0;
+}
+
+// Would `count` dwords, plus the console's 16 guard dwords, fit between this cursor and the threshold? True
+// means the caller can write every dword it asked for and still leave the guard alone, which is what makes the
+// answer a real write cursor rather than a promise. Because the threshold sits 64 KB below the end of the
+// segment, this also guarantees that everything the caller writes is inside the allocation.
+static bool push_fits(const uint32_t *put, uint32_t count)
+{
+    return push_buffer_holds(put) && push_dwords_to_threshold(put) > (uint64_t)count + PUSH_GUARD;
+}
+
+// The console's rewind, spelled out here because pb_reset() is still a named no-op (A4): draining the segment
+// means moving DEV_PUT back to its base, which is exactly what the Windows pb_reset() does with it.
+static uint32_t *push_rewind()
+{
+    pb_flush();
+    pb_reset();
+    if (g_push_base) dev_field<uint32_t *>(DEV_PUT) = g_push_base;
+    return dev_field<uint32_t *>(DEV_PUT);
+}
+
+// The one answer both push-buffer entry points need: a cursor with room for `count` dwords, or null. The
+// console's order is drain, rewind, retry -- and it never grows the buffer, because the segment is mapped at a
+// fixed address and a push that overran it was a bug to find rather than a buffer to resize.
+static uint32_t *push_cursor(uint32_t count, const char *who)
+{
+    uint32_t *put = dev_field<uint32_t *>(DEV_PUT);
+    if (!push_buffer_holds(put)) return put; // no device, or a cursor that is not ours: hands back what it found
+    if (push_fits(put, count)) return put;
+
+    put = push_rewind();
+    if (push_fits(put, count)) return put;
+
+    // A request larger than the whole segment. There is no in-bounds answer: every pointer with that much room
+    // behind it is outside the allocation, and handing one back is the fault this allocation exists to remove.
+    // Null is reported instead, once, because a caller asking for this was going to run over the loader
+    // whatever it was told, and a fault on its first write is a better outcome than a silent one.
+    static bool noted = false;
+    if (!noted) {
+        noted = true;
+        logc("[d3d] %s: %u dwords is more than the %u KB push buffer holds", who, count, PUSH_BYTES / 1024);
+    }
+    return nullptr;
 }
 
 // Direct3D_CreateDevice: the entry point the game calls to get a device. The console's implementation
@@ -311,14 +463,31 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
     }
 
     // The console allocates the device object at a fixed address (0x00279B50) and the push buffer at
-    // another fixed address. The loader keeps the same layout in g_device_object (device_posix.cpp).
+    // another fixed address. The loader keeps the device object where the console had it
+    // (g_device_object, device_posix.cpp); the push buffer is the one thing below that is not at a fixed
+    // address, because the console's two are not mapped here.
     // We initialise the fields the game reads directly.
     DeviceObject *dev = device_object();
     memset(dev->bytes, 0, DEVICE_SIZE);
 
-    // Push buffer pointers (placeholder; real push buffer is A6)
-    dev_field<uint32_t *>(DEV_PUT) = (uint32_t *)0x00200000;
-    dev_field<uint32_t *>(DEV_THRESHOLD) = (uint32_t *)0x00210000;
+    // The push buffer: really allocated, really writable, and not yet interpreted.
+    //
+    // The Windows port gave these to VirtualAlloc -- the base in DEV_PUT, and 64 KB below the end in
+    // DEV_THRESHOLD -- and a game that follows the console's protocol writes its command words through the
+    // pointer it is handed there. This file used to store the console's own two addresses instead (0x00200000
+    // and 0x00210000), and neither is mapped in this process: the first word a game wrote was a segfault,
+    // not a wrong picture. What is here now is a real allocation from this loader's own memory layer, the same
+    // size and the same 64 KB of headroom the Windows port used.
+    //
+    // What it is not: a push buffer that works. Nothing reads the words in it. pb_flush() and pb_reset() are
+    // still named no-ops -- interpreting the command stream and driving NV2A from it is the A6/A4 work this
+    // port has not done -- so a game may write commands here for as long as it likes, none of it will fault,
+    // and all of it is discarded. What is real is the memory, the cursor, the threshold and the space
+    // accounting: the game gets writable memory at the address it was told to write to, and the checks below
+    // keep that true for as long as the device lives.
+    if (!push_buffer_create()) return D3DERR_NOTAVAILABLE; // no segment: no writable cursor to hand out
+    dev_field<uint32_t *>(DEV_PUT) = g_push_base;
+    dev_field<uint32_t *>(DEV_THRESHOLD) = g_push_base + g_push_dwords - PUSH_HEADROOM; // keep 64 KB headroom
 
     // Back buffer scale (read by GetBackBufferScale)
     dev_field<float>(0x096C) = 1.0f;
@@ -355,49 +524,52 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
     // The game expects ppDevice to point at the device object.
     if (ppDevice) *ppDevice = dev->bytes;
 
-    logf("[d3d] device object %p, push buffer placeholder, back buffer %ux%u, presentation interval %u",
-         dev->bytes, width, height, pp->FullScreen_PresentationInterval);
+    logf("[d3d] device object %p, push buffer %p (%u KB, %u dwords, threshold %p), back buffer %ux%u, "
+         "presentation interval %u",
+         dev->bytes, (void *)g_push_base, PUSH_BYTES / 1024, g_push_dwords,
+         (void *)dev_field<uint32_t *>(DEV_THRESHOLD), width, height, pp->FullScreen_PresentationInterval);
 
     return D3D_OK;
 }
 
-// Release on the device is a call the game makes once at shutdown. The device is the singleton at
-// ADDR_DEVICE_OBJECT and lives until the process ends, so there is nothing to free; returning 1 keeps
-// the reference count the caller expects without pretending otherwise.
+// Release on the device is a call the game makes once at shutdown. The device *object* stays: it is the
+// singleton at ADDR_DEVICE_OBJECT and game code reaches its fields by absolute address, so there is nothing to
+// do about it and nothing to free. The push buffer is a different matter -- that is an allocation this port
+// made, and this is where it goes back; a released device still holding half a megabyte is a leak the game
+// cannot see. The cursor goes with it, so a push asked for after the release gets the null answer rather than
+// an address that has been unmapped. Returning 1 keeps the reference count the caller expects without
+// pretending anything else is outstanding.
 uint32_t XD3D_STDCALL D3DDevice_Release()
 {
+    push_buffer_free();
     return 1;
 }
 
 // ---- push buffer ----
 
-// MakeRequestedSpace: hand back where the caller may write. The HLE queues nothing, so the answer is
-// simply the write pointer -- but it is read from the device object rather than from our own shadow,
-// because that is where the game expects the cursor to live.
+// MakeRequestedSpace: hand back where the caller may write. The HLE queues nothing, so the answer is simply
+// the write pointer -- but it is read from the device object rather than from our own shadow, because that is
+// where the game expects the cursor to live.
+//
+// The size the caller asked for is checked against the threshold, because DEV_THRESHOLD is the field the
+// console kept for exactly this: a request that would not fit before the threshold is answered by draining the
+// segment and rewinding, which is what pb_reset() is for. The two arguments are a minimum and a wanted size,
+// and the larger of the two is the one that has to fit. Ignoring them (as this did) returned a cursor with
+// whatever room the cursor happened to have left, which is a write the caller was not told it could make.
 uint32_t *XD3D_STDCALL D3D_MakeRequestedSpace(uint32_t MinimumSpace, uint32_t RequestedSpace)
 {
-    (void)MinimumSpace;
-    (void)RequestedSpace;
     pb_flush();
-    pb_reset();
-    return dev_field<uint32_t *>(DEV_PUT);
+    return push_cursor(MinimumSpace > RequestedSpace ? MinimumSpace : RequestedSpace, "MakeRequestedSpace");
 }
 
-// BeginPush asks the same question with room for a whole primitive. The threshold test is kept because it
-// is what decides whether the buffer is rewound first: a caller handed a pointer with less than
-// Count + 16 dwords left would run past the guard the console keeps there.
+// BeginPush asks the same question with room for a whole primitive, so the room is checked the same way: the
+// console rewinds when the primitive would not fit before the threshold, and only hands back a cursor if the
+// primitive fits after the rewind. Both pointers are null until the device exists, and comparing them then
+// would be a comparison of two unrelated pointers, so that case answers null -- the honest answer -- rather
+// than doing arithmetic on it.
 uint32_t *XD3D_STDCALL D3DDevice_BeginPush(uint32_t Count)
 {
-    uint32_t *put = dev_field<uint32_t *>(DEV_PUT);
-    uint32_t *threshold = dev_field<uint32_t *>(DEV_THRESHOLD);
-    // Both are null until the device exists. Comparing them then would be a comparison of two unrelated
-    // pointers, so the test is skipped and the null pointer is handed back as the honest answer.
-    if (put && threshold && put + Count + 16 >= threshold) {
-        pb_flush();
-        pb_reset();
-        put = dev_field<uint32_t *>(DEV_PUT);
-    }
-    return put;
+    return push_cursor(Count, "BeginPush");
 }
 
 // EndPush: the caller's pointer IS the new write cursor, so it is stored before the flush. Flushing first

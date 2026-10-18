@@ -1,4 +1,23 @@
 // Stream decoder implementation: WMA/XMV decode for DirectSound streams.
+//
+// BUILT ONLY WHEN FFMPEG IS PRESENT. CMakeLists.txt adds this file to blackcore only inside
+// `if(HAVE_FFMPEG)`. Without libavcodec-dev:i386 this translation unit is not compiled at all -- it is not
+// compiled into a stub, and it is not compiled into something that quietly does nothing. It is absent.
+//
+// Why that matters rather than being a tidy-up: the layer below it, src/audio/decoder_posix.cpp, still builds
+// without FFmpeg. It guards on HAVE_FFMPEG_HEADERS and takes a stub path where every entry point returns
+// null. So on a machine without FFmpeg the loader still links, and audio_open/video_open still exist as
+// symbols, but they return null and nothing decodes. This file sits on top of those stubs and would wrap
+// them into a plausible-looking streaming API that produces no samples and no frames.
+//
+// Compiling it unconditionally bought exactly nothing: nothing calls these seven functions, so the build
+// emitted seven -Wunused-function warnings and the presence of a source file named stream_decode_posix.cpp
+// in the tree read as "streaming is implemented". It is not, and with FFmpeg absent it cannot be.
+//
+// Therefore: no video playback, no WMA audio decode, and no XMV video decode exist in this build. The
+// absence of warnings here is the build telling the truth about the A9 decoder being off, not evidence that
+// anything about this file works. It has never been compiled against a real decoder on this machine and has
+// never produced audio or a frame.
 #include "audio/stream_decode_posix.h"
 
 #include "audio/decoder_posix.h"

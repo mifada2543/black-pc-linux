@@ -9,7 +9,6 @@
 // | Fire / Aim | left / right mouse button |
 // | Reload | R |
 // | Action (use, pick up) | E |
-#include "d3d/device_posix.h"
 // | Crouch | C |
 // | Grenade | G |
 // | Melee | F |
@@ -24,6 +23,7 @@
 #include "input/mouselook_posix.h"
 #include "input/input_detail_posix.h"
 
+#include "d3d/device_posix.h"
 #include "platform/posix/log.h"
 
 #include <SDL2/SDL.h>
@@ -63,6 +63,14 @@ enum GameAction : int {
 
 namespace {
 
+// One place where a scancode becomes a binding key. SDL_Scancode and the project's key codes are two
+// different enums, and C++20 deprecates arithmetic between them; the cast says the addition is on the
+// integers they both stand for rather than on the enumerators themselves.
+static constexpr uint16_t key_of(SDL_Scancode sc)
+{
+    return static_cast<uint16_t>(KEY_SDL_BASE + static_cast<uint32_t>(sc));
+}
+
 struct ActionDef {
     const char *ini;
     const char *name;
@@ -71,25 +79,25 @@ struct ActionDef {
 };
 
 ActionDef g_actions[GA_COUNT] = {
-    {"move_forward", "MOVE FORWARD", GA_MOVE_FORWARD, {KEY_SDL_BASE + SDL_SCANCODE_W, KEY_NONE}},
-    {"move_back", "MOVE BACK", GA_MOVE_BACK, {KEY_SDL_BASE + SDL_SCANCODE_S, KEY_NONE}},
-    {"move_left", "MOVE LEFT", GA_MOVE_LEFT, {KEY_SDL_BASE + SDL_SCANCODE_A, KEY_NONE}},
-    {"move_right", "MOVE RIGHT", GA_MOVE_RIGHT, {KEY_SDL_BASE + SDL_SCANCODE_D, KEY_NONE}},
+    {"move_forward", "MOVE FORWARD", GA_MOVE_FORWARD, {key_of(SDL_SCANCODE_W), KEY_NONE}},
+    {"move_back", "MOVE BACK", GA_MOVE_BACK, {key_of(SDL_SCANCODE_S), KEY_NONE}},
+    {"move_left", "MOVE LEFT", GA_MOVE_LEFT, {key_of(SDL_SCANCODE_A), KEY_NONE}},
+    {"move_right", "MOVE RIGHT", GA_MOVE_RIGHT, {key_of(SDL_SCANCODE_D), KEY_NONE}},
     {"look", "LOOK", GA_LOOK, {KEY_NONE, KEY_NONE}}, // Mouse, no key binding
     {"fire", "FIRE", GA_FIRE, {KEY_LBUTTON, KEY_NONE}}, // Left mouse
     {"aim", "AIM", GA_AIM, {KEY_RBUTTON, KEY_NONE}},    // Right mouse
-    {"reload", "RELOAD", GA_RELOAD, {KEY_SDL_BASE + SDL_SCANCODE_R, KEY_NONE}},
-    {"action", "ACTION", GA_ACTION, {KEY_SDL_BASE + SDL_SCANCODE_E, KEY_NONE}},
-    {"crouch", "CROUCH", GA_CROUCH, {KEY_SDL_BASE + SDL_SCANCODE_C, KEY_NONE}},
-    {"grenade", "GRENADE", GA_GRENADE, {KEY_SDL_BASE + SDL_SCANCODE_G, KEY_NONE}},
-    {"melee", "MELEE", GA_MELEE, {KEY_SDL_BASE + SDL_SCANCODE_F, KEY_NONE}},
+    {"reload", "RELOAD", GA_RELOAD, {key_of(SDL_SCANCODE_R), KEY_NONE}},
+    {"action", "ACTION", GA_ACTION, {key_of(SDL_SCANCODE_E), KEY_NONE}},
+    {"crouch", "CROUCH", GA_CROUCH, {key_of(SDL_SCANCODE_C), KEY_NONE}},
+    {"grenade", "GRENADE", GA_GRENADE, {key_of(SDL_SCANCODE_G), KEY_NONE}},
+    {"melee", "MELEE", GA_MELEE, {key_of(SDL_SCANCODE_F), KEY_NONE}},
     {"next_weapon", "NEXT WEAPON", GA_NEXT_WEAPON, {KEY_WHEEL_DOWN, KEY_NONE}},
     {"prev_weapon", "PREV WEAPON", GA_PREV_WEAPON, {KEY_WHEEL_UP, KEY_NONE}},
-    {"fire_mode", "FIRE MODE", GA_FIRE_MODE, {KEY_SDL_BASE + SDL_SCANCODE_Z, KEY_NONE}},
-    {"suppressor", "SUPPRESSOR", GA_SUPPRESSOR, {KEY_SDL_BASE + SDL_SCANCODE_Q, KEY_NONE}},
-    {"health_pack", "HEALTH PACK", GA_HEALTH_PACK, {KEY_SDL_BASE + SDL_SCANCODE_X, KEY_NONE}},
-    {"objectives", "OBJECTIVES", GA_OBJECTIVES, {KEY_SDL_BASE + SDL_SCANCODE_SPACE, KEY_NONE}},
-    {"pause", "PAUSE", GA_PAUSE, {KEY_SDL_BASE + SDL_SCANCODE_ESCAPE, KEY_NONE}},
+    {"fire_mode", "FIRE MODE", GA_FIRE_MODE, {key_of(SDL_SCANCODE_Z), KEY_NONE}},
+    {"suppressor", "SUPPRESSOR", GA_SUPPRESSOR, {key_of(SDL_SCANCODE_Q), KEY_NONE}},
+    {"health_pack", "HEALTH PACK", GA_HEALTH_PACK, {key_of(SDL_SCANCODE_X), KEY_NONE}},
+    {"objectives", "OBJECTIVES", GA_OBJECTIVES, {key_of(SDL_SCANCODE_SPACE), KEY_NONE}},
+    {"pause", "PAUSE", GA_PAUSE, {key_of(SDL_SCANCODE_ESCAPE), KEY_NONE}},
 };
 
 uint16_t g_keys[GA_COUNT][2];
@@ -175,7 +183,7 @@ bool load_ini(const char *key, const char *value)
                 else if (strcasecmp(tok, "MMB") == 0 || strcasecmp(tok, "MIDDLE MOUSE") == 0) code = KEY_MBUTTON;
                 else {
                     SDL_Scancode sc = SDL_GetScancodeFromName(tok);
-                    if (sc != SDL_SCANCODE_UNKNOWN) code = KEY_SDL_BASE + sc;
+                    if (sc != SDL_SCANCODE_UNKNOWN) code = key_of(sc);
                 }
                 if (code != KEY_NONE) g_keys[i][s] = code;
                 tok = strtok(nullptr, ",");
@@ -287,8 +295,8 @@ bool capture_poll(bool focus, int wheel)
         if (kb[sc]) {
             for (int i = 0; i < GA_COUNT; i++)
                 for (int s = 0; s < 2; s++)
-                    if (g_keys[i][s] == KEY_SDL_BASE + sc) g_keys[i][s] = KEY_NONE;
-            g_keys[g_capture_action][g_capture_slot] = KEY_SDL_BASE + sc;
+                    if (g_keys[i][s] == key_of(sc)) g_keys[i][s] = KEY_NONE;
+            g_keys[g_capture_action][g_capture_slot] = key_of(sc);
             g_capturing = false;
             g_capture_change = true;
             return true;
@@ -478,6 +486,14 @@ void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16
     }
 }
 
+// A pad-poll proxy, not the player update this is meant to report. mouselook_play_frame() is stamped at
+// each pad poll in this port, because the authoritative source -- the player's view update, which menus,
+// pauses and cutscenes do not run -- is not built yet (see mouselook_set_frame() in
+// input/mouselook_posix.cpp). So the comparison below asks "was the pad polled during the current frame",
+// which holds in menus too: the menu branch in apply() still runs while playing, and this is recorded
+// rather than papered over. The frame it compares against is also still 0, because nothing calls
+// xd3d::frame_count_increment() yet, so this returns false for now. Once the player-update hook and a frame
+// driver exist, mouselook_play_frame() should be stamped from the hook and this loses the caveat.
 bool in_play()
 {
     return mouselook_play_frame() == xd3d::frame_count() && xd3d::frame_count() > 0;

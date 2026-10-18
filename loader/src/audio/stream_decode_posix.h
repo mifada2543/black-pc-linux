@@ -1,6 +1,12 @@
 // Stream decoder: WMA/XMV decode for DirectSound streams.
-// Wraps FFmpeg decoder (decoder_posix.cpp) to decode stream packets on the fly.
-// Integrates with audio_out mixer for playback.
+// Wraps the FFmpeg decoder layer (audio/decoder_posix.cpp) to decode stream packets on the fly.
+// Integrates with the audio_out mixer for playback.
+//
+// These declarations are NOT backed by a working implementation in a build without FFmpeg. decoder_posix
+// guards on HAVE_FFMPEG_HEADERS and falls back to stubs that return null, and stream_decode_posix.cpp is
+// only added to the build when HAVE_FFMPEG is true. So on this machine there is no object behind any
+// declaration below -- there is no WMA audio decode and no XMV video decode, and a caller that obtained
+// this header has no evidence either is available. Do not read the API surface as working playback.
 #pragma once
 
 #include "audio/decoder_posix.h"

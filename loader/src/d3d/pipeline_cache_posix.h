@@ -1,10 +1,16 @@
 // Pipeline cache: turns (vertex format + shaders + render state) -> VkPipeline.
-// This is the A4 bridge: the game sets FVF/vertex shader/pixel shader + render state,
+// This is the intended A4 bridge: the game sets FVF/vertex shader/pixel shader + render state,
 // and a draw call needs the right graphics pipeline. The cache keys on everything
-// that affects the pipeline and reuses identical pipelines.
+// that affects the pipeline and would reuse identical pipelines.
+//
+// NOT WIRED. As of this writing nothing calls any of it -- see the leading comment in
+// pipeline_cache_posix.cpp. No draw row and no HLE entry reaches get_or_create or pipeline_cache,
+// so none of this has produced a drawn pixel. Read it as scaffolding, not as a working path.
 //
 // FVF (fixed-function vertex format) convention: handle bit 0 == 0.
 // Vertex shader convention: handle bit 0 == 1 (from vertex_program_create).
+// Pixel shader handle convention: unknown -- CreatePixelShader is not implemented on this port, so
+// there is no store and nothing here can resolve a non-zero pixel_shader_handle.
 #pragma once
 
 #include "d3d/vertex_posix.h"
@@ -27,7 +33,7 @@ struct PipelineKey {
     uint32_t vertex_input_mask = 0;     // which vertex registers are fed
 
     // Pixel side
-    uint32_t pixel_shader_handle = 0;   // pixel shader handle from CreatePixelShader
+    uint32_t pixel_shader_handle = 0;   // handle the game passed to SetPixelShader; unresolvable here (no store)
     uint32_t tex_cube_mask = 0;         // which stages sample cube maps
 
     // Render state that reaches the pipeline (not the shader)
@@ -194,7 +200,8 @@ private:
 PipelineCache &pipeline_cache();
 
 // Build PipelineKey from current device state + shaders.
-// Used by draw path when a draw call is issued.
+// Intended to be called by the draw path when a draw call is issued. It is not called today: there is no
+// caller, so this is a shape the draw path is expected to take up, not one it takes.
 PipelineKey build_pipeline_key(
     uint32_t fvf_code,
     uint32_t vertex_shader_handle,

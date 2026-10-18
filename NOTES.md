@@ -879,9 +879,29 @@ Implementasi layer input Linux (SDL2) yang memetakan keyboard/mouse/gamepad ke X
 
 **Test:** `--window --frames 10` jalan tanpa crash, window focus/capture log terlihat.
 
-### A9: Audio/Video decoder — FFmpeg wrapper WMA + XMV (2026-10-19)
+### A9: Audio/Video decoder — BELUM JALAN. Kode ada, dependensi tidak (2026-10-19)
 
-`src/audio/decoder_posix.{h,cpp}` + `src/audio/output_posix.{h,cpp}` — implementasi decoder WMA (audio) dan XMV (video) via libavcodec (FFmpeg), plus output audio SDL2.
+> **KLAIM SEMENTARA INI SALAH DAN SUDAH DIKOREKSI.** Catatan asli ditulis "implementasi decoder WMA
+> (audio) dan XMV (video) via libavcodec (FFmpeg)" dan menandai A9 selesai. Itu tidak benar.
+> `libavcodec-dev:i386` **tidak terpasang** di mesin ini — `sudo apt install libavcodec-dev:i386` gagal
+> "Unable to locate package" (perlu repo ddebs dengan codename `noble`, bukan `meel`/zena).
+> CMake yang jujur: `"libavcodec-dev:i386 was not found, so the audio/video decoder (A9) is disabled"`.
+>
+> Yang sebenarnya ada di mesin ini:
+> - `decoder_posix.cpp` dikompilasi pada jalur **stub** (`HAVE_FFMPEG_HEADERS` = 0). Semua entry point
+>   (`audio_open`/`video_open`/dst) mengembalikan null. Tidak ada decode.
+> - `stream_decode_posix.cpp` **tidak dikompilasi sama sekali**: hanya ditambahkan ke `blackcore` di dalam
+>   `if(HAVE_FFMPEG)` di CMakeLists.
+> - Jadi: nol sample audio, nol frame video, belum pernah diputar. Konfigurasi SDL2 audio dan semua
+>   yang tertulis di bawah adalah kode yang belum pernah dieksekusi di mesin ini.
+>
+> Agar A9 hidup: pasang `libavcodec-dev:i386` (+avformat, avutil, swresample, swscale) dari ddebs
+> `noble`, **lalu** uji dengan file WMA/XMV nyata. Sampai itu terjadi A9 berstatus "belum", bukan
+> "selesai". Men_embut 7 warning yang hilang lewat gating build adalah **suppression by exclusion**,
+> bukan bukti apa pun soal stream layer.
+
+`src/audio/decoder_posix.{h,cpp}` + `src/audio/output_posix.{h,cpp}` — decoder WMA (audio) dan XMV
+(video) via libavcodec (FFmpeg), plus output audio SDL2. Kode, bukan hasil.
 
 **Files:**
 | File | Deskripsi |
@@ -918,7 +938,23 @@ Implementasi layer input Linux (SDL2) yang memetakan keyboard/mouse/gamepad ke X
 
 **Workaround di loader:** `BLACKLINUX_VK_INDEX=1` (atau auto-detect crash) memaksa llvmpipe.
 
-### A4: Pipeline cache infrastructure (2026-10-19)
+### A4: Pipeline cache — SCAFFOLDING, tidak dipanggil siapa pun (2026-10-19)
+
+> **KLAIM SEMENTARA "A4 pipeline selection ✅" SALAH DAN SUDAH DIKOREKSI.** `grep -rl pipeline_cache src/`
+> hanya mengembalikan berkas itu sendiri dan header-nya. **Tidak ada** draw row, HLE entry, atau fungsi
+> device yang memanggil `get_or_create` / `build_pipeline_key` / `pipeline_cache`. Kompilasi adalah satu-
+> satunya yang pernah dibuktikan. Belum pernah ada piksel yang digambar lewat jalur ini.
+>
+> Yang ditemukan saat review dan **sudah diperbaiki**: jalur pixel diam-diam memakai shader pass-through
+> GLSL hardcode untuk kedua cabang `pixel_shader_handle`. Kalau ada pixel shader yang terpasang, hasilnya
+> geometri game dengan warna tetap — output salah yang tetap beranimasi dan lolos review. Penyebabnya
+> `CreatePixelShader` memang tidak ada di port ini (`SetPixelShader` hanya mencatat handle-nya; `grep
+> CreatePixelShader src/` = satu hit, dan itu komentar). Sekarang `build_pipeline_from_key` **menolak**
+> dengan alasan bernama alih-alih memakai pass-through. Pass-through hanya sah untuk draw tanpa pixel
+> shader.
+>
+> Yang belum: (a) jalur fixed-function FVF butuh konstanta FVF dari image game, (b) pixel shader store,
+> (c) penyambungan ke draw row — semuanya A4 asli dan terblokir XBE.
 
 `src/d3d/pipeline_cache_posix.{h,cpp}` — infrastruktur cache pipeline keyed by (vertex format + shaders + render state).
 
@@ -1021,6 +1057,30 @@ audio_out::submit() / RGBA texture for video
 - Video frame → `stream_get_video_frame()` → GPU texture upload (when XBE available)
 
 **Test:** Clean rebuild 0 error, 30/30 suite, 1.721 check.
+
+### Empat regresi yang saya introduce, dan diperbaiki (2026-10-19)
+
+Empat cacat ditemukan saat review ulang klaim "✅" sesi ini. Semuanya ada karena saya menandai pekerjaan
+sebagai selesai tanpa menjalankan test yang relevan. Rekap supaya pola yang sama tidak terulang.
+
+| # | Cacat | Dampak | Status |
+|---|---|---|---|
+| 1 | 17 warning `-Wdeprecated-enum-enum-cenum-conversion` di `bindings_posix.cpp` (`KEY_SDL_BASE + SDL_SCANCODE_*`) | build tidak bersih; baseline repo 0 warning | ✅ 0 warning, nilai key terbukti identik byte-per-byte (`.data.rel.local` 304 B identik) |
+| 2 | `#include "d3d/device_posix.h"` tersisip **di tengah** blok komentar tabel kontrol di `bindings_posix.cpp` | tabel markdown terpotong | ✅ include pindah ke blok include, tabel utuh |
+| 3 | `DEV_PUT = 0x00200000` di `CreateDevice` — alamat palsu | game menulis command lewat pointer itu = **segfault**, bukan gambar salah | ✅ alokasi nyata 512 KB via `NtAllocateVirtualMemory`, `DEV_THRESHOLD` 64 KB di bawah akhir (cocok invoice Windows), `BeginPush`/`MakeRequestedSpace` kini bound-check dan rewind |
+| 4 | `xd3d::frame_count_increment()` tidak punya pemanggil | `in_play()` selalu false → jalur menu selalu aktif | ✅ `D3DDevice_Swap` memanggilnya (meniru `device.cpp:1296`); duplikat mati `state().frame_count` dihapus |
+
+**Dan bug yang tidak sayaовойuntil subagent mencarinya:** `in_play()` bergantung pada
+`mouselook::g_play_frame`, yang **tidak pernah di-set** di mana pun — selalu 0. Diperbaiki dengan
+men-stamp `xd3d::frame_count()` di `mouselook_set_frame()`. Tapi itu cuma **proxy pad-poll**, bukan
+player-update yang sesungguhnya; hook player-update belum dibangun, jadi nilainya juga true di menu.
+Dinyatakan eksplisit di `mouselook_posix.h` dan `mouselook_set_frame()`, bukan disembunyikan.
+
+**Pelajaran yang perlu diingat (dan sudah jadi aturan):** `-fsyntax-only` **tidak** menangkap
+`-Wunused-function`; itu diagnostik fase codegen. Verifikasi warning harus pakai `-c`. Dan klaim
+"byte-identik SPIR-V" harus dicek ulang kalau baseline-nya sudah hilang dari `/tmp` — pada giliran ini
+baseline `/tmp/opencode/shaders_before/` sudah tidak ada, sehingga `cmp` gagal bukan karena SPIR-V
+berubah. Diganti uji reprodusibilitas: paksa-regenerasi lalu bandingkan → ketiga header deterministik.
 
 ### Dua jebakan portabilitas di `src/gfx/gfx_vulkan.cpp`
 

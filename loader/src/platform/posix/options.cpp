@@ -21,3 +21,13 @@ bool get_mouse_invert()
 {
     return g_options ? g_options->mouse_invert : false;
 }
+
+bool get_reverb()
+{
+    return g_options ? g_options->reverb : true;
+}
+
+float get_reverb_gain()
+{
+    return g_options ? g_options->reverb_gain : 1.0f;
+}

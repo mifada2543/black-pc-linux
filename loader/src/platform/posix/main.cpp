@@ -56,16 +56,20 @@ void usage()
             "  --xbe <path>    XBE to run (default game/default.xbe)\n"
             "  --log <path>    log file (default blacklinux.log)\n"
             "  --hdd <path>    writable folder for \\Device\\Harddisk0 (default $XDG_DATA_HOME/blacklinux)\n"
+            "  (no mode)       run the game in a window, with graphics, input and audio; close the window\n"
+            "                  to end the run\n"
             "  --doctor        report what this machine can and cannot do, then exit\n"
-            "  --probe         enter the entry point, wait --timeout seconds, then report how far it got\n"
+            "  --probe         headless: enter the entry point, wait --timeout seconds, then report how far it got\n"
             "                  (set BLACKLINUX_TRACE=1 to record which D3D entries it called)\n"
             "  --window        open a window, present --frames frames into it, then exit\n"
             "  --frames <n>    frames to present in --window mode (default 60)\n"
-            "  --size <WxH>    window size for --window (default: the back buffer the game asked for)\n"
+            "  --size <WxH>    window size for --window and the game run (default: the back buffer the game asked for)\n"
             "  --info          print the image and exit without mapping it\n"
             "  --timeout <s>   --probe timeout in seconds (default 15)\n"
             "  --trace         detail lines and every stub call on the console too\n"
             "  --strict        an unimplemented kernel call is fatal instead of logged\n"
+            "  --no-reverb     mix no room reverb (the I3DL2 send on mix bin 11)\n"
+            "  --reverb-gain <k>  level of that reverb (default 1.0)\n"
             "  --version, --help\n");
 }
 
@@ -136,6 +140,12 @@ bool parse_args(int argc, char **argv, Options &o)
             o.trace = true;
         } else if (!strcmp(a, "--strict")) {
             o.strict = true;
+        } else if (!strcmp(a, "--no-reverb")) {
+            o.reverb = false;
+        } else if (!strcmp(a, "--reverb-gain")) {
+            const char *v = need("--reverb-gain");
+            if (!v) return false;
+            o.reverb_gain = (float)atof(v);
         } else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
             o.help = true;
         } else if (!strcmp(a, "--version")) {
@@ -259,9 +269,43 @@ int run(const Options &o)
         return 0;
     }
 
+    // The game run opens a window before the game's first instruction. The game's first D3D call is
+    // CreateDevice and the swapchain it asks for is made from a surface, so a run with no window has no
+    // device: --probe is that run, and it exists to find out how far the code gets on a machine with no
+    // display. Everything else is the game with a window, and closing the window ends it (D3DDevice_Swap
+    // turns the close into the same exit request HalReturnToFirmware makes).
+    const bool windowed = !o.probe;
+    if (windowed) {
+        const uint32_t want_w = o.window_width ? o.window_width : xd3d::state().display_width;
+        const uint32_t want_h = o.window_height ? o.window_height : xd3d::state().display_height;
+        logc("window: opening %ux%u", want_w, want_h);
+        if (!platform::window_open(want_w, want_h, "BLACK")) {
+            logc("window: %s", platform::window_last_error());
+            fprintf(stderr, "blacklinux: %s (--probe runs without a window)\n", platform::window_last_error());
+            log_close();
+            return 1;
+        }
+        if (!gfx::init()) {
+            logc("window: gfx::init failed: %s", gfx::last_error());
+            fprintf(stderr, "blacklinux: gfx init failed: %s\n", gfx::last_error());
+            platform::window_close();
+            log_close();
+            return 1;
+        }
+        if (!platform::timing_init())
+            logc("window: timing init failed (non-fatal, continuing)");
+        else
+            logc("window: timing initialised (pinned=%d, host TSC %llu Hz)", platform::timing_cpu_pinned(),
+                 platform::timing_host_tsc_frequency());
+    }
+
     if (!boot_prepare(o.xbe, x, img, rep, err, o.hdd)) {
         fprintf(stderr, "blacklinux: %s\n", err.c_str());
         logc("boot failed: %s", err.c_str());
+        if (windowed) {
+            platform::timing_shutdown();
+            platform::window_close();
+        }
         log_close();
         return 1;
     }
@@ -280,12 +324,14 @@ int run(const Options &o)
     int code = 0;
     switch (outcome) {
     case BootOutcome::Returned:
-        logc("boot: the game's entry point returned (this does not happen on the real image)");
+        logc("boot: the entry point returned and no game thread is left; the run is over");
         break;
     case BootOutcome::TimedOut:
-        // The normal state for the real game: it is inside its own main loop. Say where the boot thread's
-        // stack was, because that is the first thing anyone wants when a crash happens later.
-        logc("boot: still inside the game after %u s; boot thread stack top 0x%08x", o.timeout_s, stack_top);
+        // The normal state for the real game: it is inside its own main loop, on a thread its entry point
+        // created. Say where that thread's stack was, because that is the first thing anyone wants when a
+        // crash happens later.
+        logc("boot: still inside the game after %u s; a live game thread's stack top is 0x%08x", o.timeout_s,
+             stack_top);
         break;
     case BootOutcome::Exited:
         // The game asked to leave: HalReturnToFirmware, HalInitiateShutdown or KeBugCheck. Its exit code
@@ -308,6 +354,21 @@ int run(const Options &o)
 
     if (o.strict && rep.thunks.stubbed)
         logc("strict: %d kernel imports are logging stubs", rep.thunks.stubbed);
+
+    // The game's threads can still be running when the loader leaves: --probe times out with the game
+    // inside its own loop, and a thread that asked to exit is parked while its siblings keep going. The
+    // image must not be unmapped under them -- that was the "unhandled exception" that used to end every
+    // real-image run. The address space dies whole a moment later, so the mapping is abandoned instead.
+    img.abandon();
+
+    // The window is closed after the image is abandoned, not before: a game thread parked on an
+    // unimplemented call is still there, and tearing the surface down under a Swap it might still make would
+    // be a crash in the last line of the log. The address space goes a moment later anyway.
+    if (windowed) {
+        platform::timing_shutdown();
+        platform::window_close();
+    }
+
     log_close();
     return code;
 }

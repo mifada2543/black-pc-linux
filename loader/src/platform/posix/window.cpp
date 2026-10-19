@@ -31,6 +31,7 @@
 
 #include "gfx/gfx_vulkan.h"
 #include "platform/posix/log.h"
+#include "platform/posix/timing.h"
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -48,6 +49,10 @@ static SDL_Window *g_window = nullptr;
 static char g_last_error[256] = "";
 static bool g_size_changed = false;
 static uint32_t g_frames = 0;
+// The swapchain image the current frame is drawing into. swapchain_acquire chooses it, and the present has
+// to be the same one: passing a constant 0 presented image 0 while the acquire semaphore belonged to
+// another image, which is a frame the GPU never finished with.
+static uint32_t g_current_image = 0;
 static bool g_has_focus = false;
 static bool g_mouse_captured = false;
 static int g_mouse_wheel = 0;
@@ -259,6 +264,7 @@ bool window_begin_frame()
         snprintf(g_last_error, sizeof g_last_error, "acquire: %s", e ? e : "(no detail)");
         return false;
     }
+    g_current_image = idx;
 
     gfx::set_render_target(gfx::swapchain_image(idx), nullptr);
     if (!gfx::ready()) {
@@ -272,20 +278,15 @@ bool window_begin_frame()
 gfx::Image *window_target()
 {
     if (!gfx::swapchain_alive()) return nullptr;
-    uint32_t idx = 0;
-    // The last acquired image is the one we're drawing into. swapchain_acquire writes it into a local
-    // in window_begin_frame and we don't keep it, so we ask gfx for the current one.
-    // The generation doesn't change until the frame is presented, so the index is still valid.
-    (void)idx; // idx_now removed
-    // gfx doesn't expose the last acquired index directly, but we know the frame is presenting the one
-    // we just acquired. For now, we assume the last image is the one. A more precise API could be added.
-    return gfx::swapchain_image(0);
+    // The image window_begin_frame acquired, not "the first one": with more than one image in the
+    // swapchain those are different pictures.
+    return gfx::swapchain_image(g_current_image);
 }
 
 bool window_end_frame()
 {
     if (!gfx::swapchain_alive()) return false;
-    if (!gfx::swapchain_present(0)) {
+    if (!gfx::swapchain_present(g_current_image)) {
         const char *e = gfx::last_error();
         snprintf(g_last_error, sizeof g_last_error, "present: %s", e ? e : "(no detail)");
         return false;
@@ -297,6 +298,31 @@ bool window_end_frame()
 uint32_t window_frames()
 {
     return g_frames;
+}
+
+bool window_present_game_frame(bool *closed)
+{
+    if (closed) *closed = false;
+    if (!g_window) return false;
+
+    // Events first. It is what makes closing the window a request to leave rather than a frame that never
+    // ends, and it is also what keeps SDL's keyboard, mouse and pad state current for the input layer: SDL
+    // updates those from the event queue, not from the hardware directly.
+    if (!window_pump_events()) {
+        if (closed) *closed = true;
+        return false;
+    }
+
+    const bool shown = window_end_frame();
+
+    // The console's Swap waits for the next field, and that wait is the game's frame rate: timing_wait_vblank
+    // is the 59.94 Hz clock the rest of the port already paces --window on.
+    timing_wait_vblank();
+
+    // Open the next frame on the next image, so the game's next Clear or draw has somewhere to go. A failed
+    // begin (minimised window, surface that went away) is not fatal: the next Swap tries again.
+    window_begin_frame();
+    return shown;
 }
 
 // Window focus state

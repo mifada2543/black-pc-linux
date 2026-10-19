@@ -110,6 +110,17 @@ void XbeImage::unmap()
     file_data = nullptr;
 }
 
+void XbeImage::abandon()
+{
+    // Deliberately not unmap(): see the comment in image.h. The mapping stays for the game's threads to
+    // finish in, and the process exit reclaims it.
+    mapped = false;
+    map_addr = nullptr;
+    mapped_base = mapped_size = 0;
+    sections.clear();
+    file_data = nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // contiguous physical memory
 // ---------------------------------------------------------------------------

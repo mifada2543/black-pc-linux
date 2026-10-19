@@ -51,6 +51,8 @@ void get_all_hle_rows(const Hle **rows, size_t *count)
         combined.insert(combined.end(), r, r + c);
         r = input_rows(&c);
         combined.insert(combined.end(), r, r + c);
+        r = dsound_rows(&c);
+        combined.insert(combined.end(), r, r + c);
     }
     *rows = combined.data();
     *count = combined.size();

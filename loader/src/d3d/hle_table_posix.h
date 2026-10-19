@@ -42,6 +42,7 @@ const Hle *device_rows(size_t *count);
 const Hle *resource_rows(size_t *count);
 const Hle *draw_rows(size_t *count);
 const Hle *input_rows(size_t *count);
+const Hle *dsound_rows(size_t *count);
 
 // Combined table for hook installation (all HLE rows from all tables).
 void get_all_hle_rows(const Hle **rows, size_t *count);

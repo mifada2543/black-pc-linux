@@ -127,6 +127,18 @@ DeviceObject *device_object();
 // writes fields of it, so from here on the bytes are the game's.
 void device_object_attach(DeviceObject *object);
 
+// D3D_g_pDevice (0x0027BFF8): the D3D library's own pointer to the device it created. Game code reads it by
+// absolute address -- the vblank setup at 0x001FBDC6 stores the event through it -- so CreateDevice has to
+// keep it, and Release has to clear it. Before the image is mapped it names a variable of the same type, so
+// a test drives the same paths without an image.
+uint8_t **g_pdevice_slot();
+
+// Point every structure this layer shares with the game at its place in the mapped image: the device object,
+// the render-state, texture-state and stream-source arrays, and D3D_g_pDevice. Called once after the image is
+// mapped and before the game's first instruction; until then the accessors name fallback storage of the same
+// shape, which is what lets the unit tests run the same code.
+void state_attach_to_image();
+
 // A field of the device object by offset, typed by the caller. This is the same accessor the Windows port
 // used (`template <typename T> T &dev_field(uint32_t off)`) and it stays that way: the offsets are facts
 // about the console, and naming the type at each use is what makes them checkable.

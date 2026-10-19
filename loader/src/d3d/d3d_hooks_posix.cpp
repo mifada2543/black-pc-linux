@@ -223,6 +223,28 @@ extern "C" __attribute__((stdcall)) void blackrt_lib_unimplemented_posix(uint32_
 
 namespace {
 
+// The two static-initializer tables of this build (C++ then C). The game's start-up code walks them and
+// calls every non-null, non-0xFFFFFFFF pointer so the statically linked libraries can set their globals up;
+// those functions are not API entry points. The pointers are read out of *this* image, so a different build
+// cannot make the loader skip the wrong function. The Windows port keeps the same two ranges native
+// (dispatch.cpp's `initializers`); without this the first DSOUND initializer stops the run.
+bool is_library_initializer(uint32_t addr, uint8_t *code, uint32_t image_base, uint32_t image_size)
+{
+    static const uint32_t kTables[][2] = {{0x2964F0u, 0x296B6Cu}, {0x296B70u, 0x296B84u}};
+    for (const auto &t : kTables) {
+        if (t[0] < image_base || t[1] < t[0]) continue;
+        const uint32_t lo = t[0] - image_base;
+        const uint32_t hi = t[1] - image_base;
+        if (hi > image_size || lo + 4 > image_size) continue;
+        for (uint32_t off = lo; off + 4 <= hi; off += 4) {
+            uint32_t fn = 0;
+            memcpy(&fn, code + off, 4);
+            if (fn && fn != 0xFFFFFFFFu && fn == addr) return true;
+        }
+    }
+    return false;
+}
+
 // The probe the signal bridge calls for a 0xCC that hooks_install wrote. False for any other address, so a
 // trap raised anywhere else still travels the normal exception path and is reported as a breakpoint.
 bool breakpoint_probe(uint32_t eip, uint32_t eax, uint32_t ecx, uint32_t edx, const uint32_t *frame)
@@ -275,6 +297,10 @@ bool install_section(const LibFunc *funcs, size_t count, const Hle *hle, size_t 
             if (hle[k].addr == f.addr) h = &hle[k];
         if (h && !h->impl) {
             local.skipped++; // the replacement says to leave the original code in place
+            continue;
+        }
+        if (!h && is_library_initializer(f.addr, code, image_base, image_size)) {
+            local.skipped++; // a library's own static initializer: the original code sets its globals up
             continue;
         }
 

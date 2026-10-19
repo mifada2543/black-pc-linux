@@ -209,7 +209,12 @@ static void test_the_row_is_in_the_table()
     check_eq(clashes, 0, "and no two rows claim that entry");
 
     TableReport report = build_table(rows, n);
-    check_eq(report.built, n, "every row in the table still builds a thunk");
+    // Rows with no implementation are the "leave the original alone" ones (NATIVE): they are not expected
+    // to build a thunk, and refusing them is how build_table spells that.
+    size_t with_impl = 0;
+    for (size_t i = 0; i < n; i++)
+        if (rows[i].impl) with_impl++;
+    check_eq(report.built, with_impl, "every row with an implementation still builds a thunk");
     for (size_t i = 0; i < report.refused.size(); i++)
         printf("  ....  %s: %s\n", report.refused[i].name.c_str(), report.refused[i].reason.c_str());
 }

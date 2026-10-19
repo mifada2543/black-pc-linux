@@ -22,6 +22,8 @@ struct Options {
     uint32_t window_height = 0;
     float mouse_sens = 1.0f;
     bool mouse_invert = false;
+    bool reverb = true;        // the I3DL2 send (mix bin 11) is mixed; --no-reverb turns it off
+    float reverb_gain = 1.0f;  // overall level of that send (--reverb-gain)
 };
 
 // Set the global options instance (called from main after parsing)
@@ -30,3 +32,7 @@ void options_set_instance(Options *o);
 // Mouse look settings (from command line options)
 float get_mouse_sens();
 bool get_mouse_invert();
+
+// Reverb settings (from command line options)
+bool get_reverb();
+float get_reverb_gain();

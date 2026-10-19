@@ -54,6 +54,13 @@ public:
 
     void unmap();
 
+    // Stop tracking the mapping without munmap. The loader can leave while the game's threads are still
+    // running -- a probe times out inside the game's loop -- and unmapping the image under a live thread
+    // is what produced the "unhandled exception" at the end of every real-image run. The process exits
+    // immediately after, and the kernel reclaims the whole address space then, so the pages do not need
+    // to be given back by hand.
+    void abandon();
+
 private:
     bool mapped = false;
     uint32_t mapped_base = 0, mapped_size = 0;

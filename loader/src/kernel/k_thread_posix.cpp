@@ -29,6 +29,7 @@ std::mutex g_registry;
 std::vector<XboxThread *> g_threads; // pointers, because XboxThread holds a mutex and never moves
 std::atomic<uint32_t> g_unique_thread{1};
 std::atomic<uint32_t> g_live{0};
+std::atomic<uint32_t> g_live_game{0}; // the subset of g_live that runs the game itself
 
 // This thread's record. Set by thread_main when the loader starts the thread, and by kthread_current()
 // for any thread the loader did not create.
@@ -57,9 +58,12 @@ void finish(XboxThread *t)
     pthread_mutex_lock(&t->gate);
     t->finished = true;
     t->running = false;
+    // The counters come down before the broadcast: a waiter that wakes on `finished` reads them next, and
+    // must not see a thread that has finished still counted as running.
+    g_live--;
+    if (t->game_thread) g_live_game--;
     pthread_cond_broadcast(&t->gate_cv);
     pthread_mutex_unlock(&t->gate);
-    g_live--;
     logf("thread '%s' returned", t->name);
 }
 
@@ -189,6 +193,25 @@ uint32_t kthread_count()
 
 uint32_t kthread_live_count() { return g_live.load(); }
 
+uint32_t kthread_game_live_count() { return g_live_game.load(); }
+
+uint32_t kthread_game_stack_top()
+{
+    // The first live game thread in creation order, which for the real image is the one the entry point
+    // created -- the game's main thread. The gate is taken before reading `finished` so the answer cannot
+    // be a thread that has just finished and a stack top that is about to stop meaning anything.
+    std::lock_guard<std::mutex> g(g_registry);
+    for (XboxThread *t : g_threads) {
+        if (!t->game_thread) continue;
+        pthread_mutex_lock(&t->gate);
+        const bool finished = t->finished;
+        const uint32_t top = t->stack_top;
+        pthread_mutex_unlock(&t->gate);
+        if (!finished) return top;
+    }
+    return 0;
+}
+
 void kthread_mark_finished(XboxThread *t)
 {
     if (!t) return;
@@ -227,7 +250,7 @@ bool kthread_wait_finished(XboxThread *t, uint32_t slice_ms)
 
 NTSTATUS kthread_create(uint32_t *out_handle, uint32_t *out_tid, uint32_t stack_size, uint32_t tls_size,
                         uint32_t start_routine, uint32_t start_context, uint32_t system_routine, bool suspended,
-                        const char *name, bool cdecl_entry)
+                        const char *name, bool cdecl_entry, bool game_thread)
 {
     XboxThread *t = new XboxThread();
     init_record(t, name);
@@ -246,6 +269,7 @@ NTSTATUS kthread_create(uint32_t *out_handle, uint32_t *out_tid, uint32_t stack_
     t->start_context = start_context;
     t->system_routine = system_routine;
     t->cdecl_entry = cdecl_entry;
+    t->game_thread = game_thread;
     t->suspend_count = suspended ? 1 : 0;
     memcpy(t->ethread + ETHREAD_START_ADDRESS, &start_routine, 4);
     memcpy(t->ethread + ETHREAD_UNIQUE_THREAD, &t->unique_thread, 4);
@@ -262,6 +286,7 @@ NTSTATUS kthread_create(uint32_t *out_handle, uint32_t *out_tid, uint32_t stack_
         return KT_NO_MEMORY;
     }
     g_live++;
+    if (game_thread) g_live_game++;
     if (out_handle) *out_handle = t->handle;
     if (out_tid) *out_tid = t->unique_thread;
     logf("thread '%s' created: routine 0x%08x context 0x%08x system 0x%08x tls %u stack 0x%zx%s -> handle 0x%08x "
@@ -288,7 +313,8 @@ extern "C" NTSTATUS __attribute__((stdcall)) PsCreateSystemThreadEx(uint32_t *Th
     uint32_t tid = 0;
     const NTSTATUS s = kthread_create(ThreadHandle, &tid, KernelStackSize, TlsDataSize,
                                       (uint32_t)(uintptr_t)StartRoutine, (uint32_t)(uintptr_t)StartContext,
-                                      (uint32_t)(uintptr_t)SystemRoutine, CreateSuspended != 0, nullptr, false);
+                                      (uint32_t)(uintptr_t)SystemRoutine, CreateSuspended != 0, nullptr, false,
+                                      /*game_thread=*/true);
     if (ThreadId) *ThreadId = tid;
     return s;
 }

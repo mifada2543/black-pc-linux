@@ -83,6 +83,13 @@ gfx::Image *window_target();
 // A stale swapchain afterwards is a request to rebuild on the next frame, not a failure.
 bool window_end_frame();
 
+// One game frame, driven from D3DDevice_Swap: drain the window's events, present what the game recorded,
+// wait for the vblank and open the next frame. On the console those are the two things Swap does -- the
+// frame becomes visible and the CPU waits for the next field -- so they live together here. `closed` is set
+// when the window system said the application should quit; a present that merely failed (minimised, no
+// drawable) is not a request to leave the game.
+bool window_present_game_frame(bool *closed);
+
 // Frames presented since window_open. The counter the --window mode stops on, and the number a test
 // checks rather than "it ran for a while".
 uint32_t window_frames();

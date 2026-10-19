@@ -145,28 +145,38 @@ static void test_the_table()
 
     const TableReport report = build_table(rows, count, &g_thunks);
     check_eq(report.rows, count, "the report counted every row");
-    check_eq(report.built, count, "and every one of them built");
-    if (!report.refused.empty()) {
-        std::string why = report.refused.size() == 1 ? "one was refused: " : "some were refused: ";
-        for (const TableReport::Refusal &r : report.refused) {
-            char buf[160];
-            snprintf(buf, sizeof buf, "%s@0x%08x (%s)", r.name.c_str(), r.address, r.reason.c_str());
-            why += buf;
-            why += "; ";
-        }
-        check(false, why);
+    // A row with no implementation is not a gap: it says "the original library code here is correct, leave
+    // it in place", and the installer does exactly that. Only rows that claim an implementation have to
+    // produce a thunk -- so the expected count is the rows that have one.
+    size_t with_impl = 0;
+    for (size_t i = 0; i < count; i++)
+        if (rows[i].impl) with_impl++;
+    check_eq(report.built, with_impl, "and every row that has an implementation built");
+    check_eq(report.refused.size(), count - with_impl, "the rows without one are the only ones not built");
+    for (const TableReport::Refusal &r : report.refused) {
+        // Not a failure: the installer leaves these native, which is why build_table refuses them.
+        if (strstr(r.reason.c_str(), "no implementation bound")) continue;
+        char buf[160];
+        snprintf(buf, sizeof buf, "%s@0x%08x (%s)", r.name.c_str(), r.address, r.reason.c_str());
+        check(false, std::string("refused for a reason other than being native: ") + buf);
     }
-    check(g_thunks.size() == count && g_thunks[0] != nullptr, "each row has a thunk to call");
+    size_t missing = 0;
+    for (size_t i = 0; i < count; i++)
+        if ((g_thunks[i] != nullptr) != (rows[i].impl != nullptr)) missing++;
+    check_eq(missing, 0, "each row has a thunk exactly when it has an implementation");
 
     // A row is only usable if the game can actually reach its thunk from the entry it patches: both live in
     // the same arena, so a thunk far from the image would be a rel32 the patch cannot express. The arena is
     // the same one the hooks use, which is the whole reason it is mapped beside the image.
     const uint32_t base = hooks_arena_base();
-    size_t outside = 0;
+    size_t outside = 0, thunks = 0;
     for (size_t i = 0; i < g_thunks.size(); i++) {
+        if (!g_thunks[i]) continue; // a NATIVE row has no thunk, by design
         const uint32_t a = (uint32_t)(uintptr_t)g_thunks[i];
+        thunks++;
         if (a < base || a >= base + 0x100000) outside++;
     }
+    check(thunks > 0, "there are thunks to check");
     check_eq(outside, 0, "every thunk is inside the arena the entries jump into");
 
     // The addresses are per-build facts: a row whose address is not in the D3D section is a row that was

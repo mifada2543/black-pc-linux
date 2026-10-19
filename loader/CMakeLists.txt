@@ -95,6 +95,8 @@ if(UNIX)
     src/input/mouselook_posix.cpp
     src/input/input_detail_posix.cpp
     src/audio/output_posix.cpp
+    src/audio/reverb_posix.cpp
+    src/audio/dsound_posix.cpp
     src/audio/decoder_posix.cpp
     # src/audio/stream_decode_posix.cpp is deliberately absent: it wraps the decoders in
     # decoder_posix.cpp, and without FFmpeg those are null-returning stubs, so this file would wrap

@@ -18,6 +18,10 @@ uint32_t *g_streams_ptr = g_streams;
 DeviceObject g_device_object;
 DeviceObject *g_device_object_ptr = &g_device_object;
 
+// D3D_g_pDevice before the image is mapped: a pointer of its own with the same meaning.
+uint8_t *g_pdevice_storage = nullptr;
+uint8_t **g_pdevice_slot_ptr = &g_pdevice_storage;
+
 DeviceState g_state;
 
 // Global frame counter (mirrors Windows g_frame_count in device.cpp)
@@ -30,6 +34,20 @@ DeviceState &state() { return g_state; }
 DeviceObject *device_object() { return g_device_object_ptr; }
 
 void device_object_attach(DeviceObject *object) { g_device_object_ptr = object ? object : &g_device_object; }
+
+uint8_t **g_pdevice_slot() { return g_pdevice_slot_ptr; }
+
+void state_attach_to_image()
+{
+    // Every address here is a fact about one known build, and each one is already written down next to the
+    // layout constants it was derived with (xd3d8_posix.h). Nothing is computed: attaching to a different
+    // image would be attaching to the wrong bytes, and the loader only hooks a table for this build.
+    device_object_attach((DeviceObject *)(uintptr_t)ADDR_DEVICE_OBJECT);
+    g_render_state_ptr = (uint32_t *)(uintptr_t)ADDR_RENDERSTATE;
+    g_texture_state_ptr = (uint32_t (*)[TEXTURESTATE_PER_STAGE])(uintptr_t)ADDR_TEXTURESTATE;
+    g_streams_ptr = (uint32_t *)(uintptr_t)ADDR_STREAMS;
+    g_pdevice_slot_ptr = (uint8_t **)(uintptr_t)ADDR_G_PDEVICE;
+}
 
 uint32_t *render_state() { return g_render_state_ptr; }
 

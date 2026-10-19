@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -392,6 +393,19 @@ BreakpointProbe seh_set_breakpoint_probe(BreakpointProbe probe)
     return previous;
 }
 
+// Whether the page holding `addr` is mapped. The backtrace below reads the crashing thread's stack by
+// following saved frame pointers, and a wild EBP -- a hand-written routine, a frame that was already
+// corrupted -- must not turn the crash report into a second crash. mincore() answers without touching the
+// page, so an unmapped address fails here instead of inside the report.
+static bool page_mapped(uint32_t addr)
+{
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) return false;
+    unsigned char vec = 0;
+    void *page = (void *)(uintptr_t)(addr & ~(uint32_t)(ps - 1));
+    return mincore(page, (size_t)ps, &vec) == 0;
+}
+
 void seh_fatal(const ExceptionRecord *record, const Context *context)
 {
     // Mirrors what hooks.cpp reports on Windows, minus the dbghelp symbolisation (perf.cpp's job) and
@@ -405,4 +419,30 @@ void seh_fatal(const ExceptionRecord *record, const Context *context)
     if (record->number_parameters >= 2)
         fprintf(stderr, "  fault address %08x, %s\n", record->exception_information[0],
                 record->exception_information[1] == 1 ? "write" : "read");
+
+    // The stack window. The reason this exists: the faults this port sees are mostly "the game called
+    // through a pointer the library was supposed to have filled in", and those arrive here as eip=0 with
+    // a fault address of 0 -- a jump to nowhere that names nothing. The return address of the call that
+    // reached the null pointer is on the stack, and it is the only thing that names the call site. ESP is
+    // this thread's own stack, so reading it cannot fault.
+    const uint32_t *sp = (const uint32_t *)(uintptr_t)context->esp;
+    fprintf(stderr, "  stack:");
+    for (unsigned i = 0; i < 24; i++) fprintf(stderr, "%s%08x", i ? " " : " ", sp[i]);
+    fprintf(stderr, "\n");
+
+    // And the frame-pointer chain, for the frames above that call. Bounded at 12 and checked at every step
+    // (the stack grows down, so a next frame that is not strictly higher is a loop or a bad EBP).
+    uint32_t fp = context->ebp;
+    fprintf(stderr, "  backtrace:");
+    for (unsigned i = 0; i < 12; i++) {
+        if ((fp & 3) || fp < context->esp || !page_mapped(fp)) break;
+        const uint32_t *frame = (const uint32_t *)(uintptr_t)fp;
+        const uint32_t ret = frame[1];
+        if (!ret) break;
+        fprintf(stderr, " %08x", ret);
+        const uint32_t next = frame[0];
+        if (next <= fp) break;
+        fp = next;
+    }
+    fprintf(stderr, "\n");
 }

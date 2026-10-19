@@ -7,6 +7,7 @@
 #include "kernel/k_thread_posix.h"
 #include "platform/posix/fs_patch.h"
 #include "d3d/d3d_hooks_posix.h"
+#include "d3d/device_posix.h"
 #include "d3d/hle_table_posix.h"
 #include "platform/posix/log.h"
 #include "platform/posix/seh.h"
@@ -20,6 +21,17 @@
 #include <atomic>
 
 namespace {
+
+// Sleep one slice. The wait loop below watches the game's threads as well as the boot thread, and once
+// the boot thread has returned, waiting on it returns at once -- this sleep is what keeps the loop from
+// spinning while the game runs on a thread it created for itself.
+void sleep_slice(uint32_t ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, nullptr);
+}
 
 void collect(XbePosix &x, BootReport &rep)
 {
@@ -250,6 +262,12 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
     // header the game hands it and copy the section where it belongs.
     kmisc_set_image(&img, &x);
 
+    // The D3D state the game writes by absolute address (render state at 0x27C008, texture state at
+    // 0x279948, the device object at 0x279B50, D3D_g_pDevice at 0x27BFF8) is pointed at the image now that
+    // it is mapped. Until this call the accessors name fallback storage, which is what the unit tests use;
+    // from here on a game write and an HLE read are the same memory, as they are on the console.
+    xd3d::state_attach_to_image();
+
     // The library sections are hooked before the game's first instruction. Left alone they are NV2A and
     // DSound code that talks to hardware this machine does not have, so the first call the game makes
     // would fault inside a driver with nothing in the log to say which function it was. Every function
@@ -321,7 +339,8 @@ BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeo
     // and a TLS block before its first instruction -- the game's prologue reads fs:[0x20], fs:[0x24] and
     // fs:[0x28] as its first act, and the entry point is entered the Xbox's way: cdecl, no arguments.
     uint32_t handle = 0, tid = 0;
-    if (kthread_create(&handle, &tid, stack, 0, entry, 0, 0, false, "boot", true) != KT_SUCCESS)
+    if (kthread_create(&handle, &tid, stack, 0, entry, 0, 0, false, "boot", /*cdecl_entry=*/true,
+                       /*game_thread=*/true) != KT_SUCCESS)
         return BootOutcome::FailedToStart;
     XboxThread *thread = kthread_from_handle(handle);
     if (!thread) return BootOutcome::FailedToStart;
@@ -340,30 +359,51 @@ BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeo
         return true;
     };
 
+    // The entry point returning does not end the run on the real image: mainCRTStartup hands the game to
+    // a thread of its own and returns, and the game lives on that thread from then on. The run is over
+    // when the last *game* thread is gone, not when the boot thread is. Treating the boot thread as the
+    // whole run tore the image out from under the game, which was the "unhandled exception" at the end of
+    // every real-image probe.
+    auto live_stack_top = [&]() -> uint32_t {
+        if (!kthread_wait_finished(thread, 0)) return thread->stack_top;
+        const uint32_t top = kthread_game_stack_top();
+        return top ? top : thread->stack_top;
+    };
+
     if (timeout_ms) {
         // One 10 ms slice at a time rather than a single wait, so the loop can watch for an exit request
         // between slices; a game that never returns must not hold the process past the timeout.
         const uint32_t slice_ms = 10;
         for (uint32_t waited = 0; waited < timeout_ms; waited += slice_ms) {
             if (end_on_request()) return BootOutcome::Exited;
-            if (kthread_wait_finished(thread, slice_ms)) {
+            const bool entry_done = kthread_wait_finished(thread, slice_ms);
+            if (entry_done && kthread_game_live_count() == 0) {
                 if (end_on_request()) return BootOutcome::Exited;
                 if (stack_top) *stack_top = thread->stack_top;
-                logc("boot: the entry point returned after %u ms", waited);
+                logc("boot: the entry point returned after %u ms and no game thread is left", waited);
                 return BootOutcome::Returned;
             }
+            // The boot thread can be done while the game runs on: waiting on a finished thread returns at
+            // once, so the slice has to be slept out by hand or this loop would spin.
+            if (entry_done) sleep_slice(slice_ms);
         }
         thread->detached = true;
-        if (stack_top) *stack_top = thread->stack_top;
+        if (stack_top) *stack_top = live_stack_top();
+        logc("boot: still inside the game after %u ms: %u game thread(s) running", timeout_ms,
+             kthread_game_live_count());
         return BootOutcome::TimedOut;
     }
 
     // Waiting forever still has to stop if the game asks to leave, and for the same reason as above.
     if (end_on_request()) return BootOutcome::Exited;
-    while (!kthread_wait_finished(thread, 10)) {
+    for (;;) {
+        const bool entry_done = kthread_wait_finished(thread, 10);
         if (end_on_request()) return BootOutcome::Exited;
+        if (entry_done && kthread_game_live_count() == 0) break;
+        if (entry_done) sleep_slice(10);
     }
     if (end_on_request()) return BootOutcome::Exited;
     if (stack_top) *stack_top = thread->stack_top;
+    logc("boot: the entry point returned and no game thread is left");
     return BootOutcome::Returned;
 }

@@ -50,6 +50,7 @@ struct XboxThread {
     uint32_t start_context = 0;   // the entry routine's argument
     uint32_t system_routine = 0; // XPKSYSTEM_ROUTINE, called with the start routine and context
     bool cdecl_entry = false;    // the entry routine is cdecl with no arguments (the XBE entry point)
+    bool game_thread = false;    // runs the game itself: the entry point, or a thread the game asked for
 
     pthread_t host;
     pthread_mutex_t gate;      // guards suspend_count and exit flags
@@ -72,10 +73,12 @@ struct XboxThread {
 // convention), or with no arguments when `cdecl_entry` is set -- which is how the XBE entry point is
 // entered. `system_routine` is called the way the Xbox's XPKSYSTEM_ROUTINE is, with the start routine and
 // context as its two arguments; the XDK passes it so a thread can run a wrapper before its real entry.
-// `suspended` leaves the thread parked until NtResumeThread.
+// `suspended` leaves the thread parked until NtResumeThread. `game_thread` marks a thread that runs the
+// game itself (the entry point, or one the game created through PsCreateSystemThreadEx), as opposed to
+// the loader's own worker threads; kthread_game_live_count() is what says whether the run is over.
 NTSTATUS kthread_create(uint32_t *out_handle, uint32_t *out_tid, uint32_t stack_size, uint32_t tls_size,
                         uint32_t start_routine, uint32_t start_context, uint32_t system_routine, bool suspended,
-                        const char *name, bool cdecl_entry);
+                        const char *name, bool cdecl_entry, bool game_thread);
 
 // This thread's state, creating one for a thread the loader did not start (the main thread, or a host
 // thread that ends up calling into the game's code). Never null.
@@ -95,6 +98,15 @@ void kthread_set_dpc_active(bool active);
 // How many threads the loader knows about, and how many are still running. For the boot report and tests.
 uint32_t kthread_count();
 uint32_t kthread_live_count();
+
+// How many *game* threads are still running: the threads created to run the game itself (the entry point
+// and PsCreateSystemThreadEx), not the loader's own DPC worker or an adopted host thread. The real
+// image's entry point creates the game's main thread and returns while the game lives on, so this -- not
+// the boot thread's state -- is what says whether the run is over.
+uint32_t kthread_game_live_count();
+
+// The stack top of a live game thread, for the probe report's "where was it" line. 0 when none is live.
+uint32_t kthread_game_stack_top();
 
 // Mark a thread finished without waiting for it. The loader calls this when a kernel call asks to end the
 // run: the thread that asked is parked and will never finish on its own, so its record has to say so, and

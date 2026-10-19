@@ -25,10 +25,15 @@
 
 #include "d3d/hle_table_posix.h"
 
-#include "kernel/k_memory_posix.h" // NtAllocateVirtualMemory / NtFreeVirtualMemory, for the push buffer
+#include "kernel/k_memory_posix.h"  // NtAllocateVirtualMemory / NtFreeVirtualMemory, for the push buffer
+#include "kernel/k_thread_posix.h"  // kthread_create: the vblank thread runs game code
+#include "platform/posix/boot.h"    // boot_request_exit: closing the window ends the run
 #include "platform/posix/log.h"
+#include "platform/posix/window.h"  // the frame the game's Swap presents into
+#include "platform/posix/xsync.h"   // xk_set_event / xk_raise_irql: the vblank event and its callback
 
 #include <string.h>
+#include <time.h>
 
 namespace xd3d {
 
@@ -337,8 +342,15 @@ uint32_t XD3D_STDCALL D3DDevice_Swap(uint32_t Flags)
     // same place, under this port's own name.
     frame_count_increment();
 
-    // The actual present is done by window_end_frame() -> gfx::swapchain_present().
-    // This function returns immediately; the platform layer handles vblank pacing.
+    // The actual present: with a window open, Swap is where the frame the game recorded becomes the frame a
+    // player sees, and where the CPU waits for the next vblank. Both are the console's Swap. Closing the
+    // window is the one way out of a run that has no exit of its own: it is turned into the same exit request
+    // HalReturnToFirmware makes, so the window closes, the run ends and the log says why.
+    if (platform::window_ready()) {
+        bool window_closed = false;
+        platform::window_present_game_frame(&window_closed);
+        if (window_closed) boot_request_exit(0, "the window was closed");
+    }
     return 0;
 }
 
@@ -486,6 +498,101 @@ static uint32_t *push_cursor(uint32_t count, const char *who)
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// vertical blank
+// ---------------------------------------------------------------------------
+//
+// The console's GPU raises an interrupt at every vertical blank, and the D3D library's interrupt handler
+// signals the device's vblank event (DEV_VBLANKEVENT) and calls the callback the game installs
+// (DEV_VBLANKCALLBACK). The game's frame loop is built on exactly that: the code at 0x001FBD90 renders a
+// frame, then waits on the event at device+0x1DBC before starting the next one. Nothing in this port raised
+// that interrupt, so the first run that got this far stopped on that wait with its first frame recorded and
+// never presented -- a game waiting for a vblank that will not come is indistinguishable from a hang, because
+// it is one.
+//
+// What raises it here is a thread of the loader's own, paced at the Xbox's 59.94 Hz. A kthread and not a host
+// thread: the callback is the game's own code and has to run with the TEB and the fs-based state that every
+// thread of the game has.
+//
+// The event is auto-reset (SynchronizationEvent), not a notification event: the game waits once per frame,
+// so one signal has to release exactly one wait. A notification event would stay signalled after the first
+// blank and the game would spin as fast as it could render, with the frame rate set by the CPU rather than
+// by the display.
+
+constexpr long VBLANK_INTERVAL_US = 16683; // 1_000_000 / 59.94: the Xbox's NTSC field rate
+
+static XKeEvent *vblank_event()
+{
+    return reinterpret_cast<XKeEvent *>(device_object()->bytes + DEV_VBLANKEVENT);
+}
+
+static void timespec_add_us(struct timespec *t, long us)
+{
+    t->tv_sec += us / 1000000L;
+    t->tv_nsec += (us % 1000000L) * 1000L;
+    if (t->tv_nsec >= 1000000000L) {
+        t->tv_nsec -= 1000000000L;
+        t->tv_sec++;
+    }
+}
+
+// How far `now` is past `deadline`, in microseconds; negative while there is still time left.
+static long timespec_late_us(const struct timespec *now, const struct timespec *deadline)
+{
+    return (now->tv_sec - deadline->tv_sec) * 1000000L + (now->tv_nsec - deadline->tv_nsec) / 1000L;
+}
+
+static void XD3D_STDCALL vblank_thread(void *)
+{
+    logf("[d3d] vblank: 59.94 Hz (%ld us per field)", VBLANK_INTERVAL_US);
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    uint32_t vblank = 0;
+    for (;;) {
+        timespec_add_us(&next, VBLANK_INTERVAL_US);
+
+        // If the thread fell more than a field behind -- a busy machine, a stop in the debugger -- the cadence
+        // is restarted from now instead of firing the missed blanks back to back. The game cannot tell
+        // catching up from a stutter, and one stutter beats a burst of them.
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (timespec_late_us(&now, &next) > VBLANK_INTERVAL_US) {
+            next = now;
+            timespec_add_us(&next, VBLANK_INTERVAL_US);
+        }
+        // An absolute deadline, so a late wake-up does not push every later one: the cadence stays at 59.94 Hz
+        // rather than at 59.94 Hz minus whatever this loop costs.
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+
+        vblank++;
+        __atomic_store_n(&state().vblank_count, vblank, __ATOMIC_RELEASE);
+        xk_set_event(vblank_event(), 0, 0);
+
+        // The callback the game installed, with the console's D3DVBLANKDATA {VBlank, Swap, Flags}. It runs at
+        // DISPATCH_LEVEL on the console because it is an interrupt; the dispatch lock is this port's way of
+        // saying the same thing to the rest of the game.
+        const uint32_t callback = dev_field<uint32_t>(DEV_VBLANKCALLBACK);
+        if (callback) {
+            uint32_t data[3] = {vblank, state().swap_count, 0};
+            const uint8_t old = xk_raise_irql(IRQL_DISPATCH);
+            ((void (*)(uint32_t *))(uintptr_t)callback)(data);
+            xk_lower_irql(old);
+        }
+    }
+}
+
+// Start the vblank thread once. CreateDevice is allowed to be called again after Release, and a second
+// vblank thread would double every signal.
+static void vblank_start()
+{
+    static bool started = false;
+    if (started) return;
+    started = true;
+    const NTSTATUS s = kthread_create(nullptr, nullptr, 0, 0, (uint32_t)(uintptr_t)&vblank_thread, 0, 0, false,
+                                      "vblank", /*cdecl_entry=*/false, /*game_thread=*/false);
+    if (!XK_NT_OK(s)) logf("[d3d] vblank: the thread could not be created (status 0x%08x)", (uint32_t)s);
+}
+
 // Direct3D_CreateDevice: the entry point the game calls to get a device. The console's implementation
 // opens a window, creates a D3D9 device, allocates the push buffer, builds the device object at its
 // fixed address, creates the back buffer and depth surface, initialises all render state to the console's
@@ -506,6 +613,21 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
     uint32_t width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
     uint32_t height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
 
+    // The library stores the device in D3D_g_pDevice *before* it creates anything (0x26C662 in the image) and
+    // clears it on both failure paths (0x26C6A4, 0x26B5F2 in Release). Game code reads that pointer by
+    // absolute address, so the same two writes happen here in the same order.
+    uint8_t **g_pdevice = g_pdevice_slot();
+    *g_pdevice = device_object()->bytes;
+    bool device_ok = false;
+    struct ClearOnFailure {
+        uint8_t **slot;
+        bool *ok;
+        ~ClearOnFailure()
+        {
+            if (!*ok) *slot = nullptr;
+        }
+    } clear_on_failure{g_pdevice, &device_ok};
+
     state().display_width = width;
     state().display_height = height;
 
@@ -517,6 +639,13 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
         logf("[d3d] CreateDevice: swapchain create failed: %s", gfx::last_error());
         return D3DERR_NOTAVAILABLE;
     }
+
+    // Open the first frame now rather than at the first Swap: the console's device comes up with a back
+    // buffer that is already the render target, and the game's first Clear is a clear of it. A Swap
+    // presents and opens the next one, so this is the only frame that has to be opened by hand. A failure
+    // here is not fatal: Swap tries again, and a window that is minimised fails both.
+    if (platform::window_ready() && !platform::window_begin_frame())
+        logf("[d3d] CreateDevice: first frame not opened: %s", platform::window_last_error());
 
     // The console allocates the device object at a fixed address (0x00279B50) and the push buffer at
     // another fixed address. The loader keeps the device object where the console had it
@@ -544,6 +673,23 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
     if (!push_buffer_create()) return D3DERR_NOTAVAILABLE; // no segment: no writable cursor to hand out
     dev_field<uint32_t *>(DEV_PUT) = g_push_base;
     dev_field<uint32_t *>(DEV_THRESHOLD) = g_push_base + g_push_dwords - PUSH_HEADROOM; // keep 64 KB headroom
+
+    // The back buffer and the depth stencil, as Xbox surfaces, created here because game code reads them out
+    // of the device object by absolute address immediately after this call returns: RenderWare's frame setup
+    // loads [D3D_g_pDevice + DEV_RENDERTARGET] (0x1A04) and [.. + DEV_ZBUFFER] (0x1A08) at 0x00178AD0 and
+    // passes them on, so a device whose two fields are still null is a null dereference in the game's own
+    // code. The console's CreateDevice (0x26C620, through 0x2718F0) makes them here too, with the formats
+    // the game asked for in the present parameters, and the game is entitled to the same answer.
+    Surface *backbuffer =
+        D3D_CreateSurface2(width, height, 0, pp->BackBufferFormat ? pp->BackBufferFormat : XFMT_LIN_A8R8G8B8);
+    Surface *depthbuffer = nullptr;
+    if (pp->EnableAutoDepthStencil)
+        depthbuffer = D3D_CreateSurface2(width, height, 0,
+                                         pp->AutoDepthStencilFormat ? pp->AutoDepthStencilFormat : XFMT_LIN_D24S8);
+    dev_field<Surface *>(DEV_RENDERTARGET) = backbuffer;
+    dev_field<Surface *>(DEV_ZBUFFER) = depthbuffer;
+    state().render_target = backbuffer;
+    state().depth_stencil = depthbuffer;
 
     // Back buffer scale (read by GetBackBufferScale)
     dev_field<float>(0x096C) = 1.0f;
@@ -577,6 +723,19 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
     // Presentation interval (used by the pacing logic)
     render_state()[XRS_PRESENTATIONINTERVAL] = pp->FullScreen_PresentationInterval;
 
+    // The vblank event, created inside the device object where the game waits on it (0x001FBDC6 passes
+    // device+0x1DBC to KeWaitForSingleObject). Initialised after the memset above, which is what zeroes the
+    // object -- a zeroed dispatcher header already reads as a notification event, and this one has to be
+    // auto-reset or the game would never wait.
+    XKeEvent *vblank = vblank_event();
+    vblank->Header.Type = XOBJ_EVENT_SYNCHRONIZATION;
+    vblank->Header.Absolute = 0;
+    vblank->Header.Size = (uint8_t)(sizeof(XKeEvent) / 4);
+    vblank->Header.Inserted = 0;
+    vblank->Header.SignalState = 0;
+    vblank->Header.WaitListHead.Flink = vblank->Header.WaitListHead.Blink = &vblank->Header.WaitListHead;
+    vblank_start();
+
     // The game expects ppDevice to point at the device object.
     if (ppDevice) *ppDevice = dev->bytes;
 
@@ -585,6 +744,7 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
          dev->bytes, (void *)g_push_base, PUSH_BYTES / 1024, g_push_dwords,
          (void *)dev_field<uint32_t *>(DEV_THRESHOLD), width, height, pp->FullScreen_PresentationInterval);
 
+    device_ok = true;
     return D3D_OK;
 }
 
@@ -598,6 +758,8 @@ uint32_t XD3D_STDCALL Direct3D_CreateDevice(uint32_t Adapter, uint32_t DeviceTyp
 uint32_t XD3D_STDCALL D3DDevice_Release()
 {
     push_buffer_free();
+    // The console clears D3D_g_pDevice in the last release (0x26B5F2), after zeroing the object.
+    *g_pdevice_slot() = nullptr;
     return 1;
 }
 
@@ -854,6 +1016,10 @@ void XD3D_STDCALL D3D_BlockOnTime(uint32_t Time, uint32_t MakeSpace)
 // ---- the table ----
 
 #define H(addr, fn, params, ret) { addr, #fn, (void *)&fn, params, ret }
+// A row with no replacement: the library code at that address is already correct on the CPU, so the
+// installer leaves it in place (the Hle::impl == nullptr rule). It is listed rather than omitted so the
+// dispatcher does not mistake a call to it for a gap in the port. The Windows port spells these NATIVE.
+#define NATIVE(addr, name) { addr, name, nullptr, "", false }
 
 // Every row here is one console entry point: the address the game calls, the spec the thunk has to
 // match, and whether it hands a value back. The order and the addresses are facts about the image, so
@@ -872,6 +1038,10 @@ static const Hle kDeviceTable[] = {
     H(0x00277580, Direct3D_GetAdapterModeCount, "s", true),
     H(0x00277640, Direct3D_EnumAdapterModes, "s s s", true),
     H(0x0026c620, Direct3D_CreateDevice, "s s s s s s", true),
+    // Both of these are the library's own code: one hands back a constant and one reads the device's
+    // back-buffer scale field, so leaving the original in place is the correct implementation.
+    NATIVE(0x00277570, "FUN_00277570 (returns 1)"),
+    NATIVE(0x00277490, "GetBackBufferScale (reads device +0x96C/+0x970)"),
 
     // ---- device lifetime and display ----
     H(0x0026b5d0, D3DDevice_Release, "", true),
@@ -892,23 +1062,26 @@ static const Hle kDeviceTable[] = {
     H(0x0026aaa0, D3DDevice_GetDepthStencilSurface2, "", true),
 
     // ---- transforms, viewport, material ----
+    // Every address here is the one the image's own code uses, checked against the function the image
+    // actually holds: for a stdcall entry point the `ret N` in the image *is* the argument count, and a
+    // spec that disagrees leaves the caller's stack out of alignment -- so the audit that found these
+    // (tools aside: four of them were bound one row off, which is what crashed the first real run) is
+    // `/tmp/opencode/audit_arity.py`, and it must stay clean.
     H(0x0026aae0, D3DDevice_SetTransform, "s s", false),
     H(0x0026ac00, D3DDevice_SetViewport, "s", false),
-    H(0x0026e9c0, D3DDevice_SetMaterial, "s", false),
+    H(0x0026ae20, D3DDevice_SetMaterial, "s", false),
     H(0x0026ba50, D3DDevice_SetScreenSpaceOffset, "s s", false),
-    H(0x0026eaf0, D3DDevice_LightEnable, "s s", false),
+    H(0x0026b210, D3DDevice_LightEnable, "s s", false),
 
     // ---- material, lighting, scissor (A3) ----
-    H(0x00268de0, D3DDevice_SetLight, "s s", false),
-    H(0x0026e5b0, D3DDevice_SetScissors, "s s s", false),
-    H(0x0026b524, D3DDevice_SetStreamSource, "s s s", false),
-    H(0x00269734, D3DDevice_SetRenderState_Simple, "ecx edx", false),
+    H(0x0026ae50, D3DDevice_SetLight, "s s", false),
+    H(0x0026b720, D3DDevice_SetScissors, "s s s", false),
+    H(0x00268de0, D3DDevice_SetStreamSource, "s s s", false),
+    H(0x0026e5b0, D3DDevice_SetRenderState_Simple, "ecx edx", false),
 
-    // ---- viewport transform (tested by viewport transform test) ----
-    // Addresses are placeholders; the game does not call these in this build,
-    // but the HLE test exercises the implementation directly.
-    H(0x00260000, D3DDevice_GetViewportOffsetAndScale, "s s", false),
-    H(0x00260004, D3D_WriteViewportTransform, "eax", true),
+    // ---- viewport transform ----
+    H(0x0026e9c0, D3DDevice_GetViewportOffsetAndScale, "s s", false),
+    H(0x0026eaf0, D3D_WriteViewportTransform, "eax", true),
 
     // ---- textures, palettes, streams ----
     H(0x0026b370, D3DDevice_SetTexture, "s s", false),
@@ -946,6 +1119,7 @@ static const Hle kDeviceTable[] = {
 };
 
 #undef H
+#undef NATIVE
 
 const Hle *device_rows(size_t *count)
 {

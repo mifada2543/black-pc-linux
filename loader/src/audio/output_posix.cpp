@@ -84,6 +84,16 @@ bool open()
     want.callback = sdl_audio_callback;
     want.userdata = nullptr;
 
+    // The window opens SDL with the video subsystem, which is all it needs; opening the audio device needs
+    // the audio subsystem as well. Asking for it here rather than in window_open() keeps the dependency with
+    // the code that has it: without this, SDL_OpenAudioDevice fails with "Audio subsystem is not initialized"
+    // and the game runs silently.
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        logf("[audio] SDL_InitSubSystem(AUDIO) failed: %s", SDL_GetError());
+        if (g_wav) { fclose(g_wav); g_wav = nullptr; }
+        return false;
+    }
+
     g_device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (g_device == 0) {
         logf("[audio] SDL_OpenAudioDevice failed: %s", SDL_GetError());

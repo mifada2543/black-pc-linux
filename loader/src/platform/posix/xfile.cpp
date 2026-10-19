@@ -169,7 +169,11 @@ NTSTATUS resolve(uint32_t root, const XAnsiString *name, Resolved &r)
         path = "\\??\\" + path;
         root = XF_INVALID_HANDLE_VALUE;
     }
-    if (root != XF_INVALID_HANDLE_VALUE) {
+    // A null root is a fully qualified name: the Windows port's `if (root)` reads it straight from the
+    // game, and this port's XF_INVALID_HANDLE_VALUE stands for the same thing. Only a real handle goes
+    // to the lookup -- slot 0 is never a handle, so a game passing 0 used to come back STATUS_INVALID_
+    // HANDLE, which XAPI's start-up reads as a fatal disc error.
+    if (root != XF_INVALID_HANDLE_VALUE && root != 0) {
         const uint32_t ri = xhandle_index(root);
         if (ri >= kMaxHandles || !g_handles[ri].used) return XF_INVALID_HANDLE;
         std::string base = g_handles[ri].xbox_path;
@@ -336,6 +340,11 @@ NTSTATUS open_common(const char *what, XfHandle *out, uint32_t access, XObjectAt
     // the game's save paths go to partitions, and this keeps a read-only mount honest.
     if (r.mount->readonly && d != XF_FILE_OPEN && d != XF_FILE_OPEN_IF) flags |= O_RDONLY;
 
+    // A directory never goes through open(2)'s create bits: Linux cannot make a directory that way, and an
+    // existing one answers EISDIR when O_CREAT is set. The disposition still decides whether a missing
+    // directory is created below or reported as missing, and FILE_CREATE keeps its "must not exist" rule.
+    if (want_dir) flags = (flags & ~(O_RDWR | O_WRONLY | O_CREAT | O_EXCL | O_TRUNC)) | O_RDONLY;
+
     int fd = open(r.host_path.c_str(), flags, 0666);
     if (fd < 0 && errno == ENOENT && !raw) {
         std::string ci = host_path_ci(*r.mount, r.rest);
@@ -343,6 +352,18 @@ NTSTATUS open_common(const char *what, XfHandle *out, uint32_t access, XObjectAt
             r.host_path = ci;
             fd = open(r.host_path.c_str(), flags, 0666);
         }
+    }
+    // FILE_OPEN_IF on a directory that exists: the EISDIR the create bit would produce is not an error
+    // here -- "the object, created if missing" has nothing left to create. CreateFile on Windows allows
+    // this, so the POSIX side drops the create bit and retries; XAPI's start-up opens TDATA and UDATA
+    // exactly this way, and the EISDIR came back as STATUS_INVALID_PARAMETER, which it treats as fatal.
+    if (fd < 0 && errno == EISDIR && d == XF_FILE_OPEN_IF)
+        fd = open(r.host_path.c_str(), flags & ~O_CREAT, 0666);
+    // FILE_OPEN_IF on a directory that does not exist: the Xbox kernel creates it. open(2) cannot, so the
+    // loader makes the directory and opens it; the parent is the mount itself, which is why one mkdir is
+    // enough.
+    if (fd < 0 && errno == ENOENT && want_dir && d != XF_FILE_OPEN && !raw) {
+        if (mkdir(r.host_path.c_str(), 0777) == 0) fd = open(r.host_path.c_str(), flags, 0666);
     }
     if (fd < 0) {
         NTSTATUS st = err_to_status(errno);
@@ -352,6 +373,12 @@ NTSTATUS open_common(const char *what, XfHandle *out, uint32_t access, XObjectAt
 
     struct stat sb;
     bool is_dir = fstat(fd, &sb) == 0 && S_ISDIR(sb.st_mode);
+    if (want_dir && is_dir && d == XF_FILE_CREATE) {
+        // FILE_CREATE means "must not exist"; an existing directory is a collision, not a success.
+        close(fd);
+        complete(iosb, XF_OBJECT_NAME_COLLISION, 0);
+        return XF_OBJECT_NAME_COLLISION;
+    }
     if (want_dir && !is_dir) {
         close(fd);
         complete(iosb, XF_NOT_A_DIRECTORY, 0);
@@ -807,6 +834,31 @@ NTSTATUS xf_query_information(XfHandle h, uint32_t class_, void *info, uint32_t 
         out[20] = t.delete_pending ? 1 : 0;
         out[21] = t.is_dir ? 1 : 0;
         complete(iosb, XF_SUCCESS, 24);
+        return XF_SUCCESS;
+    }
+    case 34: { // FileNetworkOpenInformation: the four FileBasicInformation times, the sizes and the
+               // attributes (56 bytes). XAPI asks for it right after writing a save's metadata file and
+               // reads EndOfFile at 0x28 as a 64-bit size.
+        if (len < 56) {
+            complete(iosb, XF_BUFFER_TOO_SMALL, 0);
+            return XF_BUFFER_TOO_SMALL;
+        }
+        memset(out, 0, 56);
+        if (have_stat) {
+            const timespec ts[4] = {st.st_ctim, st.st_atim, st.st_mtim, st.st_mtim}; // no separate change time
+            for (int i = 0; i < 4; i++) {
+                const int64_t units = ((int64_t)ts[i].tv_sec + 11644473600LL) * 10000000LL + ts[i].tv_nsec / 100;
+                memcpy(out + i * 8, &units, 8);
+            }
+        }
+        const int64_t size = have_stat ? (int64_t)st.st_size : 0;
+        const int64_t alloc = (size + 511) & ~(int64_t)511;
+        memcpy(out + 0x20, &alloc, 8);
+        memcpy(out + 0x28, &size, 8);
+        const uint32_t nattrs = (uint32_t)(t.is_dir ? 0x10 /* FILE_ATTRIBUTE_DIRECTORY */
+                                                     : 0x80 /* FILE_ATTRIBUTE_NORMAL */);
+        memcpy(out + 0x30, &nattrs, 4);
+        complete(iosb, XF_SUCCESS, 56);
         return XF_SUCCESS;
     }
     case 9: { // FileNameInformation: a 4-byte length and the name, relative to its volume, in bytes

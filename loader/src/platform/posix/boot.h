@@ -99,9 +99,11 @@ bool boot_prepare(const std::string &path, XbePosix &x, XbeImage &img, BootRepor
 std::string boot_default_hdd_dir();
 
 // Enter the image's entry point on a real thread and wait. The entry point is game code that may never
-// return, so this returns when the thread returns, when `timeout_ms` expires (0 = wait forever), or when
-// a kernel call asked to end the run. `stack_top` is the boot thread's stack pointer at entry, which is
-// what a crashed game frame points back into.
+// return, so this returns when the run is over, when `timeout_ms` expires (0 = wait forever), or when a
+// kernel call asked to end the run. The run is over when the last *game* thread is gone, not when the
+// boot thread is: the real image's entry point creates the game's main thread and returns while the game
+// lives on. `stack_top` is a live game thread's stack pointer at entry, which is what a crashed game
+// frame points back into.
 enum class BootOutcome { Returned, TimedOut, Exited, FailedToStart };
 BootOutcome boot_run_entry(uint32_t entry, uint32_t stack_commit, uint32_t timeout_ms, uint32_t *stack_top);
 

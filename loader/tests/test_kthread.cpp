@@ -142,6 +142,7 @@ static void test_created_thread()
     check_u32(handle & 0xF0000000u, 0x40000000u, "the handle is tagged as a thread handle");
     check(tid != 0, "and a thread id comes back");
     check_u32(kthread_count(), 2, "the loader knows about two threads now");
+    check_u32(kthread_game_live_count(), 1, "and the thread the game asked for counts as a game thread");
 
     XboxThread *w = kthread_from_handle(handle);
     check(w != nullptr, "the handle resolves to its record");
@@ -176,6 +177,7 @@ static void test_created_thread()
     check(w->finished, "the worker finished when it called PsTerminateSystemThread");
     check_u32((uint32_t)w->exit_status, 0x1234, "with the status it was given");
     check_u32(kthread_live_count(), 1, "and the live count dropped back");
+    check_u32(kthread_game_live_count(), 0, "the game thread count dropped back with it");
 }
 
 // ----------------------------------------------------------------------------------------------------------

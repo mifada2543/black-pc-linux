@@ -200,7 +200,7 @@ bool kdpc_init()
     // interrupt for it; the closest thing here is a thread the host scheduler prefers.
     uint32_t handle = 0, tid = 0;
     const NTSTATUS s = kthread_create(&handle, &tid, 0, 0, (uint32_t)(uintptr_t)&dpc_worker, 0, 0, false,
-                                      "kernel-dpc", false);
+                                      "kernel-dpc", false, /*game_thread=*/false);
     if (s != KT_SUCCESS) {
         logc("dpc: the DPC thread could not start (%08x) -- timers will never fire", (uint32_t)s);
         return false;

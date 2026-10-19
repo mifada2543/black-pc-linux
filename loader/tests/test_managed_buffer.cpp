@@ -79,7 +79,7 @@ static void test_uploading_with_no_frame_is_refused()
     }
 
     gfx::Image target;
-    if (gfx::create_color_target(&target, 64, 64, VK_FORMAT_B8G8R8A8_UNORM)) {
+    if (gfx::create_color_target(&target, 64, 64, gfx::ATT_B8G8R8A8_UNORM)) {
         gfx::set_render_target(&target, nullptr);
         check(gfx::managed_buffer_flush(h, nullptr), "with a target set, the same flush succeeds");
         check(device_equals(h, 0, host.data(), 256), "and once the frame is submitted the bytes are there");
@@ -223,7 +223,7 @@ int main()
     }
 
     gfx::Image target;
-    if (!gfx::create_color_target(&target, 64, 64, VK_FORMAT_B8G8R8A8_UNORM)) {
+    if (!gfx::create_color_target(&target, 64, 64, gfx::ATT_B8G8R8A8_UNORM)) {
         printf("  --     no render target: %s\n", gfx::last_error());
         gfx::shutdown();
         return 77;

@@ -126,7 +126,7 @@ static void test_a_material_reaches_the_driver()
     d.vertex_elements = els;
     d.vertex_element_count = 1;
     d.stream_stride = stride;
-    d.color_format = gfx::srgb_format(VK_FORMAT_B8G8R8A8_UNORM);
+    d.color_format = gfx::srgb_format(gfx::ATT_B8G8R8A8_UNORM);
     d.flags = gfx::PIPE_DEPTH_TEST | gfx::PIPE_DEPTH_WRITE | gfx::PIPE_CULL_BACK;
 
     gfx::Pipeline pipe;
@@ -166,7 +166,7 @@ static void test_a_material_with_a_pixel_shader()
     d.vertex_element_count = 1;
     d.stream_stride = stride;
     d.pixel_shader = &ps;
-    d.color_format = gfx::srgb_format(VK_FORMAT_B8G8R8A8_UNORM);
+    d.color_format = gfx::srgb_format(gfx::ATT_B8G8R8A8_UNORM);
 
     gfx::Pipeline pipe;
     const char *err = nullptr;

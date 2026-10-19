@@ -1723,3 +1723,319 @@ tes itu berkali-kali dan selalu mendapat jawaban yang sama salah.
 
 Pelajarannya: Bug yang kita kirim sudah divalidasi hanya terhadap pemakaian yang benar.
 Bug ours lolos karena tidak ada yang membaca kode yang kita kirim.
+
+---
+
+## Verifikasi citra game: mana yang benar (2026-10-19)
+
+### Kronologi singkat
+
+Beberapa kandidat citra diperiksa. Hasilnya berubah-ubah beberapa kali karena
+saya salah membaca, jadi semua urutan perbaikannya dicatat di sini.
+
+| Kandidat | Putusan | Bukti |
+|---|---|---|
+| `game/Black (USA).zip` (7.29 GiB) | bukan | DVD-Video (`VIDEO_TS/`, `VTS_01_1.VOB`); satu `XBEH` di 3.9 GB |
+| `game/Black (USA).iso` (1.01 GiB) | buang | ekstraksi gagal, 13.8% dari zip, bukan kelipatan 2048 |
+| `game/Black(new).iso` (1.57 GiB) | buang | XBE 5.7 MB; retail 2.8 MB (lihat bawah) |
+| **`Black (USA).7z`** | **BENAR** | `readme.txt` = `ROMSFUN.COM`; hash cocok byte-per-byte |
+
+### Bukti penentu
+
+`default.xbe` dari citra ROMSFUN:
+
+```
+offset 0x84800, ukuran 2.813.952 byte (0x2AF000)
+sha256 = df2739c372d254a90aeeccf5971d12097f22d89fbb90db021fda96dd4deb68f6
+       = notes/game-manifest.sha256 -> game/default.xbe            COCOK
+```
+
+Tiga hal Independen, bukan satu bukti yang diulang-ulang:
+
+1. sha256 persis sama dengan manifest
+2. 16 byte sebelum berkas berisi `ff ff ff...` (padding batas berkas)
+3. setelahnya data terstruktur, bukan isi acak
+
+Dan bukan cuma XBE: sapuan padding di citra yang sama menghasilkan **177 berkas
+lain yang cocok** (`levels/...`, `sound/dsp/BkXboxFx.bin`, `sound/streams/*.ssh`,
+`chars/guns/GrdLnchr.wdo`, dan lain-lain).
+
+### Konsekuensi: manifest adalah acuan yang sah
+
+Selama ini `notes/game-manifest.sha256` tidak punya catatan asal-usul, jadi
+semua verifikasi bergantung pada referensi yang mungkin salah. Sekarang jelas:
+manifest itu cocok byte-per-byte dengan citra ROMSFUN, jadi **manifest sahih dan
+bukan keliru**.
+
+### Dua kandidat XBE "retail" ternyata bukan
+
+`Black(new).iso` dan `Black (USA).zip` sama-sama punya header XBE yang cocok
+retail 8-10 field. Itusecara teknisbukan bukti apa pun, karena repack biasanya
+menyentuh isi tapi tidak pernah header. Keduanya juga berbeda pada offset `0x220`
+(4 byte), dan keduanya punya isi 5.7 MB terhadap retail 2.8 MB.
+
+Pelajaran: **header yang cocok bukan bukti keaslian.** Yang membuktikan hanya
+perbandingan isi seluruh berkas.
+
+### Kesalahan saya yang perlu dicatat
+
+Tiga, semuanya kelas yang sama -- mempercayai sumber/jangkauan yang belum
+diperiksa:
+
+1. **Buffer 64 KB persis habis di `0x10000`**, tempat volume descriptor Xbox
+   berada. Saya menyimpulkan "bukan citra disc Xbox" padahal descriptor-nya ada.
+   `Black(new).iso` **adalah** citra disc XDVDFS.
+2. Dinyatakan file 7.29 GB "tidak punya executable Xbox" setelah memindai
+   **200 MB dari 7.29 GB**. Pemindaian penuh menemukan `XBEH` di 3.9 GB.
+3. `seek(0,2)` lalu `read()` tanpa `seek(0)` -- pemeriksaan header diam-diam
+   membaca nol byte, dan alat saya melaporkan "tidak ada" untuk berkas yang
+   jelas punya.
+
+Yang menyelamatkan di ketiganya: alat yang sama bisa dijalankan ulang pada
+berk exemplifyang sama dalam hitungan detik, dan hasilnya berbeda.
+
+### Yang belum selesai
+
+Ekstraksi penuh ke `game/` memakai pendekatan **padding**, bukan parser XDVDFS.
+Pendekatan itu menghasilkan sebagian berkas saja. Field ukuran sudah ditemukan di
+indeks (`default.xbe` = `0x2AF000`), tapi struktur antar entri belum konsisten,
+sehingga parser yang benar belum selesai.
+
+Artinya `game/` kemungkinan **belum** lengkap 574 berkas.
+
+---
+
+## Parser XDVDFS: 574 berkas terekstrak (2026-10-19)
+
+### Hasil
+
+```
+entri XDVDFS : 40 direktori + 574 berkas
+hash cocok   : 574/574     tidak cocok: 0     di luar citra: 0
+sha256sum -c notes/game-manifest.sha256 -> 574 OK, 0 GAGAL, 0 hilang
+```
+
+Data game sekarang lengkap di `game/` (1,6 GB). Sebelumnya baru 145 berkas
+dari pendekatan padding yang rapuh.
+
+### Format XDVDFS, hasil diturunkan dari citra
+
+Tidak dipakai dokumentasi pihak ketiga. Struktur diuji dengan cara memarsing
+lalu membandingkan sha256 tiap berkas hasil baca dengan manifest: kalau
+hipotesis salah, yang cocok akan sedikit atau tidak sama sekali. Yang terjadi
+574 dari 574 cocok -- jadi formatnya benar.
+
+**Volume descriptor** di sektor 32:
+
+```
++0x00  char[20] "MICROSOFT*XBOX*MEDIA"
++0x14  uint32  sektor direktori root   = 264   (0x84000)
++0x18  uint32  ukuran direktori root   = 200
+```
+
+Sector 264 = 0x84000 persis di tempat daftar entri ditemukan, dan 200 byte
+persis habis di akhir entri terakhir. Dua angka yang saling menguatkan.
+
+**Entri direktori**, 13 byte tetap lalu nama:
+
+```
+uint16 left        indeks pohon kiri
+uint16 right       indeks pohon kanan
+uint32 offset      sektor absolut data (Isi direktori untuk direktori)
+uint32 size        ukuran byte
+uint8  attr        0x10 = direktori, 0x20 = berkas
+uint8  namelen
+char   name[namelen]
+```
+
+Byte `0xFF` sisipan di antara entri adalah padding, dilewati.
+
+Barisan nine entri root membuktikannya tanpa perlu tebakan:
+
+```
+export        left=5    right=22   offset=2540     size=2048     dir
+data          left=10   right=15   offset=4622     size=2048     dir
+chars         left=0    right=0    offset=4629     size=2048     dir
+default.xbe   left=0    right=0    offset=265      size=2813952  BERKAS
+language      left=28   right=35   offset=4676     size=2048     dir
+GlobData.bin  left=0    right=0    offset=1639     size=1844680  BERKAS
+sound         left=40   right=45   offset=4761     size=2048     dir
+levels        left=0    right=0    offset=160914   size=2048     dir
+videos        left=0    right=0    offset=705000   size=2048     dir
+```
+
+Tiga pemeriksaan yang saling bebas:
+
+1. `default.xbe`: offset 265 = 0x84800, persis tempat XBE ditemukan sebelumnya.
+   size 2813952 = 0x2AF000, persis ukuran yang tercatat di header XBE.
+2. Offset direktori menaik monotonis: 2540, 4622, 4629, 4676, 4761, 160914,
+   705000. Dan citra hanya 823392 sektor, jadi semua offset masih di dalam.
+3. Citra 823392 sektor, jadi 705000 masih di dalam; video occupy sisa.
+
+### Kesalahan saya: "manifest punya 228 path salah"
+
+Saya sempat melaporkan itu, dan itu **salah**. Saya membandingkan dengan cara
+membangun dict `hash -> path`, lalu mencocokkan `dict[hash]`.
+
+Manifest punya 574 baris tapi hanya **346 hash unik**: 55 hash dipakai di
+lebih dari satu path, mencakup 283 berkas (aset yang memang sama di beberapa
+level, misalnya `bg1_ak1.db` ada di level_00, 01, 05, 06). Dict menutupi
+semua path kecuali satu per hash, jadi perbandingan saya membandingkan path
+yang benar dengan path acak milik hash lain.
+
+Bentuk kesalahannya sama seperti tiga kesalahan sebelumnya: meratakan
+struktur yang punya multiplicit. Yang benar adalah bandingkan per path.
+
+Bukti bahwa manifest benar sejak awal:
+
+```
+sha256sum -c notes/game-manifest.sha256  -> 574 OK, 0 GAGAL, 0 hilang
+path di manifest tapi tidak di disc      -> 0
+path di disc tapi tidak di manifest      -> 0
+hash beda pada path yang sama            -> 0
+```
+
+Jadi `notes/game-manifest.sha256` bukan hanya hash-nya yang benar -- path-nya
+juga benar, lengkap, dan urut. Tidak perlu diperbarui.
+
+### Konsekuensi untuk langkah berikutnya
+
+Data game sudah ada, jadi yang tadinya terblokir sekarang bisa jalan:
+
+- **A4 (jalur FVF)**: bisa diuji terhadap `levels/level_00/stg_0001/` dan
+  `export/frontend/` yang sekarang nyata isinya
+- **A3 (4 baris sisanya)**: bisa diverifikasi terhadap frame asli
+- **A8 (override XBE)**: `game/default.xbe` ada, 2.813.952 byte
+- **A9 (WMA/XMV)**: `game/sound/streams/*.bks` (36 berkas) dan
+  `game/videos/` (17 berkas) adalah targetnya
+
+`game/sound/streams/7thWave.bks` 40,0 MB dan `game/levels/global/Speech.bks`
+116,3 MB adalah yang terbesar -- penting untuk batas memori nanti.
+
+### Berkas kerja
+
+`.verify/xdvdfs.py` (parser, tanpa asumsi isi) dan `.verify/extract_full.py`
+(ekstraksi). `.verify/` tidak di-commit. Sumber kebenaran tetap
+`game/Black (USA).7z`.
+
+---
+
+## A0 lulus: Intel benar-benar menggambar (2026-10-19)
+
+### Hasil
+
+```
+A0 PASS: a hardware driver created a device, submitted, rasterised and read pixels back.
+Intel (ADL GT2)  mismatched=14 / 3072   PASS
+llvmpipe         mismatched= 0 / 3072   PASS
+seluruh suite   : 30/30 lulus
+VK_GATE_STRICT=1: exit 0
+```
+
+Sebelum hari ini gate ini gagal: `GATE FAIL reason=no-hardware-device-drew`. Gate A4
+pada plan mensyaratkan A0 lulus dulu, jadi jalur draw baru boleh dibangun di atas
+fondasi yang sudah terbukti.
+
+### A0 gagal karena tiga bug di dalam port, bukan karena driver
+
+Gate membandingkan readback dengan reference yang dihitung di CPU. Yang salah adalah
+reference-nya, dan ketiganya ketahuan hanya karena perbaikannya satu per satu.
+
+**1. Format vertex diisi dengan `VkFormat`, bukan `VertexFormatCode`.**
+
+```
+VK_FORMAT_R32G32_SFLOAT        = 9  -> dibaca sebagai VF_R16_SINT
+VK_FORMAT_R32G32B32A32_SFLOAT  = 4  -> dibaca sebagai VF_R16G16_SFLOAT
+```
+
+Posisi dibaca 2 byte, bukan 4. Field ini bertipe `uint32_t` sejak awal, jadi kompilasi
+bersih dan tidak ada peringatan: tipe yang salah adalah tipe yang benar.
+
+**2. Stride 28, bukan 24.**
+
+```c
+const gfx::VertexBinding binding = {0, 28, 0}; // position (8 bytes) + colour (16), tightly packed
+```
+
+`Vertex` adalah 6 float, jadi 24 byte. Komentarnya sudah menyimpulkan "24" lalu menulis
+28. Setiap vertex setelah pertama dibaca 4 byte meleset, dan yang tergambar adalah
+segitiga merah di satu sudut. Tiga pemeriksaan warna di corners masih bisa lolos
+pada gambar itu, jadi pemeriksaan alone tidak cukup; yang menangkapnya adalah
+**kotak pembatas**, dan itu tetap ada sekarang.
+
+Stride sekarang dibaca dari tipenya (`sizeof(Vertex)`), karena stride adalah fakta
+tentang tipe dan tidak boleh ditulis ulang sebagai literal.
+
+**3. Reference memakai orientasi D3D, GPU memakai Vulkan.**
+
+Ini yang paling mahal, karena menyesatkan. Reference lama memakai
+`ndc_y = 1 - y*2`, GPU memakai `ndc_y = y*2 - 1`. Keduanya menghasilkan **962 piksel
+tercover** -- segitiganya simetris, jadi dua orientasi itu menghasilkan jumlah yang
+sama persis.цев angka itu terlihat masuk akal selama berbulan-bulan.
+
+Bukti yang membedakan::
+
+```
+irisn reference-Vulkan  vs GPU : 480 / 962
+irisn reference-D3D     vs GPU : 962 / 962
+```
+
+Jadi yang benar adalah D3D: `set_viewport` memang sengaja tidak membalik Y (meng-negate
+tinggi viewport menggambar game terbalik), dan reference yang keliru. Saat mismatch
+turun dari 1444 ke 14, dan ke 14 itu selisih 1/255 pada kanal yang paling redup --
+pembulatan presisi rasteriser, bukan geometri.
+
+Pelajaran: **dua review yang berbeda bisa sama-sama benar soal jumlah dan salah soal
+tempat.** Kalau sebuah pengukuran cocok di angka besaran tapi gagal di semua detail,
+cek dulu apakah yang dibandingkan memang yang sama, sebelum menuduh yang diukur.
+
+### Gate fork yang salah baca piksel milik anaknya
+
+Uji gambar di `test_gfx` menggambar di anak proses lalu **membaca hasilnya di induk**.
+`fork()` memberi anak halaman copy-on-write, jadi `std::vector` yang diisi anak dan
+`gfx::Image` yang dibuat anak masih kosong di induk -- membaca keduanya adalah
+perilaku tak terdefinisi.
+
+Bug itu tidak pernah muncul karena anak selalu mati duluan (driver-nya crash), jadi
+jalur bermasalah tidak terjangkau. Setelah stride diperbaiki, anak berhasil menggambar,
+jalur itu akhirnya dieksekusi, dan PNG gagal ditulis karena `target_for_png` memang
+tidak pernah diisi.
+
+Sekarang semua yang memeriksa hasil berada di anak, seperti yang sudah dilakukan uji
+bertekstur. Yang benar-benar melewati `fork` hanya tiga: exit status, stdout anak, dan
+berkas PNG di disk.
+
+Status keluar juga tidak lagi diratakan jadi satu. Sebelumnya "child gagal" apa pun
+dilaporkan sebagai "the driver died building the pipeline" -- termasuk anak yang
+menggambar sempurna lalu gagal satu pemeriksaan piksel. Sekarang: `DRAW_OK`,
+`DRAW_COULD_NOT`, `DRAW_NO_FRAGMENTS`, `DRAW_WRONG`.
+
+### Draft #3.2: VkFormat keluar dari API publik
+
+`VkFormat` di signature publik diganti kode milik gfx sendiri:
+
+```c
+enum AttachmentFormat : uint32_t { ATT_NONE, ATT_B8G8R8A8_UNORM, ATT_B8G8R8A8_SRGB,
+                                   ATT_R8G8B8A8_UNORM, ATT_D16_UNORM, ATT_D32_SFLOAT };
+```
+
+Sengaja **bukan** `VertexFormatCode`: tabel itu menjelaskan cara membaca vertex, dan
+swapchain BGRA8 bukan format vertex. Kalau dicampur, swapchain berubah diam-diam.
+
+Ini menutup satu kebocoran nyata: `material_posix.cpp` melakukan cast ke `VkFormat`.
+`VkFormat` adalah enum bertipe int, jadi kesalahan tipe di sini **dikompilasi bersih** --
+persis kelas bug yang sama seperti nomor 1 dan 2 di atas.
+
+Bug laten lain yang ketahuan sekalian: `create_pipeline_d3d` memetakan kode warna lewat
+`gfx_format_for_vertex_code`, jadi format vertex dipakai sebagai format attachment.
+Tidak ada yang menangkap karena satu-satunya pemanggilnya scaffolding yang belum
+tersambung.
+
+Yang belum dirapikan: `struct Buffer` dan `struct Image` masih membuka `VkBuffer`,
+`VkImage`, `VkImageView`. Ini pekerjaan A4 lanjutan, bukan selesai di sini.
+
+### Ditemukan karena data game sudah ada
+
+Tidak ada satu pun dari tiga bug ini yang butuh data game. Semuanya muncul karena
+sekarang **ada** yang benar-benar menggambar. Sebelumnya tidak ada device yang
+menghasilkan satu fragmen pun, jadi tidak ada yang bisa salah.

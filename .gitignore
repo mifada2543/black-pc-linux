@@ -7,6 +7,7 @@ game/
 .agents
 .codebase-memory
 report.md
+.verify
 # The archived Windows port: the invoice for the Linux one, kept locally and deliberately not in git.
 # It is the record of *why* each workaround exists (see the comments in loader/windows/src), and it is
 # deliberately not a second build: nothing in loader/CMakeLists.txt refers to it, and the Linux port

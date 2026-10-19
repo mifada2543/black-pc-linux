@@ -174,6 +174,27 @@ void managed_buffer_destroy(uint32_t handle);
 ManagedBuffer *managed_buffer_at(uint32_t handle);
 size_t managed_buffer_count();
 
+// ---- attachment formats ----
+//
+// A gfx-owned code for the formats this port actually gives a framebuffer or a depth
+// buffer, standing where a VkFormat used to stand in the public API. The reason is the
+// same one as VertexAttribute::format below: d3d/ and shader/ must be able to say which
+// format an attachment is without naming a Vulkan type (plan section 3.2), so the Vulkan
+// enum stays on this side of the boundary and these integers cross it.
+//
+// This is deliberately NOT VertexFormatCode. That table describes how to *read a vertex*;
+// BGRA8 swapchains and D32F depth buffers are not vertex formats, and folding them in
+// would have silently changed what the swapchain is. Kept separate, so the mapping in
+// gfx_vulkan.cpp is a table that can be checked rather than an alias that cannot.
+enum AttachmentFormat : uint32_t {
+    ATT_NONE = 0,             // no attachment of this kind (a pipeline's depth with no depth buffer)
+    ATT_B8G8R8A8_UNORM,       // the swapchain, and every colour target the tests render into
+    ATT_B8G8R8A8_SRGB,
+    ATT_R8G8B8A8_UNORM,
+    ATT_D16_UNORM,
+    ATT_D32_SFLOAT,
+};
+
 // ---- images ----
 
 struct Image {
@@ -181,7 +202,9 @@ struct Image {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0;
-    VkFormat format = VK_FORMAT_UNDEFINED;
+    // The AttachmentFormat code this image was created with, NOT the VkFormat. See create_image's comment:
+    // this is the field callers outside gfx/ read, and it must not require naming a Vulkan type.
+    uint32_t format = ATT_NONE;
     uint32_t mip_levels = 1;
     // Index into the loader's table of current image layouts. Vulkan's layout is part of an image's state,
     // not of a render pass, and this port has no render pass objects to remember it in -- see gfx_vulkan.cpp.
@@ -190,19 +213,28 @@ struct Image {
 
 // A colour target the loader can render into, sample, and read back. `linear` picks the sRGB view: the
 // game writes gamma-corrected values already, so UNORM is the normal case.
-bool create_color_target(Image *img, uint32_t width, uint32_t height, VkFormat format, bool linear = false);
-bool create_depth_target(Image *img, uint32_t width, uint32_t height, VkFormat format);
-bool create_texture(Image *img, uint32_t width, uint32_t height, VkFormat format, uint32_t mip_levels,
+// `format` is an AttachmentFormat, not a VkFormat -- see the enum above.
+bool create_color_target(Image *img, uint32_t width, uint32_t height, uint32_t format, bool linear = false);
+bool create_depth_target(Image *img, uint32_t width, uint32_t height, uint32_t format);
+bool create_texture(Image *img, uint32_t width, uint32_t height, uint32_t format, uint32_t mip_levels,
                     bool sampled = true);
 void destroy_image(Image *img);
 
 // Upload pixels into a texture, or into one level of it. `level` is a mip index.
 bool upload_texture(Image *img, const void *pixels, VkDeviceSize bytes, uint32_t level = 0);
 
+// The Vulkan format an AttachmentFormat names. Returns VK_FORMAT_UNDEFINED for ATT_NONE
+// and for anything not in the table, so a caller that ignores a failure gets a format
+// Vulkan rejects rather than one it silently substitutes.
+VkFormat gfx_format_for_attachment(uint32_t code);
+
+// True when the code names a colour format, false for ATT_NONE and every depth format.
+bool attachment_is_color(uint32_t code);
+
 // The sRGB view of a colour format, for a target whose values are already gamma-corrected. Written out
 // rather than pulled from a helper library: it is four cases, and it is the one place where getting the
 // format wrong shows up as a subtly too-bright frame instead of an error.
-VkFormat srgb_format(VkFormat f);
+uint32_t srgb_format(uint32_t code);
 
 // ---- pipeline ----
 
@@ -251,8 +283,12 @@ struct PipelineDesc {
     size_t vertex_spirv_size = 0;
     const void *fragment_spirv = nullptr;
     size_t fragment_spirv_size = 0;
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
-    VkFormat depth_format = VK_FORMAT_UNDEFINED; // VK_FORMAT_UNDEFINED for no depth attachment
+    // AttachmentFormat codes, not VkFormat: the same boundary rule as VertexAttribute::format below, and for
+    // the same reason. ATT_NONE for depth_format means "this pipeline has no depth attachment", which is a
+    // different statement from a format Vulkan does not support, so it gets its own code rather than
+    // VK_FORMAT_UNDEFINED sneaking back in as one.
+    uint32_t color_format = ATT_B8G8R8A8_UNORM;
+    uint32_t depth_format = ATT_NONE;
     const VertexAttribute *attributes = nullptr;
     uint32_t attribute_count = 0;
     const VertexBinding *bindings = nullptr;

@@ -8,6 +8,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include <sys/wait.h>
@@ -165,6 +166,19 @@ bool fail(const char *what, VkResult r)
     return false;
 }
 
+// The same, for a refusal that is this port's own and never reached Vulkan. Without it a bad format code
+// or a bad state table entry would have no way to say why, and callers report last_error() by name.
+bool failf(const char *fmt, ...)
+{
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    g_error = buf;
+    return false;
+}
+
 // Physical devices in preference order: a discrete GPU first, then anything else, then a software
 // rasteriser. llvmpipe last is deliberate -- it works, and it is what the headless tests fall back to, but
 // on a machine with a real GPU there is no reason to draw with it.
@@ -198,7 +212,7 @@ namespace {
 // attachment pair would be a cache with no hits.
 VkCommandBuffer begin_pass(Image *color, Image *depth)
 {
-    if (color->format == VK_FORMAT_UNDEFINED || !color->view) return VK_NULL_HANDLE;
+    if (color->format == ATT_NONE || !color->view) return VK_NULL_HANDLE;
     if (g_pass_open) return g_cmd; // one pass at a time; a second Begin would be an error, not a no-op
 
     VkRenderingAttachmentInfo color_attach;
@@ -988,14 +1002,39 @@ uint32_t max_vertex_attributes()
 
 // ---- format ----
 
-VkFormat srgb_format(VkFormat f)
+VkFormat gfx_format_for_attachment(uint32_t code)
 {
-    switch (f) {
-    case VK_FORMAT_B8G8R8A8_UNORM:
-    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
-    default: return f;
+    switch (code) {
+    case ATT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_UNORM;
+    case ATT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+    case ATT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_UNORM;
+    case ATT_D16_UNORM: return VK_FORMAT_D16_UNORM;
+    case ATT_D32_SFLOAT: return VK_FORMAT_D32_SFLOAT;
+    default: return VK_FORMAT_UNDEFINED; // ATT_NONE, and any code that is not in the table
+    }
+}
+
+bool attachment_is_color(uint32_t code)
+{
+    switch (code) {
+    case ATT_B8G8R8A8_UNORM:
+    case ATT_B8G8R8A8_SRGB:
+    case ATT_R8G8B8A8_UNORM: return true;
+    default: return false;
+    }
+}
+
+// The sRGB view of a colour format. Input and output are AttachmentFormat codes, not VkFormats, so that
+// shader/ can ask for the sRGB view without naming a Vulkan type. A code that is already sRGB, or that is
+// not a colour format at all, comes back unchanged: asking for sRGB of a depth buffer has no answer, and
+// returning something else would be worse than returning the question.
+uint32_t srgb_format(uint32_t code)
+{
+    switch (code) {
+    case ATT_B8G8R8A8_UNORM:
+    case ATT_B8G8R8A8_SRGB: return ATT_B8G8R8A8_SRGB;
+    case ATT_R8G8B8A8_UNORM: return ATT_B8G8R8A8_SRGB;
+    default: return code;
     }
 }
 
@@ -1150,9 +1189,14 @@ Buffer &vertex_staging()
 
 namespace {
 
-bool create_image(Image *img, uint32_t width, uint32_t height, VkFormat format, uint32_t mip_levels,
+// `code` is an AttachmentFormat. The image remembers the code rather than the VkFormat it was created with,
+// so that a caller which only knows the public vocabulary (which is what test_gfx and window.cpp are) can ask
+// an image what it is, and never has to name a Vulkan type to get the answer.
+bool create_image(Image *img, uint32_t width, uint32_t height, uint32_t code, uint32_t mip_levels,
                   VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
+    const VkFormat format = gfx_format_for_attachment(code);
+    if (format == VK_FORMAT_UNDEFINED) return failf("create_image: %u is not a format this port knows", code);
     if (!ready()) {
         g_error = "gfx::init has not run";
         return false;
@@ -1161,7 +1205,7 @@ bool create_image(Image *img, uint32_t width, uint32_t height, VkFormat format, 
 
     img->width = width;
     img->height = height;
-    img->format = format;
+    img->format = code;
     img->mip_levels = mip_levels ? mip_levels : 1;
     img->layout_slot = new_layout_slot();
 
@@ -1220,27 +1264,39 @@ bool create_image(Image *img, uint32_t width, uint32_t height, VkFormat format, 
 
 } // namespace
 
-bool create_color_target(Image *img, uint32_t width, uint32_t height, VkFormat format, bool linear)
+bool create_color_target(Image *img, uint32_t width, uint32_t height, uint32_t code, bool linear)
 {
-    const VkFormat f = linear ? srgb_format(format) : format;
-    return create_image(img, width, height, f, 1,
+    const uint32_t use = linear ? srgb_format(code) : code;
+    const VkFormat f = gfx_format_for_attachment(use);
+    if (f == VK_FORMAT_UNDEFINED) {
+        return failf("create_color_target: %u is not a colour attachment format", code);
+    }
+    return create_image(img, width, height, use, 1,
                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
-bool create_depth_target(Image *img, uint32_t width, uint32_t height, VkFormat format)
+bool create_depth_target(Image *img, uint32_t width, uint32_t height, uint32_t code)
 {
-    return create_image(img, width, height, format, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    const VkFormat f = gfx_format_for_attachment(code);
+    if (f == VK_FORMAT_UNDEFINED || attachment_is_color(code)) {
+        return failf("create_depth_target: %u is not a depth attachment format", code);
+    }
+    return create_image(img, width, height, code, 1, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                         VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
-bool create_texture(Image *img, uint32_t width, uint32_t height, VkFormat format, uint32_t mip_levels,
+bool create_texture(Image *img, uint32_t width, uint32_t height, uint32_t code, uint32_t mip_levels,
                     bool sampled)
 {
+    const VkFormat f = gfx_format_for_attachment(code);
+    if (f == VK_FORMAT_UNDEFINED) {
+        return failf("create_texture: %u is not a texture format", code);
+    }
     VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (sampled) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    return create_image(img, width, height, format, mip_levels, usage, VK_IMAGE_ASPECT_COLOR_BIT);
+    return create_image(img, width, height, code, mip_levels, usage, VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 void destroy_image(Image *img)
@@ -1394,7 +1450,7 @@ Placeholder &placeholder()
     static Placeholder p;
     if (p.image.image) return p;
     static const uint8_t white[4] = {0xFF, 0xFF, 0xFF, 0xFF}; // B8G8R8A8 white
-    create_texture(&p.image, 1, 1, VK_FORMAT_B8G8R8A8_UNORM, 1, true);
+    create_texture(&p.image, 1, 1, ATT_B8G8R8A8_UNORM, 1, true);
     upload_texture(&p.image, white, sizeof white);
     const SamplerDesc d;
     create_sampler(&p.sampler, d);
@@ -1798,7 +1854,14 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
     rs.lineWidth = 1.0f;
     rs.depthClampEnable = VK_TRUE; // the Xbox clamps depth rather than dropping the pixel (see nv2a_vsh)
 
-    const bool has_depth = desc.depth_format != VK_FORMAT_UNDEFINED;
+    const bool has_depth = desc.depth_format != ATT_NONE;
+    VkFormat depth_vk = VK_FORMAT_UNDEFINED;
+    VkFormat color_vk = gfx_format_for_attachment(desc.color_format);
+    if (color_vk == VK_FORMAT_UNDEFINED ||
+        (has_depth && (depth_vk = gfx_format_for_attachment(desc.depth_format)) == VK_FORMAT_UNDEFINED)) {
+        return failf("create_pipeline: colour %u / depth %u is not a format this port knows",
+                     desc.color_format, desc.depth_format);
+    }
     VkPipelineDepthStencilStateCreateInfo ds;
     memset(&ds, 0, sizeof ds);
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -1852,9 +1915,9 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
     memset(&rendering, 0, sizeof rendering);
     rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &desc.color_format;
+    rendering.pColorAttachmentFormats = &color_vk;
     if (has_depth) {
-        rendering.depthAttachmentFormat = desc.depth_format;
+        rendering.depthAttachmentFormat = depth_vk;
     }
 
     VkGraphicsPipelineCreateInfo gp;
@@ -1889,8 +1952,16 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
 }
 
 // ---- d3d-layer pipeline creation (keeps VkFormat out of d3d layer) ----
-// color_format/depth_format are gfx::VertexFormatCode (0 = no attachment).
-// This function converts the d3d format codes to VkFormat and calls create_pipeline.
+//
+// color_format/depth_format are AttachmentFormat (ATT_NONE = no attachment of that kind).
+//
+// This used to run them through gfx_format_for_vertex_code, on the comment's word that they
+// were VertexFormatCode. That was wrong twice over: a vertex format code describes how to
+// *read a vertex*, and the table's colour entry (VF_R8G8B8A8_UNORM) is not the swapchain's
+// BGRA8, so a caller following that contract got the wrong bytes on screen rather than an
+// error. Nothing caught it because the only caller is unwired scaffolding. The codes now
+// cross the boundary as what they are -- attachment formats -- and no conversion happens
+// here at all.
 bool create_pipeline_d3d(Pipeline *p,
                          const void *vertex_spirv, size_t vertex_spirv_size,
                          const void *fragment_spirv, size_t fragment_spirv_size,
@@ -1904,8 +1975,8 @@ bool create_pipeline_d3d(Pipeline *p,
     desc.vertex_spirv_size = vertex_spirv_size;
     desc.fragment_spirv = fragment_spirv;
     desc.fragment_spirv_size = fragment_spirv_size;
-    desc.color_format = gfx_format_for_vertex_code(color_format);
-    desc.depth_format = depth_format ? gfx_format_for_vertex_code(depth_format) : VK_FORMAT_UNDEFINED;
+    desc.color_format = color_format;
+    desc.depth_format = depth_format;
     desc.attributes = attributes;
     desc.attribute_count = attribute_count;
     desc.bindings = bindings;
@@ -2732,7 +2803,8 @@ bool write_png_from_color_target(const char *path, const Image *img)
 
     // read_color hands back the image's own byte order; PNG wants RGBA. Only the two formats this port
     // creates for colour targets differ, and only in the first and third byte.
-    const bool bgra = img->format == VK_FORMAT_B8G8R8A8_UNORM || img->format == VK_FORMAT_B8G8R8A8_SRGB;
+    // AttachmentFormat codes, not VkFormats: see create_image's comment on why the image remembers the code.
+    const bool bgra = img->format == ATT_B8G8R8A8_UNORM || img->format == ATT_B8G8R8A8_SRGB;
     if (bgra) {
         for (size_t i = 0; i < pixels.size(); i += 4) {
             const uint8_t t = pixels[i];

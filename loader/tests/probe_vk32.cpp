@@ -28,6 +28,7 @@
 // machine whose GPU this repository cannot see -- which is how the second GPU's row of the driver table in
 // `NOTES.md` gets filled in.
 #include "gfx/gfx_vulkan.h"
+#include "d3d/vertex_posix.h"
 
 #include "gfx/png.h"
 #include "platform/posix/log.h"
@@ -81,8 +82,8 @@ const uint8_t kBackground[4] = {128, 0, 0, 255}; // the clear colour (0, 0, 0.5,
 
 void expected_pixel(uint32_t x, uint32_t y, uint8_t out[4])
 {
-    // Pixel centre in clip space. The viewport is the whole target and the Y axis is flipped on the way to
-    // the framebuffer, so both matter and both are one line each.
+    // Pixel centre in clip space. The viewport is the whole target, so a pixel centre maps to clip space
+    // directly, in Vulkan's y-down framebuffer order: row 0 is the top, hence the `1.0f -` below.
     //
     // The parentheses around the fraction are load-bearing. `1.0f - X * 2.0f - 1.0f` -- which is what this used
     // to say -- is `(1 - X*2) - 1`, because `/`, `*` and `-` are all left-to-right at these precedences: it
@@ -90,7 +91,16 @@ void expected_pixel(uint32_t x, uint32_t y, uint8_t out[4])
     // That reference covered 722 pixels where the correct one covers 962, and the 722 matched what this gate
     // reported, which is how the mistake stayed invisible for so long. See NOTES.md.
     const float ndc_x = ((float)x + 0.5f) / (float)kWidth * 2.0f - 1.0f;
-    const float ndc_y = 1.0f - (((float)y + 0.5f) / (float)kHeight * 2.0f);
+    // D3D orientation, and that is not a typo: this port's framebuffer has NDC y = -1 at the top, because
+    // set_viewport deliberately does not flip (see its comment -- negating the height drew the game upside
+    // down). So row 0 is clip y = -0.979 and the last row is +0.979.
+    //
+    // This reference used to compute the Vulkan order instead (`1.0f - y * 2.0f`), and reported 1444 of 3072
+    // pixels mismatched while covering the same 962. The two orders cover the same *count* on this symmetric
+    // triangle, which is why the number looked plausible for so long and why no one read past it: at (7,5) the
+    // reference called the pixel background and the GPU had drawn the triangle there. The sets now intersect
+    // 962 of 962 against what the driver actually produced, which is the check that settles it. See NOTES.md.
+    const float ndc_y = (((float)y + 0.5f) / (float)kHeight) * 2.0f - 1.0f;
 
     // Barycentric coordinates by the edge-function form, which needs no normalisation and no special case
     // for one of the vertices being the origin.
@@ -151,18 +161,19 @@ static ChildOutcome run_gate_on_current_device()
 {
     step("create_targets");
     gfx::Image target, depth;
-    if (!gfx::create_color_target(&target, kWidth, kHeight, VK_FORMAT_B8G8R8A8_UNORM) ||
-        !gfx::create_depth_target(&depth, kWidth, kHeight, VK_FORMAT_D32_SFLOAT)) {
+    if (!gfx::create_color_target(&target, kWidth, kHeight, gfx::ATT_B8G8R8A8_UNORM) ||
+        !gfx::create_depth_target(&depth, kWidth, kHeight, gfx::ATT_D32_SFLOAT)) {
         report("targets", "could not create the colour or depth target");
         return OUT_SETUP;
     }
     gfx::set_render_target(&target, &depth);
 
     const gfx::VertexAttribute attrs[] = {
-        {0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
-        {0, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 8},
+        {0, 0, xd3d::VF_R32G32_SFLOAT, 0},
+        {0, 1, xd3d::VF_R32G32B32A32_SFLOAT, 8},
     };
-    const gfx::VertexBinding binding = {0, 28, 0}; // position + colour, tightly packed
+    // sizeof(Vertex), not 28: a Vertex is 6 floats, so the packed stride is 24. See test_gfx.cpp.
+    const gfx::VertexBinding binding = {0, (uint32_t)sizeof(Vertex), 0};
     gfx::PipelineDesc desc;
     desc.vertex_spirv = kProbeVertSpv;
     desc.vertex_spirv_size = sizeof kProbeVertSpv;
@@ -253,6 +264,25 @@ static ChildOutcome run_gate_on_current_device()
         fflush(stdout);
     }
 
+    // A raw dump of the readback, so that "the reference says background" can be answered by looking at what
+    // came back rather than by reasoning about what the driver probably did. Off unless asked for.
+    // One file per device: the probe runs each in its own child but in the same process tree, so a single
+    // path has every device's dump overwrite the last one's and the file you end up reading is whichever
+    // device happened to run last. The index is in the name so the two can be told apart.
+    char dump_path[512];
+    dump_path[0] = 0;
+    if (const char *dump = getenv("VK_PROBE_DUMP")) {
+        snprintf(dump_path, sizeof dump_path, "%s.%u", dump, gfx::adapter_index());
+        FILE *f = fopen(dump_path, "wb");
+        if (f) {
+            fprintf(f, "%u %u\n", kWidth, kHeight);
+            fwrite(pixels.data(), 1, pixels.size(), f);
+            fclose(f);
+            printf("DUMP path=%s bytes=%zu\n", dump_path, pixels.size());
+            fflush(stdout);
+        }
+    }
+
     // Timing, because the plan asks for it and because a driver that draws 64x48 in half a second is a
     // different answer from one that draws it in a millisecond. Cheap, single-threaded, and clearly labelled
     // as an upper bound rather than a benchmark.
@@ -291,7 +321,7 @@ static ChildOutcome run_gate_on_current_device()
 static ChildOutcome check_api_path()
 {
     gfx::Image target;
-    if (!gfx::create_color_target(&target, kWidth, kHeight, VK_FORMAT_B8G8R8A8_UNORM)) {
+    if (!gfx::create_color_target(&target, kWidth, kHeight, gfx::ATT_B8G8R8A8_UNORM)) {
         report("clear", "could not create the target");
         return OUT_SETUP;
     }

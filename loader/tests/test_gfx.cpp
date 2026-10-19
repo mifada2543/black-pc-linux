@@ -17,6 +17,7 @@
 //     (1x8 and 8x1 layouts alike) and the 32-bit loader does not expose push descriptors. The always-tested
 //     draw therefore uses a shader with no sampler, and the textured draw runs in a forked child so that a
 //     driver which dies takes the child with it and the suite reports what happened.
+#include "d3d/vertex_posix.h"
 #include "gfx/gfx_vulkan.h"
 #include "gfx/png.h"
 #include "platform/posix/log.h"
@@ -107,10 +108,10 @@ static void test_device()
     // The two formats the game actually uses. These are the decisions the plan makes about the port's format
     // mapping, and they are checkable before there is a picture to compare them against.
     gfx::Image probe;
-    check(gfx::create_color_target(&probe, 16, 16, VK_FORMAT_B8G8R8A8_UNORM),
+    check(gfx::create_color_target(&probe, 16, 16, gfx::ATT_B8G8R8A8_UNORM),
           "A8R8G8B8 targets work (B8G8R8A8_UNORM here)");
     gfx::destroy_image(&probe);
-    check(gfx::create_depth_target(&probe, 16, 16, VK_FORMAT_D32_SFLOAT),
+    check(gfx::create_depth_target(&probe, 16, 16, gfx::ATT_D32_SFLOAT),
           "D24S8 depth works (D32_SFLOAT here)");
     gfx::destroy_image(&probe);
 
@@ -134,7 +135,7 @@ static void test_clear_and_readback()
     printf("\nclear and readback\n");
 
     gfx::Image target;
-    if (!gfx::create_color_target(&target, kWidth, kHeight, VK_FORMAT_B8G8R8A8_UNORM)) {
+    if (!gfx::create_color_target(&target, kWidth, kHeight, gfx::ATT_B8G8R8A8_UNORM)) {
         check(false, std::string("a render target (") + gfx::last_error() + ")");
         return;
     }
@@ -189,16 +190,22 @@ static bool draw_the_triangle(const void *frag_spirv, size_t frag_size, std::vec
                               gfx::Image *keep = nullptr)
 {
     gfx::Image target, depth;
-    if (!gfx::create_color_target(&target, kWidth, kHeight, VK_FORMAT_B8G8R8A8_UNORM) ||
-        !gfx::create_depth_target(&depth, kWidth, kHeight, VK_FORMAT_D32_SFLOAT))
+    if (!gfx::create_color_target(&target, kWidth, kHeight, gfx::ATT_B8G8R8A8_UNORM) ||
+        !gfx::create_depth_target(&depth, kWidth, kHeight, gfx::ATT_D32_SFLOAT))
         return false;
     gfx::set_render_target(&target, &depth);
 
     const gfx::VertexAttribute attrs[] = {
-        {0, 0, VK_FORMAT_R32G32_SFLOAT, 0},         // position
-        {0, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 8},  // colour
+        {0, 0, xd3d::VF_R32G32_SFLOAT, 0},         // position
+        {0, 1, xd3d::VF_R32G32B32A32_SFLOAT, 8},  // colour
     };
-    const gfx::VertexBinding binding = {0, 28, 0}; // position (8 bytes) + colour (16), tightly packed
+    // sizeof(Vertex), not a literal. The stride was written as 28 with a comment claiming the vertices were
+    // "tightly packed", which they are not: a Vertex is 6 floats, so the packed stride is 24. Every vertex
+    // after the first was therefore read four bytes late, and what came out was a wedge of the first vertex's
+    // red in the corner instead of a three-coloured triangle. Nothing noticed, because the only devices this
+    // test had run on produced no fragments and died respectively. A stride is a fact about the type, so it
+    // is read from the type.
+    const gfx::VertexBinding binding = {0, (uint32_t)sizeof(Vertex), 0};
     gfx::PipelineDesc desc;
     desc.vertex_spirv = kProbeVertSpv;
     desc.vertex_spirv_size = sizeof kProbeVertSpv;
@@ -255,12 +262,34 @@ static bool draw_the_triangle(const void *frag_spirv, size_t frag_size, std::vec
     return ok;
 }
 
+// The first few bytes of a file, or an empty string when it cannot be read. Exists because after fork() the
+// only result a parent can actually see is what the child left on disk, so "the child wrote a PNG" has to be
+// checked by reading the PNG rather than by trusting a value the child passed back through memory.
+static std::string file_prefix(const char *path, size_t want)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return std::string();
+    std::string head(want, '\0');
+    const size_t n = fread(&head[0], 1, want, f);
+    fclose(f);
+    head.resize(n);
+    return head;
+}
+
+// Exit codes from the child, so the parent can tell four outcomes apart instead of one. It used to collapse
+// them: any nonzero exit became "the driver died building the pipeline", which is how a child that drew a
+// frame perfectly and then failed a check got reported as a driver crash.
+enum DrawChild {
+    DRAW_OK = 0,          // drew, and every pixel check passed
+    DRAW_COULD_NOT = 1,   // a target, a pipeline, a buffer or a draw could not be made
+    DRAW_NO_FRAGMENTS = 2, // drew and read back, but the device rasterised nothing: not measurable here
+    DRAW_WRONG = 3,       // drew with fragments, and at least one pixel check disagreed
+};
+
 static void test_draw(const char *out_png)
 {
     printf("\na real draw\n");
 
-    std::vector<uint8_t> pixels;
-    gfx::Image target_for_png;
     // In a child, for the same reason the textured draw is: a driver that dies inside the draw has to take
     // the child with it rather than the suite. This stopped being hypothetical -- see below.
     //
@@ -270,67 +299,150 @@ static void test_draw(const char *out_png)
     // which hid everything that came after. With that fixed, Intel is selected for real, and it turns out to
     // die inside vkCreateGraphicsPipelines on this machine. A suite that dies there measures nothing at all,
     // so the draw is isolated and its death is reported as what it is: this device produced no fragments.
+    //
+    // EVERYTHING that inspects the result is in the child, not just the draw. fork() gives the child private
+    // copy-on-write pages, so a std::vector the child fills and an Image the child creates are still empty
+    // and uninitialised in the parent -- and this test spent years' worth of changes reading both anyway,
+    // which is undefined behaviour that happened to look like it worked because the child never lived long
+    // enough to reach those lines. The parent keeps only what genuinely crosses the fork: the exit status,
+    // the child's stdout, and the PNG file, which is written to disk and so is shared. That is the same
+    // division the textured test below already used, and it is the only one that can be correct.
     fflush(stdout);
     const pid_t pid = fork();
     if (pid == 0) {
-        const bool ok = draw_the_triangle(kProbeFragSpv, sizeof kProbeFragSpv, &pixels, &target_for_png);
-        _exit(ok ? 0 : 1);
+        std::vector<uint8_t> pixels;
+        gfx::Image target;
+        if (!draw_the_triangle(kProbeFragSpv, sizeof kProbeFragSpv, &pixels, &target)) _exit(DRAW_COULD_NOT);
+        if (!gfx::write_png_from_color_target(out_png, &target)) _exit(DRAW_COULD_NOT);
+
+        auto at = [&](uint32_t x, uint32_t y) { return &pixels[((size_t)y * kWidth + x) * 4]; };
+
+        // Whether the driver rasterised anything at all, measured before anything is asserted about it. On a
+        // driver that does, the checks below run; on one that quietly drops every fragment they are reported as
+        // not measurable here rather than as failures.
+        const uint8_t *bg = at(0, 0);
+        int differing = 0;
+        for (size_t i = 0; i < pixels.size(); i += 4)
+            if (pixels[i] != bg[0] || pixels[i + 1] != bg[1] || pixels[i + 2] != bg[2]) differing++;
+        printf("       %d of %u pixels differ from the background after the draw\n", differing,
+               kWidth * kHeight);
+        fflush(stdout);
+        if (differing == 0) _exit(DRAW_NO_FRAGMENTS);
+
+        int bad = 0;
+        auto want = [&](bool cond, const char *what) {
+            printf("  %s %s\n", cond ? "ok  " : "FAIL", what);
+            if (!cond) bad++;
+            fflush(stdout);
+        };
+
+        // read_color hands back B8G8R8A8 bytes, so red is index 2, green index 1 and blue index 0. The old
+        // checks here tested red at index 0 and blue at index 2 -- shifted by one channel, which is what let
+        // a red corner be reported as "not red". The old comment said "(in BGR bytes)" next to a test that was
+        // written in RGB order, so the mistake was visible in the source and still passed.
+        auto dominant = [&](uint32_t x, uint32_t y, int channel) {
+            const uint8_t *p = at(x, y);
+            const int other[2] = {channel == 0 ? 1 : 0, channel == 2 ? 1 : 2};
+            return p[channel] > 180 && p[other[0]] < 90 && p[other[1]] < 90;
+        };
+        // Anywhere in a box, not one exact pixel: the pure core of each corner is only a few pixels across,
+        // so a fixed sample point would be testing rasteriser rounding rather than the thing being checked.
+        auto any_dominant = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, int channel) {
+            for (uint32_t y = y0; y <= y1 && y < kHeight; y++)
+                for (uint32_t x = x0; x <= x1 && x < kWidth; x++)
+                    if (dominant(x, y, channel)) return true;
+            return false;
+        };
+
+        // Where the geometry says the triangle is, in Vulkan's orientation. Clip-space y = -1 is the TOP of a
+        // Vulkan framebuffer, so the two vertices at y = -0.6 land along the top edge and the one at y = +0.6
+        // hangs below them. 64x48 with the viewport at the origin puts them at x = 12.8 and 51.2 and y = 9.6.
+        //
+        // These expectations used to be the other way up (red bottom-left, green bottom-right, blue on top),
+        // which is the D3D orientation. They were never checked against a picture, because nothing rasterised
+        // until the vertex format and stride were fixed, so the wrong assumption sat there looking like a
+        // passing test. gfx:: is a Vulkan layer and does not promise a D3D orientation; turning the console's
+        // framebuffer the right way up is the *shader translation's* job -- nv2a_vsh multiplies gl_Position
+        // by a vmScale uniform -- and that scale is not written anywhere yet (A4 step 5). So this probe checks
+        // what gfx:: actually promises, and the console's Y flip is tracked there, not faked here.
+        const uint8_t *centre = at(kWidth / 2, kHeight / 2);
+        want(centre[0] < 200 && centre[1] < 200 && centre[2] < 200,
+             "the middle of the target is not the background any more (there is a triangle there)");
+        want(centre[3] == 255, "and it is opaque");
+
+        // The three corners are the three colours, and which corner gets which is fixed by the vertex order
+        // -- so this checks the whole path from the vertex buffer through the vertex shader to the pixel, not
+        // merely that something was drawn. Channel 2 is red, 1 is green, 0 is blue, in B8G8R8A8 order.
+        want(any_dominant(13, 10, 22, 15, 2), "the top-left corner is the first vertex' red");
+        want(any_dominant(42, 10, 51, 15, 1), "the top-right corner is the second vertex' green");
+        want(any_dominant(27, 31, 37, 37, 0), "and the bottom corner is the third vertex' blue");
+
+        // The bounding box is the check that a wrong stride cannot pass. With the four extra bytes per vertex
+        // the triangle came out as a wedge of the first colour in one corner, which still put red near the
+        // top left -- so the three colour checks above would have been satisfied by the broken picture. The
+        // box is what says the geometry has the size and position the vertex data asked for.
+        uint32_t lo_x = kWidth, hi_x = 0, lo_y = kHeight, hi_y = 0;
+        for (uint32_t y = 0; y < kHeight; y++)
+            for (uint32_t x = 0; x < kWidth; x++)
+                if (at(x, y)[0] != bg[0] || at(x, y)[1] != bg[1] || at(x, y)[2] != bg[2]) {
+                    if (x < lo_x) lo_x = x;
+                    if (x > hi_x) hi_x = x;
+                    if (y < lo_y) lo_y = y;
+                    if (y > hi_y) hi_y = y;
+                }
+        printf("       bounding box: x %u..%u, y %u..%u\n", lo_x, hi_x, lo_y, hi_y);
+        want(lo_x >= 12 && lo_x <= 14 && hi_x >= 50 && hi_x <= 52 && lo_y >= 9 && lo_y <= 11 &&
+                 hi_y >= 37 && hi_y <= 39,
+             "and the triangle covers the box the vertex data asked for");
+
+        // Just outside the triangle the clear colour has to survive, or the triangle covered everything and
+        // the checks above would prove nothing about where its edges are. Compared against bg rather than
+        // against a threshold: the clear colour is blue at 128, which is not "strongly dominant" by the test
+        // above, and a corner is not a triangle edge if it merely looks like a colour.
+        auto any_background = [&](uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+            for (uint32_t y = y0; y <= y1 && y < kHeight; y++)
+                for (uint32_t x = x0; x <= x1 && x < kWidth; x++) {
+                    const uint8_t *p = at(x, y);
+                    if (p[0] == bg[0] && p[1] == bg[1] && p[2] == bg[2]) return true;
+                }
+            return false;
+        };
+        want(any_background(0, 0, 8, 8), "the top-left corner of the target is still the background colour");
+        want(any_background(kWidth - 9, kHeight - 9, kWidth - 1, kHeight - 1),
+             "and so is the bottom-right corner");
+
+        gfx::destroy_image(&target);
+        _exit(bad ? DRAW_WRONG : DRAW_OK);
     }
+
     int status = 0;
     const pid_t reaped = pid > 0 ? waitpid(pid, &status, 0) : -1;
-    if (reaped != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        skip("a pipeline, a buffer and a draw (the driver died building the pipeline on this device)");
+    if (reaped != pid || !WIFEXITED(status)) {
+        skip("a pipeline, a buffer and a draw (the driver died inside the draw on this device)");
         skip("the triangle's three corner colours (same reason)");
         skip("the background outside the triangle (same reason)");
         return;
     }
-    check(true, "a pipeline, a buffer and a draw, with the shaders built at build time");
-
-    auto at = [&](uint32_t x, uint32_t y) { return &pixels[((size_t)y * kWidth + x) * 4]; };
-
-    // Whether the driver rasterised anything at all, measured before anything is asserted about it. On a
-    // driver that does, the checks below run; on one that quietly drops every fragment -- which is what 32-bit
-    // llvmpipe does on this machine -- they are reported as not measurable here rather than as failures.
-    const uint8_t *bg = at(0, 0);
-    int differing = 0;
-    for (size_t i = 0; i < pixels.size(); i += 4)
-        if (pixels[i] != bg[0] || pixels[i + 1] != bg[1] || pixels[i + 2] != bg[2]) differing++;
-    const bool rasterised = differing > 0;
-    printf("       %d of %u pixels differ from the background after the draw\n", differing, kWidth * kHeight);
-    if (!rasterised) {
+    switch (WEXITSTATUS(status)) {
+    case DRAW_COULD_NOT:
+        skip("a pipeline, a buffer and a draw (the child could not create them)");
+        skip("the triangle's three corner colours (same reason)");
+        skip("the background outside the triangle (same reason)");
+        return;
+    case DRAW_NO_FRAGMENTS:
+        check(true, "a pipeline, a buffer and a draw, with the shaders built at build time");
         skip("the triangle's three corner colours (this device produced no fragments at all)");
         skip("the background outside the triangle (same reason)");
-        check(gfx::write_png_from_color_target(out_png, &target_for_png), "a PNG was written anyway");
-        gfx::destroy_image(&target_for_png);
-        return;
+        break;
+    case DRAW_OK:
+        check(true, "a pipeline, a buffer and a draw, with the shaders built at build time");
+        break;
+    default:
+        check(false, "the child's pixel checks all agreed (it reported a mismatch; see above)");
+        break;
     }
-
-    // Where the geometry says the triangle is: clip-space (0,0) is the middle of the target, and the corners
-    // are a little over half the half-width away. 64x48, so x in [16,48] and y in [9,39] roughly.
-    const uint8_t *centre = at(kWidth / 2, kHeight / 2);
-    check(centre[0] < 200 && centre[1] < 200 && centre[2] < 200,
-          "the middle of the target is not the background any more (there is a triangle there)");
-    check(centre[3] == 255, "and it is opaque");
-
-    // The three corners are the three colours, and which corner gets which is fixed by the vertex order --
-    // so this checks the whole path from the vertex buffer through the vertex shader to the pixel, not merely
-    // that something was drawn.
-    const uint8_t *bottom_left = at(22, 38);
-    const uint8_t *bottom_right = at(42, 38);
-    const uint8_t *top = at(kWidth / 2, 12);
-    check(bottom_left[0] > 100 && bottom_left[1] < 60 && bottom_left[2] < 60,
-          "the bottom-left corner is the first vertex' red (in BGR bytes)");
-    check(bottom_right[1] > 100 && bottom_right[0] < 60 && bottom_right[2] < 60,
-          "the bottom-right corner is the second vertex' green");
-    check(top[2] > 100 && top[0] < 60 && top[1] < 60, "and the top corner is the third vertex' blue");
-
-    // Just outside the triangle the clear colour has to survive, or the triangle covered everything and the
-    // checks above would prove nothing about where its edges are.
-    const uint8_t *corner = at(0, 0);
-    check(corner[2] > 100 && corner[0] < 60, "the top-left corner is still the background colour");
-
-    check(gfx::write_png_from_color_target(out_png, &target_for_png), "a PNG was written");
-    gfx::destroy_image(&target_for_png);
+    static const char kPngSignature[8] = {'\x89', 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    check(file_prefix(out_png, 8) == std::string(kPngSignature, 8), "a PNG was written");
 }
 
 // ---- the same draw with a texture, in a child ----------------------------------------------------------
@@ -346,9 +458,9 @@ static void test_textured_draw_in_a_child()
         // segfaults inside llvmpipe, and an unwritten descriptor makes the *draw* crash. Either way the child
         // is what dies, and the parent turns that into a sentence.
         gfx::Image target, depth, texture;
-        if (!gfx::create_color_target(&target, kWidth, kHeight, VK_FORMAT_B8G8R8A8_UNORM) ||
-            !gfx::create_depth_target(&depth, kWidth, kHeight, VK_FORMAT_D32_SFLOAT) ||
-            !gfx::create_texture(&texture, 2, 2, VK_FORMAT_B8G8R8A8_UNORM, 1, true)) {
+        if (!gfx::create_color_target(&target, kWidth, kHeight, gfx::ATT_B8G8R8A8_UNORM) ||
+            !gfx::create_depth_target(&depth, kWidth, kHeight, gfx::ATT_D32_SFLOAT) ||
+            !gfx::create_texture(&texture, 2, 2, gfx::ATT_B8G8R8A8_UNORM, 1, true)) {
             printf("       (the child could not make its targets)\n");
             fflush(stdout);
             _exit(121);
@@ -363,10 +475,10 @@ static void test_textured_draw_in_a_child()
         if (!gfx::create_sampler(&sampler, desc)) _exit(123);
 
         const gfx::VertexAttribute attrs[] = {
-            {0, 0, VK_FORMAT_R32G32_SFLOAT, 0},
-            {0, 1, VK_FORMAT_R32G32B32A32_SFLOAT, 8},
+            {0, 0, xd3d::VF_R32G32_SFLOAT, 0},
+            {0, 1, xd3d::VF_R32G32B32A32_SFLOAT, 8},
         };
-        const gfx::VertexBinding binding = {0, 28, 0};
+        const gfx::VertexBinding binding = {0, (uint32_t)sizeof(Vertex), 0};
         gfx::PipelineDesc pd;
         pd.vertex_spirv = kProbeVertSpv;
         pd.vertex_spirv_size = sizeof kProbeVertSpv;

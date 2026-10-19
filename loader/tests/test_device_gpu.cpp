@@ -238,8 +238,8 @@ int main()
         printf("\n%d checks, 0 failures\n", g_checks);
         return 77;
     }
-    if (!gfx::create_color_target(&g_colour, kW, kH, VK_FORMAT_B8G8R8A8_UNORM) ||
-        !gfx::create_depth_target(&g_depth, kW, kH, VK_FORMAT_D16_UNORM)) {
+    if (!gfx::create_color_target(&g_colour, kW, kH, gfx::ATT_B8G8R8A8_UNORM) ||
+        !gfx::create_depth_target(&g_depth, kW, kH, gfx::ATT_D16_UNORM)) {
         printf("  --     no render targets: %s (skipped)\n", gfx::last_error());
         gfx::shutdown();
         return 77;

@@ -169,8 +169,11 @@ bool build_material(gfx::Pipeline *out, const MaterialDesc &desc, const char **e
     const Spirv &use_ps = have_ps ? ps : fallback_ps;
     d.fragment_spirv = use_ps.words;
     d.fragment_spirv_size = use_ps.bytes;
-    d.color_format = (VkFormat)desc.color_format;
-    d.depth_format = (VkFormat)desc.depth_format;
+    // Straight pass-through: MaterialDesc's colour/depth fields are already gfx AttachmentFormat codes,
+    // which is the whole point of that enum. This used to cast them to VkFormat to fill a PipelineDesc
+    // field, which meant shader/ named a Vulkan type for no reason (plan section 3.2).
+    d.color_format = desc.color_format;
+    d.depth_format = desc.depth_format;
     d.attributes = attrs.empty() ? nullptr : attrs.data();
     d.attribute_count = (uint32_t)attrs.size();
     d.bindings = binds.empty() ? nullptr : binds.data();

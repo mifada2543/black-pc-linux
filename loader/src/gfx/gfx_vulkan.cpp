@@ -423,6 +423,12 @@ static void probe_child(uint32_t physical_index)
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr,
                          0, nullptr);
+    // End the command buffer before submitting it. A command buffer handed to vkQueueSubmit has to be in
+    // the pending or executable state (VUID-vkQueueSubmit-pCommandBuffers-00070); one that is still
+    // recording is invalid usage, and this is the exact bug that made Intel's driver die inside
+    // vkQueueSubmit while llvmpipe quietly tolerated it. submit_frame ends its buffer for the same reason,
+    // and the comment there says why -- this path was simply missed when that was fixed.
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) probe_exit(PROBE_REFUSED);
     VkSubmitInfo si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;

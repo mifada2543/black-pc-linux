@@ -1648,3 +1648,78 @@ Masalah 0-piksel pada frame uji ada di `gfx::` atau di harness kita. Dengan data
 benar, program minimal yang meniru langkah-langkah loader **menggambar segitiga dengan
 benar** pada stride 28 dengan dua atribut. Jadi bukan llvmpipe. Belum ditemukan penyebabnya,
 dan tidak ada lagi yang bisa diklaim ke pihak mana pun sampai ketemu.
+
+---
+
+## Tapani menemukan bug kita sendiri: vkQueueSubmit tanpa vkEndCommandBuffer (2026-10-19)
+
+### Intinya
+
+Tapani Pälli menjawab di issue ANV:
+
+> This looks like application bug, you are not calling vkEndCommandBuffer before
+> submitting it.
+> `VUID-vkQueueSubmit-pCommandBuffers-00070`
+
+Dia **benar**. Dicek di dua tempat:
+
+```
+gfx_vulkan.cpp probe_child()  :  vkBeginCommandBuffer -> vkCmdPipelineBarrier -> vkQueueSubmit
+                                 (vkEndCommandBuffer tidak ada)
+tools/repro_anv.c line 160-178 :  sama
+```
+
+Command buffer yang masih *recording* diserahkan ke `vkQueueSubmit` adalah pelanggaran
+spesifikasi. **llvmpipe menoleransi; ANV tidak.** Itu sebabnya software renderer selalu
+jalan dan hardware selalu mati -- bukan karena llvmpipe lebih baik, tapi karena
+**kita** yang salah, dan hanya driver yang toleran yang menyembunyikannya.
+
+Yang membuat ini lolos: `submit_frame()` sudah memanggil `vkEndCommandBuffer`
+dengan komentar panjang tentang kelas bug yang sama. Jalur **probe** terlewat saat itu
+diperbaiki.
+
+### Setelah diperbaiki
+
+```
+tools/repro_anv.c : Mesa 25.2.8, 32-bit -> exit 0   (dulu SIGSEGV)
+                    Mesa 25.2.8, 64-bit -> exit 0   (dulu SIGSEGV)
+```
+
+Crash ANV hilang. Gate A0 untuk pertama kalinya **memilih Intel ADL GT2**, dan
+clear + readback lolos di hardware.
+
+### Akibat lanjutan: bug kedua, belum selesai
+
+Begitu probe tidak lagi crash, ANV benar-benar dipakai -- dan ia mati di
+`vkCreateGraphicsPipelines`:
+
+```
+#0 emit_ves_vf_instancing  genX_pipeline.c:217      (eax = 0)
+#1 emit_vertex_input       genX_pipeline.c:321
+#2 gfx12_graphics_pipeline_emit
+#3 anv_graphics_pipeline_emit
+#5 anv_CreateGraphicsPipelines
+#6 gfx::create_pipeline    gfx_vulkan.cpp:1877
+```
+
+`test_gfx` jadi segfault karena ia menggambar di proses utama. Draw-nya sekarang
+dijalankan di child -- pola yang sudah dipakai tes bertekstur -- sehingga kematian driver
+dilaporkan sebagai "device ini tidak menghasilkan fragmen", bukan sebagai suite yang mati.
+
+Yang **sudah disingkirkan** sebagai penyebab: jumlah atribut (1 atau 2 sama saja),
+`depthClampEnable`, descriptor set di layout, ukuran viewport statis, dan keenam device
+feature yang dinyalakan. Semua diuji satu per satu di loader sendiri.
+
+Belum diketahui apakah ini bug ANV atau punyaku. Yang diketahui: program minimal yang
+meniru langkah loader **berhasil** membuat pipeline di GPU yang sama -- tapi pipeline-nya
+lebih sederhana, jadi belum bisa disebut bukti.
+
+### Yang dicabut dari catatan sebelumnya
+
+Semua angka di `report.md` bagian [6] yang berbunyi "belum diperbaiki di Mesa 26.2.5"
+**salah**, dan tabel di sana sudah diperbarui. Angka itu terlihat seperti hasil kuat, tapi
+hanya hasil dari kode yang memang salah. Kalau Tapani tidak membacanya, kita akan mengulang
+tes itu berkali-kali dan selalu mendapat jawaban yang sama salah.
+
+Pelajarannya: Bug yang kita kirim sudah divalidasi hanya terhadap pemakaian yang benar.
+Bug ours lolos karena tidak ada yang membaca kode yang kita kirim.

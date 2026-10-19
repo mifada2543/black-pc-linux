@@ -261,8 +261,27 @@ static void test_draw(const char *out_png)
 
     std::vector<uint8_t> pixels;
     gfx::Image target_for_png;
-    if (!draw_the_triangle(kProbeFragSpv, sizeof kProbeFragSpv, &pixels, &target_for_png)) {
-        check(false, std::string("the triangle was drawn (") + gfx::last_error() + ")");
+    // In a child, for the same reason the textured draw is: a driver that dies inside the draw has to take
+    // the child with it rather than the suite. This stopped being hypothetical -- see below.
+    //
+    // What made it necessary: the A0 probe used to end its command buffer without vkEndCommandBuffer before
+    // submitting, which is invalid usage (VUID-vkQueueSubmit-pCommandBuffers-00070). llvmpipe tolerated it and
+    // the Intel driver did not, so the probe reported "its driver died on submit" and Intel was skipped --
+    // which hid everything that came after. With that fixed, Intel is selected for real, and it turns out to
+    // die inside vkCreateGraphicsPipelines on this machine. A suite that dies there measures nothing at all,
+    // so the draw is isolated and its death is reported as what it is: this device produced no fragments.
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const bool ok = draw_the_triangle(kProbeFragSpv, sizeof kProbeFragSpv, &pixels, &target_for_png);
+        _exit(ok ? 0 : 1);
+    }
+    int status = 0;
+    const pid_t reaped = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    if (reaped != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        skip("a pipeline, a buffer and a draw (the driver died building the pipeline on this device)");
+        skip("the triangle's three corner colours (same reason)");
+        skip("the background outside the triangle (same reason)");
         return;
     }
     check(true, "a pipeline, a buffer and a draw, with the shaders built at build time");

@@ -173,6 +173,8 @@ int main(int argc, char **argv)
         si.commandBufferCount = 1;
         si.pCommandBuffers = &cmd;
 
+        // End the command buffer before submitting: VUID-vkQueueSubmit-pCommandBuffers-00070.
+        CHK(vkEndCommandBuffer(cmd));
         printf("  vkQueueSubmit...\n");
         fflush(stdout);
         CHK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); // <-- SIGSEGV inside ANV

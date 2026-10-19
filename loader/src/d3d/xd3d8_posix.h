@@ -231,6 +231,19 @@ constexpr uint32_t DEV_SCREENOFFSET_Y = 0x0EFC;
 constexpr uint32_t DEV_TEXTURES = 0x0F98;      // Resource* [4]
 constexpr uint32_t DEV_TRANSFORMS = 0x0C60;   // Matrix[10]: D3DTS_WORLD .. D3DTS_VIEW, 0x40 bytes each
 constexpr uint32_t DEV_VIEWPORT = 0x0EE0;     // Viewport: starts exactly where the ten transforms end
+constexpr uint32_t DEV_MATERIAL = 0x00E0;      // D3DMATERIAL9 (68 bytes)
+constexpr uint32_t DEV_MATERIAL_SET = 0x0128;  // bool
+constexpr uint32_t DEV_LIGHTS = 0x0100;        // Light[8] (8 * 104 bytes = 0x350)
+constexpr uint32_t DEV_LIGHTS_ON = 0x0200;     // bool[8]
+constexpr uint32_t DEV_SCISSOR_RECT = 0x0208;  // D3DRECT (16 bytes)
+constexpr uint32_t DEV_SCISSOR_ON = 0x0218;    // bool
+
+// D3DRECT / Rect (16 bytes) - used by scissor and resource locking
+struct Rect {
+    int32_t left, top, right, bottom;
+};
+static_assert(sizeof(Rect) == 16, "a rect is four longs");
+
 constexpr uint32_t DEV_VERTEXSHADER = 0x0794;  // m_VertexShader (XbSymbolDatabase)
 constexpr uint32_t DEV_RENDERTARGET = 0x1A04;  // Surface*
 constexpr uint32_t DEV_ZBUFFER = 0x1A08;       // Surface*

@@ -43,6 +43,32 @@ constexpr uint32_t VS_CONSTANT_COUNT = 192;
 constexpr uint32_t PS_CONSTANT_COUNT = 16;
 constexpr uint32_t MAX_LIGHTS = 8;
 
+// D3DMATERIAL9 (matches D3DMATERIAL8, 68 bytes)
+struct Material {
+    float Diffuse[4];   // r, g, b, a
+    float Ambient[4];
+    float Specular[4];
+    float Emissive[4];
+    float Power;
+};
+
+// D3DLIGHT9 (matches D3DLIGHT8, 104 bytes)
+struct Light {
+    uint32_t Type;          // D3DLIGHTTYPE
+    float Diffuse[4];
+    float Specular[4];
+    float Ambient[4];
+    float Position[3];
+    float Direction[3];
+    float Range;
+    float Falloff;
+    float Attenuation0;
+    float Attenuation1;
+    float Attenuation2;
+    float Theta;
+    float Phi;
+};
+
 // The state we own. Kept in one place so that "what does the loader think is bound" has one answer.
 struct DeviceState {
     Surface *render_target = nullptr;
@@ -72,6 +98,15 @@ struct DeviceState {
     // field that gets read later by someone assuming it is live. D3DDevice_Swap advances the real one.
     uint32_t gpu_time = 0;     // SetFence's counter, mirrored into the device object at DEV_GPUTIME
     uint32_t vblank_count = 0; // drives GetDisplayFieldStatus's field parity
+
+    // Material & lighting (A3). The console keeps these in the device object and the game reads them
+    // directly, so we mirror the same layout. D3DMATERIAL9 = 68 bytes, D3DLIGHT9 = 104 bytes.
+    Material material = {};
+    bool material_set = false;
+    Light lights[MAX_LIGHTS] = {};
+    bool lights_on[MAX_LIGHTS] = {};
+    Rect scissor = {};
+    bool scissor_on = false;
 
     // The window the loader opened, which is what GetDisplayMode reports back: the game uses the answer to
     // decide how big its back buffer should be, so it has to be the real size rather than the TV mode.

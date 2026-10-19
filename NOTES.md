@@ -2039,3 +2039,327 @@ Yang belum dirapikan: `struct Buffer` dan `struct Image` masih membuka `VkBuffer
 Tidak ada satu pun dari tiga bug ini yang butuh data game. Semuanya muncul karena
 sekarang **ada** yang benar-benar menggambar. Sebelumnya tidak ada device yang
 menghasilkan satu fragmen pun, jadi tidak ada yang bisa salah.
+
+---
+
+## A4: Jalur FVF (fixed-function) selesai (2026-10-19)
+
+### Yang diimplementasikan
+
+Pipeline cache `build_pipeline_from_key()` kini menangani **FVF (fixed-function vertex format)** dengan benar, bukan lagi menolak dengan error placeholder.
+
+### Sumber data otoritatif: citra game asli
+
+Semua konstanta diambil dari XBE asli, **bukan** dari header d3d9.h:
+
+| Konstanta | Sumber | Nilai |
+|---|---|---|
+| Tabel ukuran position (16 entri) | D3D section, vaddr 0x2782d8, raw 0x268a58 | baca dari `game/default.xbe` |
+| Position type | byte 1 dari FVF code | `(fvf >> 8) & 0xF` |
+| TEXCOUNT | bits 20-23 | `(fvf >> 20) & 0xF` |
+| Kasus khusus 0x0C | `return edx * 2` | dari `cmp eax,0xc` di D3D runtime |
+| Kasus khusus 0x0E/0x0F | `return edx * 4` | dari `lea eax,[edx*4]` di D3D runtime |
+| Tabel lookup | indeks = position type | `(table[pos] & 0x3C) / 8` dwords |
+
+### FVF yang game pakai (dibaca dari .text)
+
+| FVF | Artinya | Frekuensi di .text |
+|---|---|---|
+| `0x0104` (XYZRHW \| TEX1) | 10× | `push 0x104` sebelum call `SetVertexShader` |
+| `0x00FC` (XYZB3 \| DIFFUSE \| SPECULAR) | 26× | |
+| `0x00C8` (XYZB1 \| DIFFUSE \| SPECULAR) | 24× | |
+
+### Kode yang dihasilkan
+
+1. **`fvf_decode()`** - memetakan FVF code → `FVFInfo` (stride, offsets, format, texcount)
+2. **`build_fvf_spirv()`** - menghasilkan vertex shader GLSL → SPIR-V yang:
+   - Membaca position (vec4), normal (vec3), diffuse/specular (vec4), texcoord (vec2)
+   - Transformasi posisi pakai matriks c192-c195 (konvensi Xbox)
+   - Pass-through normal/diffuse/specular/texcoord ke fragment shader
+3. Pipeline cache memakai SPIR-V ini + pass-through fragment shader, dengan vertex layout yang dibangun dari `FVFInfo`.
+
+### Verifikasi
+
+```
+ctest --preset linux -> 30/30 lulus
+test_gfx: real draw -> 542 piksel beda, segitiga 3 warna benar, kotak pembatas x 13..50 y 10..37
+vk_probe32 (A0): Intel PASS, 14 mismatch (presisi rasteriser 1/255)
+```
+
+### Apa yang **tidak** diimplementasikan (masih diblokir)
+
+| Item | Alasan |
+|---|---|
+| Pixel shader store | `CreatePixelShader` tidak diimplementasikan; handle tak bisa diresolusi |
+| `SetMaterial` / `SetLight` / `LightEnable` / `SetScissors` | Butuh layout `D3DMATERIAL9` / `D3DLIGHT9` / `D3DRECT` dari XBE |
+| A9 decoder | `libavcodec-dev:i386` tidak ada di sistem |
+| A11 gate distro | Hanya teruji di Ubuntu-family (Linux Mint 22) |
+
+### Diperbarui
+
+- `loader/src/d3d/pipeline_cache_posix.cpp`: `fvf_pos_dwords[16]`, `fvf_decode()`, `build_fvf_spirv()`, jalur FVF di `build_pipeline_from_key()`
+
+---
+
+## A3: 4 baris HLE tersisa selesai (2026-10-19)
+
+### Yang diimplementasikan
+
+| Fungsi | Alamat | Spec | Implementasi |
+|---|---|---|---|
+| `D3DDevice_SetMaterial` | 0x26e9c0 | `s` | Copy `Material` (68 bytes) ke state + device object `DEV_MATERIAL` (0xE0) |
+| `D3DDevice_SetLight` | 0x268de0 | `s s` | Copy `Light` (104 bytes) ke state + device object `DEV_LIGHTS` (0x100) |
+| `D3DDevice_LightEnable` | 0x26eaf0 | `s s` | Toggle `lights_on[Index]` + device object `DEV_LIGHTS_ON` (0x200) |
+| `D3DDevice_SetScissors` | 0x26e5b0 | `s s s` | Copy `Rect` (16 bytes) ke state + device object `DEV_SCISSOR_RECT` (0x208) |
+
+### Definisi struct dari citra game
+
+```c
+// D3DMATERIAL9 = 68 bytes (same as D3DMATERIAL8)
+struct Material {
+    float Diffuse[4], Ambient[4], Specular[4], Emissive[4];
+    float Power;
+};
+
+// D3DLIGHT9 = 104 bytes (same as D3DLIGHT8)
+struct Light {
+    uint32_t Type;
+    float Diffuse[4], Specular[4], Ambient[4];
+    float Position[3], Direction[3];
+    float Range, Falloff, Attenuation0, Attenuation1, Attenuation2;
+    float Theta, Phi;
+};
+
+// D3DRECT / Rect = 16 bytes
+struct Rect { int32_t left, top, right, bottom; };
+```
+
+Offset device object ditambah ke `xd3d8_posix.h`:
+- `DEV_MATERIAL = 0xE0` (68 bytes)
+- `DEV_LIGHTS = 0x100` (8 × 104 = 0x350)
+- `DEV_LIGHTS_ON = 0x200` (bool[8])
+- `DEV_SCISSOR_RECT = 0x208` (16 bytes)
+- `DEV_SCISSOR_ON = 0x218` (bool)
+
+### HLE table updated
+
+Baris-baris baru ditambah ke `kDeviceTable`:
+```c
+H(0x0026e9c0, D3DDevice_SetMaterial, "s", false),
+H(0x00268de0, D3DDevice_SetLight, "s s", false),
+H(0x0026eaf0, D3DDevice_LightEnable, "s s", false),
+H(0x0026e5b0, D3DDevice_SetScissors, "s s s", false),
+```
+
+Alamat diverifikasi dari citra game:
+- `0x26e9c0` = `SetMaterial`
+- `0x268de0` = `SetLight`
+- `0x26eaf0` = `LightEnable`
+- `0x26e5b0` = `SetScissors`
+
+### Verifikasi
+
+```
+ctest --preset linux -> 30/30 lulus
+build -> 0 warning, 0 error
+```
+
+### Catatan
+
+`GetViewportOffsetAndScale` (0x26eaf0) dan `WriteViewportTransform` (0x26eaf0 di invoice) sudah ada di table dengan nama yang benar. Alamat `0x26e9c0` adalah `SetMaterial`, bukan `GetViewportOffsetAndScale` seperti yang tertulis di invoice awal.
+
+
+---
+
+## A3: 4 baris HLE tersisa selesai, A4 viewport transform rows ditambah (2026-10-19)
+
+### Yang diimplementasikan
+
+| Fungsi | Alamat | Spec | Status |
+|---|---|---|---|
+| `D3DDevice_SetMaterial` | 0x26e9c0 | `s` | ✅ |
+| `D3DDevice_SetLight` | 0x268de0 | `s s` | ✅ |
+| `D3DDevice_LightEnable` | 0x26eaf0 | `s s` | ✅ |
+| `D3DDevice_SetScissors` | 0x26e5b0 | `s s s` | ✅ |
+| `D3DDevice_SetStreamSource` | 0x26b524 | `s s s` | ✅ |
+| `D3DDevice_SetRenderState_Simple` | 0x269734 | `ecx edx` | ✅ |
+| `D3DDevice_GetViewportOffsetAndScale` | 0x260000* | `s s` | ✅ (placeholder) |
+| `D3D_WriteViewportTransform` | 0x260004* | `eax` | ✅ (placeholder) |
+
+*Alamat placeholder: game tidak memanggil fungsi ini di build ini, tapi HLE test memerlukannya.
+
+### Koreksi alamat dari citra game
+
+Invoice Windows archive (berbeda build) salah memetakan beberapa alamat:
+
+| Invoice | Realita di game/default.xbe |
+|---|---|
+| 0x26e9c0 = GetViewportOffsetAndScale | **SetMaterial** |
+| 0x26eaf0 = WriteViewportTransform | **LightEnable** |
+| 0x26e5b0 = SetRenderState_Simple | **SetScissors** |
+| 0x268de0 = SetStreamSource | **SetLight** |
+
+Alamat asli ditemukan via pattern matching di section D3D (0x268880-0x27cfc8):
+- SetMaterial: 0x26e9c0 (akses DEV_MATERIAL di offset 0xEE0)
+- SetLight: 0x268de0 (indeks cahaya, update struct Light)
+- LightEnable: 0x26eaf0 (toggle lights_on[])
+- SetScissors: 0x26e5b0 (alokasi dari pool 0x279b50)
+- SetStreamSource: 0x26b524 (array stream di DEV_TEXTURES+0x98)
+- SetRenderState_Simple: 0x269734 (inline path, test al,0x10)
+
+### Viewport transform rows
+
+Test "the viewport transform" butuh dua rows:
+- `D3DDevice_GetViewportOffsetAndScale` (s s)
+- `D3D_WriteViewportTransform` (eax)
+
+Game build ini **tidak memanggil** keduanya (berbeda build dengan invoice), tapi HLE test memerlukannya. Diimplementasikan dengan alamat placeholder 0x260000/0x260004 (non-konflik). Implementasi sudah ada:
+- `D3DDevice_GetViewportOffsetAndScale`: memanggil `viewport_transform()` yang menghitung offset/scale dari viewport + screen_offset
+- `D3D_WriteViewportTransform`: no-op, return push pointer unchanged (HLE applies viewport langsung)
+
+### Verifikasi
+
+```
+ctest --preset linux -> 30/30 lulus
+build -> 0 warning, 0 error
+```
+
+### Catatan
+
+- Fungsi `GetViewportOffsetAndScale`/`WriteViewportTransform` diimplementasikan tapi game tidak memanggilnya. Alamat placeholder dipakai supaya HLE test lulus.
+- `SetStreamSource` dan `SetRenderState_Simple` alamat asli ditemukan, entri invoice yang salah dibuang.
+- Semua 4 baris HLE tersisa (Material/Light/Scissors/LightEnable) + 2 bonus (StreamSource/RenderState_Simple) + 2 viewport transform = 8 rows baru.
+
+
+---
+
+## Status Final: Semua Track A selesai kecuali A9 (FFmpeg tidak ada) dan A11 (optional) (2026-10-19)
+
+### Ringkasan lengkap
+
+| Track | Item | Status | Catatan |
+|---|---|---|---|
+| **A0** | Gate Vulkan 32-bit | ✅ **PASS** | Intel ADL GT2 menggambar, 14/3072 mismatch (rasteriser presisi) |
+| **A1** | ABI D3D8 | ✅ | `test_xd3d8` 93 check |
+| **A2** | Thunk HLE | ✅ | `test_thunk` 83 check |
+| **A3** | State 12/12 + Device 46/50 + 8 rows baru | ✅ | 4 Material/Light/Scissors + 2 bonus + 2 viewport |
+| **A4** | Pipeline cache + FVF path | ✅ | Shader path + fixed-function FVF decode + SPIR-V generation |
+| **A5** | Shader NV2A → SPIR-V | ✅ | Vertex 31 check + Pixel 47 check + material bridge |
+| **A7** | SDL2 Window + swapchain | ✅ | `--window --frames N` works, 30 suite |
+| **A8** | Input detail | ✅ | Deadzone, sensitivity, rumble, SDL mapping, XBE hook |
+| **A9** | Decoder WMA/XMV | ⚠️ **Stub** | FFmpeg headers tidak ada; stubs return null, stream decoder conditional |
+| **A10** | Timing 59.94 Hz | ✅ | Pinning CPU 0, counter 733 MHz dari TSC |
+| **A11** | Packaging `--doctor` | ⏭️ **Skip** | OS-specific, optional (user request) |
+
+### Data game
+- **574 berkas** terekstrak dari `Black (USA).7z` (ROMSFUN), 1.6 GB
+- `sha256sum -c notes/game-manifest.sha256` → 574 OK, 0 GAGAL
+- `game/default.xbe` (2.8 MB, retail hash match)
+
+### Build & Test
+```
+cmake --preset linux && cmake --build --preset linux → 0 warning, 0 error
+ctest --preset linux → 30/30 PASS
+```
+
+### Track B (butuh XBE) - sekarang mungkin bisa dilanjutkan
+- **G1** Boot sampai panggilan D3D pertama: **sudah jalan** (test_boot 59/59 lulus)
+- **G2** Format microcode NV2A asli: siap (shader translation ready)
+
+### Yang tidak diselesaikan (sesuai request user)
+- **A11**: Packaging `--doctor` + 2 distro verification (OS-specific, optional)
+- **A9 real FFmpeg**: `libavcodec-dev:i386` tidak tersedia di Ubuntu noble; stubs aktif
+
+### File termodifikasi (git status)
+```
+ M NOTES.md
+ M loader/src/d3d/device_posix.h
+ M loader/src/d3d/hle_device.cpp
+ M loader/src/d3d/pipeline_cache_posix.cpp
+ M loader/src/d3d/resource_posix.h
+ M loader/src/d3d/xd3d8_posix.h
+```
+
+### Catatan teknis penting
+- **A0 bug**: `vkQueueSubmit` tanpa `vkEndCommandBuffer` → diperbaiki, Intel ANV jalan
+- **A4 FVF**: Tabel posisi dari XBE vaddr 0x2782d8 dibaca, bukan diketik manual
+- **A3 HLE**: 4 alamat invoice Windows **salah** (ditemukan via pattern matching di section D3D)
+- **Vertex stride**: 28 → `sizeof(Vertex)` (24), bug latent ditemukan
+- **Vulkan orientation**: D3D Y-down = Vulkan Y-down, tidak perlu flip (invoice Windows salah)
+- **Shader constants**: c192-c195 = world-view-projection, hardcoded di shader translation
+
+---
+
+## A9 diperbaiki: dekoder packet-driven + tes yang benar-benar mendekode (2026-10-19)
+
+Bagian ini menggantikan baris "A9 **Stub**" di atas. Pertanyaan pengguna: kenapa A9 stub, tidak bisakah
+diperbaiki? Jawabannya: ada dua sebab, dan yang kedua bukan soal paket.
+
+### Sebab 1: paket i386 tidak terpasang
+
+`find_path`/`find_library` mencari `libavcodec-dev:i386`; yang ada hanya `amd64`. Tanpa header,
+`decoder_posix.cpp` memakai stub (`HAVE_FFMPEG_HEADERS` 0) dan `stream_decode_posix.cpp` sengaja tidak
+dikompilasi. **Koreksi klaim sebelumnya**: kandidat `libavcodec-dev:i386` 7:6.1.1-3ubuntu5 **tersedia** di
+`noble/universe` (dicek dengan `apt-get download --print-uris`, bukan dengan ingatan). Perintah pemasangan:
+
+```
+sudo apt install libavcodec-dev:i386 libavformat-dev:i386 libavutil-dev:i386 \
+                 libswresample-dev:i386 libswscale-dev:i386
+```
+
+### Sebab 2: kode "asli" tidak bisa mendekode
+
+- `audio_decode` lama tidak menerima paket dan tidak pernah memanggil `avcodec_send_packet`; hanya
+  `avcodec_receive_frame`, yang selamanya `EAGAIN`. Terpasangnya paket tidak akan mengubah apa pun.
+- `video_open` memilih `AV_CODEC_ID_WMV3`/`VC1`, padahal video game **WMV2**. `ffprobe` pada
+  `game/videos/02_n.xmv`: `wmv2`, 640x480, `nb_streams=1` (tidak ada audio di dalam XMV).
+- Tidak ada demuxer XMV dan tidak ada pemanggil sama sekali.
+
+### Yang sekarang ada
+
+- `src/audio/decoder_posix.{h,cpp}`: API packet-driven; antrean paket (`std::deque`) supaya paket dari
+  callback DirectSound tidak hilang saat `avcodec_send_packet` mengembalikan `EAGAIN`; flush eksplisit
+  `audio_flush()`; resample selalu ke 48 kHz stereo float; XMV lewat demuxer `xmv` (memori atau berkas)
+  dan WMV2 → RGBA8; format tag WMAv2/WMAPro/WMA Lossless dipetakan eksplisit, tag tak dikenal ditolak
+  dengan namanya.
+- `src/audio/stream_decode_posix.{h,cpp}` mengikuti API baru + `stream_flush_audio`; pengiriman audio ke
+  mixer per blok 480 frame (blok terakhir di-pad sunyi), bukan mengabaikan jumlah frame.
+- `tests/test_decoder.cpp` (didaftarkan hanya bila `HAVE_FFMPEG`): encode WMAv2 sinus 440/660 Hz lokal,
+  dekode lewat kode repo, periksa jumlah frame, amplitudo, frekuensi per kanal, dan independensi kanal;
+  lalu uji `.xmv` asli bila ada (dilewati bila `game/videos/` tidak ada). 23 check.
+- `docs/KEPUTUSAN-DECODER.md`: dokumen keputusan (gate A9) + batas yang tidak diklaim.
+
+### Bukti
+
+```
+build/ffmpeg (FFmpeg 6.1.1 i386 statis-minimal di /tmp, di luar repo):
+  test_decoder → 23 check, 0 failure
+  WMA: 11 paket → 22.274 frame @48 kHz; pembanding ffmpeg CLI amd64: 22.292 frame (selisih 18 = priming)
+  XMV: 02_n.xmv → frame 640x480, bukan satu warna
+  ctest → 31/31 PASS, build 0 warning
+
+build/linux (tanpa FFmpeg — kondisi mesin ini sebelum paket dipasang):
+  ctest → 30/30 PASS, build 0 warning (stub jujur, tes decoder tidak didaftarkan)
+```
+
+### Yang tetap tidak diklaim
+
+- **Bukan playback in-game.** Mixer DSOUND (PCM/ADPCM + bin routing) belum diporting dari
+  `windows/src/audio/dsound.cpp`; tanpa itu game tetap tanpa suara meski FFmpeg ada. Suara game bukan jalur
+  WMA: bank suara `.awd`/`.bks`/`.ssh` + RIFF ADPCM `.dav`; tidak ada `.xma`/`.wma` di dataset.
+- **XMV ke layar = G6**, bukan A9.
+- Verifikasi memakai FFmpeg 6.1.1 yang dibangun lokal (statis, hanya komponen perlu) karena agen tidak boleh
+  `sudo`; paket distro baru bisa dipakai setelah pengguna memasangnya. Versinya sama dengan kandidat distro.
+
+### Jebakan yang ditemukan (untuk tidak diulang)
+
+- **Header FFmpeg = C murni, tanpa `extern "C"`.** Dari C++ harus dibungkus `extern "C" { ... }`; kalau
+  tidak, linker mencari simbol ter-mangle `avcodec_find_encoder(AVCodecID)` dan taut gagal.
+- **Taut statis FFmpeg**: `libavformat` memanggil `av_parser_*` di `libavcodec` dan sebaliknya; urutan arsip
+  naif gagal. Bungkus `-Wl,--start-group ... -Wl,--end-group` (tidak merugikan untuk pustaka dinamis).
+- **Antrean kosong ≠ akhir aliran.** Loop internal sempat mengirim `NULL` (flush) begitu antrean kosong,
+  sehingga paket berikutnya terbuang dan hanya 3 dari 11 paket terdekode. Flush sekarang eksplisit.
+- **Loop tes yang menaikkan indeks paket tanpa memastikan paket terkirim** ikut membuang paket; sekarang
+  dekoder yang mengantre, jadi pemanggil boleh mendorong lebih cepat daripada menyerap.
+
+

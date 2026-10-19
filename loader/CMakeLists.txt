@@ -282,7 +282,10 @@ endif()
 # Link FFmpeg libraries to blackcore if available
 if(HAVE_FFMPEG)
   target_include_directories(blackcore PUBLIC ${AVCODEC_INCLUDE_DIR})
-  target_link_libraries(blackcore PUBLIC ${FFMPEG_LIBS})
+  # Grouped because libavformat and libavcodec reference each other (av_parser_* lives in avcodec and is
+  # called by avformat's demuxer), and a plain archive order fails to resolve one of the two directions.
+  # Grouping is harmless for the shared libraries a distro install ships; it matters for a static build.
+  target_link_libraries(blackcore PUBLIC "-Wl,--start-group" ${FFMPEG_LIBS} "-Wl,--end-group" m)
   target_compile_definitions(blackcore PUBLIC HAVE_FFMPEG=1)
   # The stream layer is only meaningful on top of a real decoder, so it is built only here. Added here
   # rather than in the source list above because HAVE_FFMPEG is not decided until line ~267, after
@@ -297,6 +300,20 @@ endif()
   # Platform layer tests. These need no XBE: they exercise the TEB anchor, the fs->gs patcher and the
   # SEH chain directly.
   enable_testing()
+
+  # A9: the decoder must actually decode. The test encodes a WMAv2 stream with libavcodec, feeds the
+  # packets through this repository's packet-driven wrapper, and checks the sine waves that come back.
+  # It is registered only when FFmpeg is present, because without it the wrapper is an honest stub and
+  # there is nothing to drive. The XMV half additionally decodes the first frames of a real game video
+  # when game/videos/ exists; that part skips itself when the dataset is absent.
+  if(HAVE_FFMPEG)
+    add_executable(test_decoder tests/test_decoder.cpp)
+    target_link_libraries(test_decoder PRIVATE blackcore)
+    target_compile_definitions(test_decoder PRIVATE
+                               BLACKLINUX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")
+    add_test(NAME decoder COMMAND test_decoder)
+  endif()
+
   add_executable(test_platform tests/test_platform.cpp)
   target_link_libraries(test_platform PRIVATE blackcore)
   add_test(NAME platform COMMAND test_platform)

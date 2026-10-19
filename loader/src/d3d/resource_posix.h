@@ -38,11 +38,6 @@ struct LockedRect {
 };
 static_assert(sizeof(LockedRect) == 8, "a locked rect is a pitch and a pointer");
 
-struct Rect {
-    int32_t left, top, right, bottom;
-};
-static_assert(sizeof(Rect) == 16, "a rect is four longs");
-
 // Xbox D3DSURFACE_DESC, as the Windows loader wrote it: Format, Type, Usage, Size, MultiSampleType, Width,
 // Height. The field order is the console's and the game reads the fields by position.
 struct SurfaceDesc {

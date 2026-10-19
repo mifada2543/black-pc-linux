@@ -1,12 +1,13 @@
-// Stream decoder: WMA/XMV decode for DirectSound streams.
-// Wraps the FFmpeg decoder layer (audio/decoder_posix.cpp) to decode stream packets on the fly.
-// Integrates with the audio_out mixer for playback.
+// Stream decoder: WMA/XMV decode on top of audio/decoder_posix.
 //
-// These declarations are NOT backed by a working implementation in a build without FFmpeg. decoder_posix
-// guards on HAVE_FFMPEG_HEADERS and falls back to stubs that return null, and stream_decode_posix.cpp is
-// only added to the build when HAVE_FFMPEG is true. So on this machine there is no object behind any
-// declaration below -- there is no WMA audio decode and no XMV video decode, and a caller that obtained
-// this header has no evidence either is available. Do not read the API surface as working playback.
+// A "stream" here is the shape the game's DirectSound stream uses: a compressed format (WMA) plus one
+// packet at a time. Video is different -- XMV is a container, so the decoder owns the demuxer and the
+// stream layer only asks for the next frame.
+//
+// This file is built only when FFmpeg is present (CMakeLists.txt adds it inside if(HAVE_FFMPEG)).
+// Without the i386 development package the declarations below have no object behind them, and
+// decoder_posix.cpp's open calls return null. That is the honest state: no WMA audio decode and no XMV
+// video decode. Do not read this API surface as working playback on a build without FFmpeg.
 #pragma once
 
 #include "audio/decoder_posix.h"
@@ -15,54 +16,51 @@
 
 namespace stream_decode {
 
-// Stream types
 enum StreamType {
-    STREAM_AUDIO_WMA = 1,  // WMA audio stream
-    STREAM_VIDEO_XMV = 2,  // XMV video stream
+    STREAM_AUDIO_WMA = 1,
+    STREAM_VIDEO_XMV = 2,
 };
 
-// Stream handle (opaque to caller)
 struct Stream {
-    void *opaque;              // decoder-specific state
-    StreamType type;
-    uint32_t sample_rate;      // audio: 48000, video: fps
-    uint32_t channels;         // audio: 2, video: N/A
-    uint32_t width;            // video only
-    uint32_t height;           // video only
-    bool paused;
-    bool eof;
+    void *opaque = nullptr;
+    StreamType type = STREAM_AUDIO_WMA;
+    uint32_t sample_rate = 0; // audio: 48000 (the host mixer rate); video: fps
+    uint32_t channels = 0;    // audio: 2; video: 0
+    uint32_t width = 0;       // video only
+    uint32_t height = 0;      // video only
+    bool paused = false;
+    bool eof = false;
 };
 
-// Open a stream for decoding.
-// format_tag: WAVEFORMATEX.wFormatTag (0x161 = WMA, 0x163 = XMV)
-// Returns null on failure.
-Stream *stream_open(uint16_t format_tag, const uint8_t *extradata, uint32_t extradata_size);
+// Open a WMA stream from the format the game's DirectSound stream carries.
+Stream *stream_open_audio(const decoder::AudioFormat &fmt);
 
-// Decode one packet into output buffer.
-// audio: out must be at least max_frames * channels * sizeof(float)
-// video: out must be width * height * 4 (RGBA)
-// Returns number of frames decoded (audio) or 1/0 (video), negative on error.
-int stream_decode(Stream *s, const uint8_t *packet, uint32_t packet_size,
-                  float *out_audio, uint32_t max_frames,
-                  uint8_t *out_video_rgba);
+// Open an XMV video stream from a file held in memory.
+Stream *stream_open_video(const uint8_t *data, uint32_t size);
 
-// Submit decoded audio to mixer (audio_out::submit)
+// Decode one step.
+//   audio: feed `packet`; writes up to max_frames stereo frames to out_audio.
+//   video: `packet` is ignored (the container is demuxed by the decoder); writes one RGBA frame.
+// Returns frames written (audio), 1/0 (video), or a negative error code.
+int stream_decode(Stream *s, const uint8_t *packet, uint32_t packet_size, float *out_audio,
+                  uint32_t max_frames, uint8_t *out_video_rgba);
+
+// Mark the end of an audio stream. Queued packets are still decoded; later calls return the remaining
+// samples and then ERROR_EOF. Mirrors decoder::audio_flush.
+void stream_flush_audio(Stream *s);
+
+// Submit decoded audio to the host mixer (audio_out::submit). Partial blocks are padded with silence.
 void stream_submit_audio(const float *lr, uint32_t frames);
 
-// Get video frame as RGBA texture (for rendering)
-// Returns true if new frame available
+// Copy the most recently decoded video frame, if one is waiting. Returns true when it copied one.
 bool stream_get_video_frame(Stream *s, uint8_t *out_rgba);
 
-// Pause/resume stream
 void stream_pause(Stream *s, bool paused);
 
-// Close and free stream
 void stream_close(Stream *s);
 
-// Stream callback type (matches DirectSound stream callback)
 using StreamCallback = void (*)(void *context, void *packet_context, uint32_t status);
 
-// Set callback for packet completion
 void stream_set_callback(Stream *s, StreamCallback cb, void *context);
 
 } // namespace stream_decode

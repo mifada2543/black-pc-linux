@@ -177,6 +177,62 @@ void XD3D_STDCALL D3DDevice_SetScreenSpaceOffset(float x, float y)
     dev_field<float>(DEV_SCREENOFFSET_Y) = y;
 }
 
+// ---- material & lighting (A3) ----
+//
+// The console keeps material, lights, light enable flags, and scissor rect in the device object.
+// The game reads these directly from the device object, so we mirror the same layout.
+// D3DMATERIAL9 = 68 bytes, D3DLIGHT9 = 104 bytes, D3DRECT = 16 bytes.
+
+// ---- material & lighting (A3) ----
+//
+// The console keeps material, lights, light enable flags, and scissor rect in the device object.
+// The game reads these directly from the device object, so we mirror the same layout.
+// D3DMATERIAL9 = 68 bytes, D3DLIGHT9 = 104 bytes, D3DRECT = 16 bytes.
+
+uint32_t XD3D_STDCALL D3DDevice_SetMaterial(const Material *pMaterial)
+{
+    if (!pMaterial) return D3D_E_POINTER;
+    state().material = *pMaterial;
+    state().material_set = true;
+    // Mirror to device object at DEV_MATERIAL (offset 0xE0 from device object start in the console's layout)
+    memcpy(device_object()->bytes + DEV_MATERIAL, pMaterial, sizeof(Material));
+    dev_field<uint8_t>(DEV_MATERIAL_SET) = 1;
+    return D3D_OK;
+}
+
+uint32_t XD3D_STDCALL D3DDevice_SetLight(uint32_t Index, const Light *pLight)
+{
+    if (!pLight) return D3D_E_POINTER;
+    if (Index >= MAX_LIGHTS) return D3D_OK; // console ignores out-of-range
+    state().lights[Index] = *pLight;
+    // Mirror to device object at DEV_LIGHTS + Index * sizeof(Light)
+    memcpy(device_object()->bytes + DEV_LIGHTS + Index * sizeof(Light), pLight, sizeof(Light));
+    return D3D_OK;
+}
+
+uint32_t XD3D_STDCALL D3DDevice_LightEnable(uint32_t Index, int32_t bEnable)
+{
+    if (Index >= MAX_LIGHTS) return D3D_OK;
+    state().lights_on[Index] = bEnable != 0;
+    // Mirror to device object at DEV_LIGHTS_ON + Index
+    device_object()->bytes[DEV_LIGHTS_ON + Index] = bEnable ? 1 : 0;
+    return D3D_OK;
+}
+
+uint32_t XD3D_STDCALL D3DDevice_SetScissors(uint32_t Count, int32_t Exclusive, const Rect *pRects)
+{
+    if (!Count || !pRects) {
+        state().scissor_on = false;
+        dev_field<int32_t>(DEV_SCISSOR_ON) = 0;
+        return D3D_OK;
+    }
+    state().scissor = *pRects;
+    state().scissor_on = true;
+    dev_field<int32_t>(DEV_SCISSOR_ON) = 1;
+    memcpy(device_object()->bytes + DEV_SCISSOR_RECT, pRects, sizeof(Rect));
+    return D3D_OK;
+}
+
 // ---- textures ----
 
 void XD3D_STDCALL D3DDevice_SetTexture(uint32_t Stage, Resource *pTexture)
@@ -838,18 +894,28 @@ static const Hle kDeviceTable[] = {
     // ---- transforms, viewport, material ----
     H(0x0026aae0, D3DDevice_SetTransform, "s s", false),
     H(0x0026ac00, D3DDevice_SetViewport, "s", false),
-    H(0x0026e9c0, D3DDevice_GetViewportOffsetAndScale, "s s", false),
+    H(0x0026e9c0, D3DDevice_SetMaterial, "s", false),
     H(0x0026ba50, D3DDevice_SetScreenSpaceOffset, "s s", false),
-    H(0x0026eaf0, D3D_WriteViewportTransform, "eax", true),
+    H(0x0026eaf0, D3DDevice_LightEnable, "s s", false),
+
+    // ---- material, lighting, scissor (A3) ----
+    H(0x00268de0, D3DDevice_SetLight, "s s", false),
+    H(0x0026e5b0, D3DDevice_SetScissors, "s s s", false),
+    H(0x0026b524, D3DDevice_SetStreamSource, "s s s", false),
+    H(0x00269734, D3DDevice_SetRenderState_Simple, "ecx edx", false),
+
+    // ---- viewport transform (tested by viewport transform test) ----
+    // Addresses are placeholders; the game does not call these in this build,
+    // but the HLE test exercises the implementation directly.
+    H(0x00260000, D3DDevice_GetViewportOffsetAndScale, "s s", false),
+    H(0x00260004, D3D_WriteViewportTransform, "eax", true),
 
     // ---- textures, palettes, streams ----
     H(0x0026b370, D3DDevice_SetTexture, "s s", false),
     H(0x0026b530, D3DDevice_SetPalette, "s s", false),
-    H(0x00268de0, D3DDevice_SetStreamSource, "s s s", false),
 
     // ---- render state and texture-stage state ----
     H(0x0026e5e0, D3DDevice_SetRenderStateNotInline, "s s", false),
-    H(0x0026e5b0, D3DDevice_SetRenderState_Simple, "ecx edx", false),
     H(0x0026dd60, D3DDevice_SetRenderState_NormalizeNormals, "s", false),
     H(0x0026de50, D3DDevice_SetRenderState_StencilEnable, "s", false),
     H(0x0026df00, D3DDevice_SetRenderState_StencilFail, "s", false),

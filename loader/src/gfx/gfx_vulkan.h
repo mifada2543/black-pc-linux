@@ -303,8 +303,7 @@ struct Pipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout set0 = VK_NULL_HANDLE; // one combined image sampler per set, see the D3D8 layer
-    VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
-    VkDescriptorSet bound_set = VK_NULL_HANDLE; // freed and rewritten on each bind_textures
+    VkDescriptorSet bound_set = VK_NULL_HANDLE; // written by each bind_textures, owned by the frame pool
 };
 
 bool create_pipeline(Pipeline *p, const PipelineDesc &desc);
@@ -368,6 +367,19 @@ struct TextureSlot {
 // Takes a non-const pipeline because it owns the currently bound set: rebinding frees the old one, and a
 // pool that grows with every bind is a pool that runs out in the middle of a frame.
 bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count);
+
+// Upload a draw's vertex and pixel constant blocks and point the pipeline's set at them.
+//
+// These are two uniform buffers, not one, because the two shaders do not agree on what the bytes mean: the
+// vertex half's bank is 201 vec4s of console constants followed by the viewport, texture-scale, fog and
+// view-model vectors, and the pixel half's is 18 vec4s of its own. Sharing one buffer would have each stage
+// read the other's layout, which compiles and draws nonsense.
+//
+// Call after bind_textures(): that call allocates the descriptor set this writes into. The bytes live in a
+// per-frame ring, reset by begin_frame(), so a draw recorded earlier in the same frame still reads the
+// constants it was recorded with when the frame is submitted at the end.
+bool bind_uniforms(Pipeline *p, const void *vertex_data, uint32_t vertex_bytes, const void *pixel_data,
+                   uint32_t pixel_bytes);
 
 // ---- the window: surface and swapchain ----
 //
@@ -548,5 +560,11 @@ bool write_png_from_color_target(const char *path, const Image *img);
 
 // The staging buffer draw calls upload through, sized on first use and grown in whole megabytes.
 Buffer &vertex_staging();
+
+// Copy a draw's loose vertices into vertex_staging() and return the offset to bind. The ring is per frame
+// and is reset in begin_frame(), so the bytes stay valid until the frame's queue wait finishes -- which is
+// the whole reason this exists instead of a buffer per draw (and instead of freeing one while the recorded
+// command buffer still names it).
+bool stage_vertices(const void *data, uint32_t bytes, uint32_t *offset);
 
 } // namespace gfx

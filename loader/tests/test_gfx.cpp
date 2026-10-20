@@ -497,6 +497,18 @@ static void test_textured_draw_in_a_child()
         const gfx::TextureSlot slots[] = {{&texture, &sampler, false}};
         if (!gfx::bind_textures(&pipe, slots, 1)) _exit(125);
 
+        // The two constant blocks, in the same descriptor set as the textures -- the way a draw binds them.
+        // Sizes are the ones the translators' std140 blocks add up to, not arbitrary: an Intel descriptor
+        // write cares about the range.
+        std::vector<uint8_t> vs_bytes(3328, 0), ps_bytes(384, 0);
+        printf("       child: textures bound, binding constants\n");
+        fflush(stdout);
+        if (!gfx::bind_uniforms(&pipe, vs_bytes.data(), (uint32_t)vs_bytes.size(), ps_bytes.data(),
+                                (uint32_t)ps_bytes.size()))
+            _exit(129);
+        printf("       child: constants bound\n");
+        fflush(stdout);
+
         gfx::Buffer verts;
         if (!gfx::create_buffer(&verts, sizeof kTriangle, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true)) _exit(126);
         gfx::upload_buffer(&verts, kTriangle, sizeof kTriangle);

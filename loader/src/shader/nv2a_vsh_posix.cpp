@@ -217,10 +217,12 @@ std::string vsh_to_glsl(const uint32_t *program, uint32_t instruction_count, uin
     s += "#version 450\n";
     s += "// Translated from NV2A vertex microcode. See src/shader/nv2a_vsh_posix.cpp for why each step is\n"
          "// written the way it is; the arithmetic is the console's, not a preference.\n";
-    s += "layout(std140, binding = 0) uniform Consts {\n";
+    s += "layout(std140, set = 0, binding = 8) uniform Consts {\n";
     // The texture scale is one array of four in the console's bank (194..197), written as four scalars here
     // so the D3D layer's job -- filling c194..c197 -- maps onto plain named members.
-    s += "  vec4 c[198];\n";
+    // The bank is 201 long, not 198: the translator's own name table (kBank) has c198..c200 in it, and a
+    // shader that read one of those would index past a 198-entry array and fail to compile.
+    s += "  vec4 c[201];\n";
     s += "  vec4 texScale0, texScale1, texScale2, texScale3;\n";
     s += "  vec4 fogParams;\n";
     s += "  vec4 fogMode;\n";

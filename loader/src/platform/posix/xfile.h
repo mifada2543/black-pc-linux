@@ -72,11 +72,16 @@ struct XAnsiString {
     char *Buffer;
 };
 
+// NT's IO_STATUS_BLOCK is two words: the status (the kernel also stores a pointer there when an APC
+// will complete the request) and the number of bytes transferred. They are separate fields, not a
+// union -- the game reads Information after every read, and a union of the two silently replaced the
+// status with the byte count and left a stale value where the count should be.
 struct XIoStatusBlock {
     union {
         NTSTATUS Status;
-        uint32_t Information;
+        void *Pointer;
     };
+    uint32_t Information;
 };
 
 struct XObjectAttributes {

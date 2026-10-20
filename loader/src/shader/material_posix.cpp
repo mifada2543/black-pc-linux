@@ -55,6 +55,12 @@ uint64_t material_cache_key(const MaterialDesc &desc)
         if (desc.stream_stride) h = hash_bytes(h, desc.stream_stride, 16 * sizeof(uint32_t));
     }
     if (desc.pixel_shader) h = hash_bytes(h, desc.pixel_shader, sizeof(PixelShaderDef));
+    if (desc.fragment_glsl) {
+        // The generated fixed-function shader is a function of the texture stage state, and folding the
+        // text in is how two stage configurations with the same everything else stay apart.
+        h = hash_bytes(h, desc.fragment_glsl, strlen(desc.fragment_glsl));
+        h = hash_u64(h, 0x46465053u); // "FFPS": an empty or truncated string still has to be a distinct key
+    }
     h = hash_u64(h, desc.tex_cube);
     h = hash_u64(h, desc.flags);
     h = hash_u64(h, desc.color_format);
@@ -91,6 +97,7 @@ bool build_material(gfx::Pipeline *out, const MaterialDesc &desc, const char **e
 
     // ---- the pixel half ----
     std::string psrc;
+    const char *pixel_source = desc.fragment_glsl;
     if (desc.pixel_shader) {
         psrc = psh_to_glsl(*desc.pixel_shader, desc.tex_cube, &why);
         if (psrc.empty()) {
@@ -98,7 +105,10 @@ bool build_material(gfx::Pipeline *out, const MaterialDesc &desc, const char **e
             vs.release();
             return false;
         }
-        ps.words = compile_glsl_to_spirv(psrc.c_str(), SHADER_STAGE_FRAGMENT, &ps.bytes, &why);
+        pixel_source = psrc.c_str();
+    }
+    if (pixel_source) {
+        ps.words = compile_glsl_to_spirv(pixel_source, SHADER_STAGE_FRAGMENT, &ps.bytes, &why);
         if (!ps.words) {
             if (err) *err = why ? why : "the pixel shader did not compile";
             vs.release();
@@ -113,9 +123,11 @@ bool build_material(gfx::Pipeline *out, const MaterialDesc &desc, const char **e
     Spirv fallback_ps;
     const bool have_ps = ps.words != nullptr;
     if (!have_ps) {
+        // The vertex stage's diffuse colour, at the location the vertex translator writes it to. This used
+        // to read location 0, which no vertex shader writes: gl_Position is built in and is not a varying.
         static const char kPassThrough[] =
             "#version 450\n"
-            "layout(location = 0) in vec4 d0;\n"
+            "layout(location = 1) in vec4 d0;\n"
             "layout(location = 0) out vec4 outColour;\n"
             "void main() { outColour = d0; }\n";
         fallback_ps.words = compile_glsl_to_spirv(kPassThrough, SHADER_STAGE_FRAGMENT, &fallback_ps.bytes, &why);

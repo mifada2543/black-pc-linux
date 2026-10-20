@@ -4,6 +4,9 @@
 
 #include "d3d/hle_table_posix.h"
 
+#include "d3d/texture_posix.h" // texture_forget: the decoded copy must not outlive the header
+
+#include "platform/posix/image.h" // contiguous_base/contiguous_size: the physical-address alias
 #include "platform/posix/log.h"
 
 #include <stdlib.h>
@@ -149,6 +152,7 @@ void destroy_resource(Resource *r)
         PixelContainer *parent = ((Surface *)r)->Parent;
         ResourceRecord *rec = resource_record(r);
         if (rec && rec->owns_data) free(resource_data(r));
+        texture_forget(r); // the decoded image was made from this header's pixels
         resource_forget(r);
         free(r);
         if ((parent->Common & COMMON_REFCOUNT_MASK) && (--parent->Common & COMMON_REFCOUNT_MASK) == 0)
@@ -172,6 +176,7 @@ void destroy_resource(Resource *r)
         if (rec->owns_data) free(resource_data(r));
         resource_forget(r);
     }
+    texture_forget(r); // the decoded image was made from this header's pixels
     free(r);
 }
 
@@ -279,7 +284,18 @@ ResourceRecord &resource_attach(Resource *r, uint32_t bytes, bool owns_data)
     return rec;
 }
 
-void *resource_data(const Resource *r) { return r ? (void *)(uintptr_t)r->Data : nullptr; }
+void *resource_data(const Resource *r)
+{
+    if (!r) return nullptr;
+    // The console's header stores the data's *physical* address, and the CPU reaches that memory through
+    // the cached alias at 0x80000000 -- which is exactly where this port maps the contiguous block. A game
+    // that makes its own headers (the movie path does, for the decoded frames) therefore stores 0x00df5900
+    // and writes through 0x80df5900. Resources this port allocates hold host pointers instead, which are
+    // above the 64 MB physical range and pass through unchanged.
+    const uint32_t a = r->Data;
+    if (a < contiguous_size()) return (void *)(uintptr_t)(a + contiguous_base());
+    return (void *)(uintptr_t)a;
+}
 
 void resource_mark_dirty(Resource *r, uint64_t lo, uint64_t hi)
 {

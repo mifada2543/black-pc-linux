@@ -235,7 +235,7 @@ std::string psh_to_glsl(const PixelShaderDef &d, uint32_t tex_cube, const char *
     s += "// Translated from an Xbox NV2A pixel program (D3DPIXELSHADERDEF). The register combiners are\n"
          "// reproduced literally, including the separate RGB and alpha paths, because that is what the\n"
          "// hardware did -- see src/shader/nv2a_psh_posix.cpp.\n";
-    s += "layout(std140, binding = 0) uniform Consts {\n";
+    s += "layout(std140, set = 0, binding = 9) uniform Consts {\n";
     s += "  vec4 pc[18];\n";
     s += "  vec4 fogColor;\n";
     s += "  vec4 bumpMat[4];\n";

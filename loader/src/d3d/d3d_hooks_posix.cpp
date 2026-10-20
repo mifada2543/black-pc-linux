@@ -366,6 +366,51 @@ bool install_section(const LibFunc *funcs, size_t count, const Hle *hle, size_t 
         g_rows.push_back(Row{f, section});
     }
 
+    // An HLE row whose address the section table missed. The table is built from a symbol dump, and the
+    // dump has holes: four DSOUND wrappers (0x219677, 0x21b210, 0x21b2d7, 0x21b330) start in the space
+    // between two named neighbours, so the table never gave them a row. They are real entry points the
+    // game calls by address, and leaving them native runs the original body, which then calls a *listed*
+    // function and stops the run one level away from the cause. A gap row is patched exactly like a
+    // listed one, but only where its address is not inside any listed function, and only when a jump to
+    // the next listed entry still fits.
+    if (hle_count && !sorted.empty()) {
+        const uint32_t lo = sorted.front().addr;
+        const uint32_t hi = sorted.back().addr + sorted.back().size;
+        for (size_t k = 0; k < hle_count; k++) {
+            const Hle &h = hle[k];
+            if (!h.impl || h.addr < lo || h.addr >= hi) continue;
+            if (h.addr < image_base || h.addr - image_base + 5 > image_size) continue;
+
+            bool covered = false;
+            uint32_t room = 0;
+            for (size_t i = 0; i < sorted.size() && !covered; i++) {
+                if (h.addr >= sorted[i].addr && h.addr < sorted[i].addr + sorted[i].size) covered = true;
+                else if (sorted[i].addr > h.addr && !room) room = sorted[i].addr - h.addr;
+            }
+            if (covered) continue;
+            if (room < 5) {
+                local.skipped++; // no room for a jump; better to run the original than to overwrite a neighbour
+                continue;
+            }
+
+            std::string thunk_err;
+            void *t = make_hle_thunk(h, &thunk_err, trace);
+            if (!t) {
+                err = thunk_err.empty() ? (std::string(h.name) + " has no thunk") : thunk_err;
+                return false;
+            }
+            uint8_t *fn = code + (h.addr - image_base);
+            if (!write_jmp(fn, t)) {
+                err = std::string(h.name) + " is too far from the thunk arena for a five-byte jump";
+                return false;
+            }
+            local.functions++;
+            local.patched++;
+            local.hle++;
+            g_rows.push_back(Row{LibFunc{h.addr, room, h.name}, section});
+        }
+    }
+
     if (report) *report = local;
     return true;
 }

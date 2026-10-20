@@ -1,5 +1,6 @@
 #include "d3d/draw_posix.h"
 
+#include "d3d/draw_material_posix.h"
 #include "d3d/hle_table_posix.h"
 #include "d3d/resource_posix.h"
 #include "d3d/vertex_posix.h"
@@ -313,6 +314,13 @@ void submit(const char *what, uint32_t xprim, DrawPlan &plan, const DrawInputs &
         return;
     }
 
+    const char *why_material = nullptr;
+    if (!bind_draw_material(0, &why_material)) {
+        g_draws_skipped++;
+        DTRACE("%s %u: %s", what, xprim, why_material ? why_material : "the material could not be bound");
+        return;
+    }
+
     std::vector<uint16_t> expanded;
     const uint16_t *indices = game_indices;
     uint32_t index_count = 0;
@@ -358,74 +366,80 @@ void submit(const char *what, uint32_t xprim, DrawPlan &plan, const DrawInputs &
 void XD3D_STDCALL D3DDevice_DrawVerticesUP(uint32_t PrimitiveType, uint32_t VertexCount,
                                            const void *pVertexStreamZeroData, uint32_t VertexStreamZeroStride)
 {
-    DTRACE("DrawVerticesUP %u, %u, %p, %u", PrimitiveType, VertexCount, pVertexStreamZeroData,
+    DTRACE("DrawVerticesUP %u, %u, %p, %u (vs 0x%08x, ps 0x%08x, stride %u)", PrimitiveType, VertexCount,
+           pVertexStreamZeroData, VertexStreamZeroStride, state().vertex_shader, state().pixel_shader,
            VertexStreamZeroStride);
     pb_flush();
 
-    // The vertices are in memory the game chose, not in a buffer of ours, so there is nothing to upload and
-    // nothing to bind: the game's own bytes are already where the driver will read them. A managed buffer is
-    // the wrong tool here and using one would copy the data for no reason.
+    // The vertices are in memory the game chose, not in a buffer of ours, so they are copied into the
+    // frame's loose-vertex ring and the draw binds that. A buffer per draw was the earlier shape and it was
+    // wrong twice: it was sized by the *stride* rather than by the vertex count, and it was destroyed while
+    // the recorded command buffer still named it.
+    const uint64_t bytes = (uint64_t)VertexCount * VertexStreamZeroStride;
+    if (bytes == 0 || bytes > 0xFFFFFFFFu) {
+        g_draws_skipped++;
+        DTRACE("DrawVerticesUP %u: %llu bytes of vertices is not a draw", PrimitiveType,
+               (unsigned long long)bytes);
+        return;
+    }
+    uint32_t stage_offset = 0;
+    if (!gfx::stage_vertices(pVertexStreamZeroData, (uint32_t)bytes, &stage_offset)) {
+        g_draws_skipped++;
+        DTRACE("DrawVerticesUP %u: %s", PrimitiveType, gfx::last_error());
+        return;
+    }
     DrawPlan plan;
     if (!plan_draw(PrimitiveType, VertexCount, 0, &plan)) {
         g_draws_skipped++;
         return;
     }
-    if (!pVertexStreamZeroData || !VertexStreamZeroStride) {
+    if (!gfx::bind_vertex_buffer(&gfx::vertex_staging(), 0, stage_offset)) {
         g_draws_skipped++;
-        DTRACE("DrawVerticesUP %u: no data", PrimitiveType);
+        DTRACE("DrawVerticesUP %u: the staging buffer could not be bound", PrimitiveType);
         return;
     }
 
-    gfx::Buffer up;
-    if (!gfx::create_buffer(&up, (uint32_t)VertexStreamZeroStride, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true)) {
+    const char *why_material = nullptr;
+    if (!bind_draw_material(VertexStreamZeroStride, &why_material)) {
         g_draws_skipped++;
-        DTRACE("DrawVerticesUP %u: %s", PrimitiveType, gfx::last_error());
-        return;
-    }
-    if (!gfx::update_buffer(&up, 0, (uint32_t)VertexStreamZeroStride, pVertexStreamZeroData)) {
-        gfx::destroy_buffer(&up);
-        g_draws_skipped++;
+        DTRACE("DrawVerticesUP %u: %s", PrimitiveType,
+               why_material ? why_material : "the material could not be bound");
         return;
     }
 
-    DrawInputs in;
-    in.vertices = (const uint8_t *)up.mapped;
-    in.stride = VertexStreamZeroStride;
-    in.vertex_count = VertexCount;
-    in.ok = true;
-
-    gfx::bind_vertex_buffer(&up, 0, 0);
     std::vector<uint16_t> expanded;
     if (plan.needs_indices) {
         uint32_t n = 0;
         const char *why = nullptr;
         if (!cached_indices(PrimitiveType, VertexCount, 0, &expanded, &n, &why)) {
-            gfx::destroy_buffer(&up);
             g_draws_skipped++;
             DTRACE("DrawVerticesUP %u: %s", PrimitiveType, why ? why : "the indices could not be written");
             return;
         }
         if (!gfx::bind_index_buffer_upload(expanded.data(), n * sizeof(uint16_t))) {
-            gfx::destroy_buffer(&up);
             g_draws_skipped++;
             return;
         }
-        const bool ok = gfx::draw_indexed(plan.topology, n, 1, 0, 0);
-        if (ok) g_draws++; else g_draws_skipped++;
+        if (gfx::draw_indexed(plan.topology, n, 1, 0, 0)) {
+            g_draws++;
+        } else {
+            g_draws_skipped++;
+            DTRACE("DrawVerticesUP %u: %s", PrimitiveType, gfx::last_error());
+        }
     } else {
-        const bool ok = gfx::draw(plan.topology, plan.vertex_count, 1, 0);
-        if (ok) g_draws++; else g_draws_skipped++;
+        if (gfx::draw(plan.topology, plan.vertex_count, 1, 0)) {
+            g_draws++;
+        } else {
+            g_draws_skipped++;
+            DTRACE("DrawVerticesUP %u: %s", PrimitiveType, gfx::last_error());
+        }
     }
-    // The buffer that held the game's vertices is not ours to keep, but it cannot be freed either: the
-    // command buffer naming it has not run. It is released at the next frame boundary by the same list that
-    // holds staging, and until then it costs one allocation per draw -- which is why this path is a fallback
-    // and not the one the game mostly takes.
-    gfx::destroy_buffer(&up);
 }
 
 void XD3D_STDCALL D3DDevice_DrawVertices(uint32_t PrimitiveType, uint32_t StartVertex, uint32_t VertexCount)
 {
-    DTRACE("DrawVertices %u, %u, %u", PrimitiveType, StartVertex, VertexCount);
+    DTRACE("DrawVertices %u, %u, %u (vs 0x%08x, ps 0x%08x)", PrimitiveType, StartVertex, VertexCount,
+           state().vertex_shader, state().pixel_shader);
     pb_flush();
     DrawPlan plan;
     if (!plan_draw(PrimitiveType, VertexCount, 0, &plan)) {
@@ -439,7 +453,8 @@ void XD3D_STDCALL D3DDevice_DrawVertices(uint32_t PrimitiveType, uint32_t StartV
 void XD3D_STDCALL D3DDevice_DrawIndexedVertices(uint32_t PrimitiveType, uint32_t VertexCount,
                                                 const uint16_t *pIndexData)
 {
-    DTRACE("DrawIndexedVertices %u, %u, %p", PrimitiveType, VertexCount, pIndexData);
+    DTRACE("DrawIndexedVertices %u, %u, %p (vs 0x%08x, ps 0x%08x)", PrimitiveType, VertexCount, pIndexData,
+           state().vertex_shader, state().pixel_shader);
     pb_flush();
     if (!pIndexData || !VertexCount) {
         g_draws_skipped++;

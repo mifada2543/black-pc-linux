@@ -67,6 +67,31 @@ std::vector<Buffer> g_staging_pending;
 Buffer g_index_buffer;
 uint64_t g_index_capacity = 0;
 
+// The whole frame's descriptor sets, from one pool that is reset at the start of the next frame. Declared
+// here because shutdown() destroys it; see frame_set_pool() for why it is not per pipeline.
+VkDescriptorPool g_set_pool = VK_NULL_HANDLE;
+constexpr uint32_t SETS_PER_FRAME = 8192;
+
+// Where the next loose-vertex upload goes inside gfx::vertex_staging(). Reset at the start of every frame,
+// which is safe because end_frame waits for the queue: the previous frame's command buffer can no longer be
+// reading the bytes it named. A draw that wraps simply starts again at zero, and since the whole frame is one
+// submission, the bytes it overwrites were already read by the draws recorded before it -- that is what the
+// queue wait above buys, and without it this would be the same use-after-free as g_staging_pending.
+uint32_t g_stage_offset = 0;
+
+// The constants ring: one host-visible buffer the whole frame's draws take blocks out of, and the offset of
+// the next free byte in it. Same lifetime rule as g_stage_offset, and the same reason it is not one buffer
+// per draw: a draw's constants are 3.3 KB for the vertex half alone, and four draws a frame for a minute is
+// thirteen thousand buffers.
+Buffer g_uniform_ring;
+uint32_t g_uniform_offset = 0;
+constexpr uint32_t UNIFORM_BINDING_VERTEX = 8;
+constexpr uint32_t UNIFORM_BINDING_PIXEL = 9;
+// VkPhysicalDeviceLimits::minUniformBufferOffsetAlignment is 256 on every desktop driver this port targets,
+// and a hard-coded 256 is a superset of anything smaller. Rounded up again to 16 so a vec4 never straddles a
+// block boundary in a way a driver could object to.
+constexpr uint32_t UNIFORM_ALIGN = 256;
+
 // Whether the frame has a pipeline bound. A draw without one is recorded anyway and faults at submit,
 // so the draw path asks first and skips with a reason.
 bool g_pipeline_bound = false;
@@ -974,6 +999,8 @@ void shutdown()
     }
     g_managed.clear();
     if (g_index_buffer.buffer) destroy_buffer(&g_index_buffer);
+    if (g_device && g_set_pool) vkDestroyDescriptorPool(g_device, g_set_pool, nullptr);
+    g_set_pool = VK_NULL_HANDLE;
     if (g_device && g_pool) vkDestroyCommandPool(g_device, g_pool, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
     if (g_surface && pfnDestroySurface) {
@@ -1183,6 +1210,30 @@ Buffer &vertex_staging()
     // is more than any frame of this game has needed. Grown in whole megabytes after that.
     create_buffer(&staging, 4u << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
     return staging;
+}
+
+bool stage_vertices(const void *data, uint32_t bytes, uint32_t *offset)
+{
+    if (!data || !bytes || !offset) return false;
+    Buffer &b = vertex_staging();
+    if (!b.buffer || !b.mapped) {
+        g_error = "no vertex staging buffer";
+        return false;
+    }
+    if (bytes > b.size) {
+        // Never happens for a single draw (4 MiB is 174762 vertices of 24 bytes), and refusing is better
+        // than growing the buffer under a bind offset the caller has already been given.
+        g_error = "one draw's vertices do not fit in the staging buffer";
+        return false;
+    }
+    // 256-byte alignment: well past the 4 bytes vkCmdBindVertexBuffers wants for an offset, and it keeps
+    // two draws' vertex data off the same cache line.
+    g_stage_offset = (g_stage_offset + 255u) & ~255u;
+    if (g_stage_offset + bytes > b.size) g_stage_offset = 0;
+    memcpy((uint8_t *)b.mapped + g_stage_offset, data, bytes);
+    *offset = g_stage_offset;
+    g_stage_offset += bytes;
+    return true;
 }
 
 // ---- images ----
@@ -1459,9 +1510,39 @@ Placeholder &placeholder()
 
 } // namespace
 
+// One descriptor pool for every material's set 0, reset once per frame rather than freed per bind.
+//
+// A set must not be freed while a command buffer that names it is in the recording or executable state. The
+// old code freed the pipeline's only set on every texture bind and allocated a new one, which handed the
+// driver the same object for every draw in the frame -- including draws already recorded. On the Intel
+// driver that lost the per-draw content: a magazine quad drawn after a line of text sampled the text's
+// atlas, while the same quad drawn in a frame whose text draws were skipped showed its own texture.
+//
+// The pool therefore outlives the frame, and the reset happens in begin_frame, after submit_frame's
+// vkQueueWaitIdle has made the previous frame's sets unreachable.
+namespace {
+
+VkDescriptorPool frame_set_pool()
+{
+    if (g_set_pool) return g_set_pool;
+    VkDescriptorPoolSize ps[2];
+    ps[0] = VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SETS_PER_FRAME * 8u};
+    ps[1] = VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SETS_PER_FRAME * 2u};
+    VkDescriptorPoolCreateInfo ci;
+    memset(&ci, 0, sizeof ci);
+    ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    ci.maxSets = SETS_PER_FRAME;
+    ci.poolSizeCount = 2;
+    ci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(g_device, &ci, nullptr, &g_set_pool) != VK_SUCCESS) g_set_pool = VK_NULL_HANDLE;
+    return g_set_pool;
+}
+
+} // namespace
+
 bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count)
 {
-    if (!p || !p->descriptor_pool || !p->set0) {
+    if (!p || !p->set0) {
         g_error = "the pipeline has no descriptor set to bind";
         return false;
     }
@@ -1476,20 +1557,22 @@ bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count)
     if (g_pass_open) end_pass();
     if (!ensure_recording()) return false;
 
-    // The pool has room for one set, and the previous bind's set is freed rather than leaked: the game
-    // rebinds textures constantly, and a pool that grows per bind is a pool that runs out mid-frame.
-    if (p->bound_set) {
-        vkFreeDescriptorSets(g_device, p->descriptor_pool, 1, &p->bound_set);
-        p->bound_set = VK_NULL_HANDLE;
-    }
+    // The pool has room for one frame's worth of sets and is reset in begin_frame. Allocating a fresh set
+    // per bind is what keeps a draw's descriptor content from being rewritten under a draw already recorded.
+    VkDescriptorPool set_pool = frame_set_pool();
+    if (!set_pool) return fail("the frame's descriptor pool could not be created", VK_ERROR_OUT_OF_HOST_MEMORY);
 
     VkDescriptorSetAllocateInfo dai;
     memset(&dai, 0, sizeof dai);
     dai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dai.descriptorPool = p->descriptor_pool;
+    dai.descriptorPool = set_pool;
+    // Without this the driver dereferences a null pSetLayouts. It is the pipeline's own set 0, which is the
+    // layout both the pipeline and bind_uniforms write into.
+    dai.pSetLayouts = &p->set0;
     dai.descriptorSetCount = 1;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(g_device, &dai, &set) != VK_SUCCESS) return fail("vkAllocateDescriptorSets", VK_ERROR_OUT_OF_HOST_MEMORY);
+    if (vkAllocateDescriptorSets(g_device, &dai, &set) != VK_SUCCESS)
+        return fail("the frame's descriptor sets are exhausted", VK_ERROR_OUT_OF_HOST_MEMORY);
     p->bound_set = set;
 
     // 2D textures in 0..3, cube textures in 4..7, everything else the placeholder. One write for all eight,
@@ -1518,6 +1601,84 @@ bool bind_textures(Pipeline *p, const TextureSlot slots[], uint32_t count)
     VkDescriptorSetLayout layout = p->set0;
     vkCmdBindDescriptorSets(g_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &set, 0, nullptr);
     (void)layout;
+    return true;
+}
+
+namespace {
+
+// The one constants buffer, created on first use. Host-visible and persistently mapped, because a draw's
+// constants change every time the game sets one and a staging copy per draw would be the frame's largest
+// cost; upload_buffer's memcpy path is exactly what this wants.
+Buffer &uniform_ring()
+{
+    if (g_uniform_ring.buffer) return g_uniform_ring;
+    // 1 MiB holds 320 vertex blocks (3.3 KiB each) in one frame. A frame with more draws than that has
+    // bigger problems than this buffer's size, and the wrap below still does the correct thing.
+    if (!create_buffer(&g_uniform_ring, 1u << 20, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true))
+        g_uniform_ring = Buffer();
+    return g_uniform_ring;
+}
+
+} // namespace
+
+bool bind_uniforms(Pipeline *p, const void *vertex_data, uint32_t vertex_bytes, const void *pixel_data,
+                   uint32_t pixel_bytes)
+{
+    if (!p || !p->bound_set) {
+        g_error = "bind_uniforms needs a bound descriptor set: call bind_textures first";
+        return false;
+    }
+    if (!vertex_data || vertex_bytes == 0) {
+        g_error = "bind_uniforms was given no vertex constants";
+        return false;
+    }
+    Buffer &ring = uniform_ring();
+    if (!ring.buffer || !ring.mapped) return fail("no constants ring", VK_ERROR_OUT_OF_HOST_MEMORY);
+
+    const bool has_pixel = pixel_data && pixel_bytes != 0;
+    const uint32_t ps_bytes = has_pixel ? pixel_bytes : 16u;
+
+    // A block that cannot fit at all would wrap forever; the arithmetic is done before the write so the
+    // failure is a refusal and not a recursion with no base case.
+    if ((uint64_t)vertex_bytes + ps_bytes + 2 * UNIFORM_ALIGN > ring.size)
+        return fail("a draw's constants do not fit in the constants ring", VK_ERROR_OUT_OF_HOST_MEMORY);
+
+    uint32_t vs_off = (g_uniform_offset + UNIFORM_ALIGN - 1) & ~(UNIFORM_ALIGN - 1);
+    uint32_t ps_off = (vs_off + vertex_bytes + UNIFORM_ALIGN - 1) & ~(UNIFORM_ALIGN - 1);
+    if ((uint64_t)ps_off + ps_bytes > ring.size) {
+        // The ring wrapped. The frame is one submission, so the bytes it is about to overwrite have already
+        // been read by the draws recorded before this one -- the queue wait at the end of the frame is what
+        // makes the same argument true across frames.
+        g_uniform_offset = 0;
+        vs_off = 0;
+        ps_off = (vertex_bytes + UNIFORM_ALIGN - 1) & ~(UNIFORM_ALIGN - 1);
+    }
+
+    memcpy((uint8_t *)ring.mapped + vs_off, vertex_data, vertex_bytes);
+    if (has_pixel) memcpy((uint8_t *)ring.mapped + ps_off, pixel_data, pixel_bytes);
+    g_uniform_offset = ps_off + ps_bytes;
+
+    VkDescriptorBufferInfo bi[2];
+    memset(bi, 0, sizeof bi);
+    bi[0].buffer = ring.buffer;
+    bi[0].offset = vs_off;
+    bi[0].range = vertex_bytes;
+    bi[1].buffer = ring.buffer;
+    bi[1].offset = ps_off;
+    bi[1].range = ps_bytes;
+
+    VkWriteDescriptorSet w[2];
+    memset(w, 0, sizeof w);
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[0].dstSet = p->bound_set;
+    w[0].dstBinding = UNIFORM_BINDING_VERTEX;
+    w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    w[0].pBufferInfo = &bi[0];
+    w[1] = w[0];
+    w[1].dstBinding = UNIFORM_BINDING_PIXEL;
+    w[1].pBufferInfo = &bi[1];
+    vkUpdateDescriptorSets(g_device, 2, w, 0, nullptr);
     return true;
 }
 
@@ -1762,16 +1923,37 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
     // Set 0 is one combined image sampler per binding. The game samples a 2D texture and a cube texture
     // from the same shader register (nv2a_psh.cpp:92-93) and Vulkan forbids one descriptor for two image
     // types, so the D3D8 layer gives each its own binding here rather than sharing one.
-    VkDescriptorSetLayoutBinding sb{};
-    sb.binding = 0;
-    sb.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    sb.descriptorCount = 8;
-    sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    //
+    // Eight *separate* bindings, not one binding of eight: the translators declare `binding = 0` .. `binding
+    // = 7` and bind_textures writes one descriptor to each, so a single array binding would leave bindings
+    // 1..7 undeclared. The driver does not reject a write to an undeclared binding in a release build; it
+    // walks its own layout and writes past it, which is how this was found (the constants write after the
+    // textures then crashed inside ANV).
+    //
+    // Bindings 8 and 9 are the two constant blocks. They are separate bindings because the vertex and pixel
+    // translators declared their banks independently and the bytes do not mean the same thing; see
+    // bind_uniforms in the header.
+    VkDescriptorSetLayoutBinding sb[10];
+    memset(sb, 0, sizeof sb);
+    for (uint32_t i = 0; i < 8; i++) {
+        sb[i].binding = i;
+        sb[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sb[i].descriptorCount = 1;
+        sb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    sb[8].binding = UNIFORM_BINDING_VERTEX;
+    sb[8].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sb[8].descriptorCount = 1;
+    sb[8].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    sb[9].binding = UNIFORM_BINDING_PIXEL;
+    sb[9].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    sb[9].descriptorCount = 1;
+    sb[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo slci;
     memset(&slci, 0, sizeof slci);
     slci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    slci.bindingCount = 1;
-    slci.pBindings = &sb;
+    slci.bindingCount = 10;
+    slci.pBindings = sb;
     if (vkCreateDescriptorSetLayout(g_device, &slci, nullptr, &p->set0) != VK_SUCCESS)
         return fail("descriptor set layout", VK_ERROR_INITIALIZATION_FAILED);
 
@@ -1904,11 +2086,16 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
     cb.attachmentCount = 1;
     cb.pAttachments = &blend_state;
 
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    // Primitive topology is dynamic because D3D carries it on the draw and not on the pipeline. The
+    // pipeline's own topology still names the *class* (triangle), which is what Vulkan requires when the
+    // restricted form of dynamic topology is in use; a draw that switches to the point or line class has to
+    // bring a pipeline of that class, and gfx::draw refuses rather than violating the rule.
+    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY};
     VkPipelineDynamicStateCreateInfo dyn;
     memset(&dyn, 0, sizeof dyn);
     dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dyn.dynamicStateCount = has_depth ? 2 : 2;
+    dyn.dynamicStateCount = (uint32_t)(sizeof dynamic_states / sizeof dynamic_states[0]);
     dyn.pDynamicStates = dynamic_states;
 
     VkPipelineRenderingCreateInfo rendering;
@@ -1940,14 +2127,8 @@ bool create_pipeline(Pipeline *p, const PipelineDesc &desc)
     VkResult r = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &gp, nullptr, &p->pipeline);
     if (r != VK_SUCCESS) return fail("vkCreateGraphicsPipelines", r);
 
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8};
-    VkDescriptorPoolCreateInfo dpci;
-    memset(&dpci, 0, sizeof dpci);
-    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &ps;
-    vkCreateDescriptorPool(g_device, &dpci, nullptr, &p->descriptor_pool);
+    // No descriptor pool here: sets come from the frame-wide pool in bind_textures, because a per-pipeline
+    // pool with one set cannot give each recorded draw its own descriptor content.
     return true;
 }
 
@@ -1989,8 +2170,7 @@ bool create_pipeline_d3d(Pipeline *p,
 void destroy_pipeline(Pipeline *p)
 {
     if (!p || !g_device) return;
-    p->bound_set = VK_NULL_HANDLE; // freed with the pool below
-    if (p->descriptor_pool) vkDestroyDescriptorPool(g_device, p->descriptor_pool, nullptr);
+    p->bound_set = VK_NULL_HANDLE; // owned by the frame-wide pool
     if (p->pipeline) vkDestroyPipeline(g_device, p->pipeline, nullptr);
     if (p->layout) vkDestroyPipelineLayout(g_device, p->layout, nullptr);
     if (p->set0) vkDestroyDescriptorSetLayout(g_device, p->set0, nullptr);
@@ -2187,6 +2367,13 @@ bool swapchain_create(VkFormat preferred_format, bool immediate)
         for (VkPresentModeKHR m : modes)
             if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) present_mode = m;
 
+    // Nothing changed is not a rebuild. window_begin_frame calls this every frame so that a resize is picked
+    // up, and without this the call rebuilt the swapchain -- a new one, with new images -- on every frame.
+    if (g_swapchain && !g_swapchain_stale && caps.currentExtent.width == g_swapchain_width &&
+        caps.currentExtent.height == g_swapchain_height && format.format == g_swapchain_format &&
+        immediate == g_swapchain_wants_immediate)
+        return true;
+
     const VkSurfaceFormatKHR format_unused_guard = format;
     (void)format_unused_guard;
 
@@ -2288,6 +2475,20 @@ bool swapchain_create(VkFormat preferred_format, bool immediate)
 
 bool swapchain_recreate() { return swapchain_create(g_swapchain_format, g_swapchain_wants_immediate); }
 
+// SUBOPTIMAL is the presentation engine saying it would prefer a different swapchain. On X11 under a
+// compositor it is also the answer to every present, whatever the swapchain looks like, so treating it as a
+// rebuild request unconditionally means a new swapchain -- and new images -- on every frame. The surface's
+// own currentExtent is the one statement about a resize that does not lie, and rebuilding is deferred to
+// the frame where that extent has actually moved.
+bool surface_extent_differs()
+{
+    if (!g_physical || !g_surface || !pfnSurfaceCapabilities) return false;
+    VkSurfaceCapabilitiesKHR caps{};
+    if (pfnSurfaceCapabilities(g_physical, g_surface, &caps) != VK_SUCCESS) return false;
+    if (caps.currentExtent.width == UINT32_MAX) return false; // the extent is ours; it did not move
+    return caps.currentExtent.width != g_swapchain_width || caps.currentExtent.height != g_swapchain_height;
+}
+
 bool swapchain_acquire(uint32_t *index)
 {
     if (!index) return false;
@@ -2309,8 +2510,7 @@ bool swapchain_acquire(uint32_t *index)
     // SUBOPTIMAL is not a failure: the image is valid and the frame is worth showing. It says the surface
     // no longer matches the swapchain, which is a rebuild request for later rather than an error now.
     if (r == VK_SUBOPTIMAL_KHR) {
-        g_swapchain_stale = true;
-        logf("[gfx] acquire returned SUBOPTIMAL: the swapchain will be rebuilt\n");
+        if (surface_extent_differs()) g_swapchain_stale = true;
         return true;
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
@@ -2357,7 +2557,7 @@ bool swapchain_present(uint32_t index)
     if (g_present_queue != g_queue) vkQueueWaitIdle(g_present_queue);
 
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
-        if (r == VK_SUBOPTIMAL_KHR) g_swapchain_stale = true;
+        if (r == VK_SUBOPTIMAL_KHR && surface_extent_differs()) g_swapchain_stale = true;
         return true;
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR) {
@@ -2399,6 +2599,11 @@ bool begin_frame()
         return false;
     }
 
+    // The previous frame's sets are unreachable: submit_frame waits for the queue before returning. Resetting
+    // here rather than inside bind_textures is what makes the reset legal -- a set named by a command buffer
+    // that is still recording must not be recycled.
+    if (g_set_pool) vkResetDescriptorPool(g_device, g_set_pool, 0);
+
     vkResetCommandBuffer(g_cmd, 0);
     VkCommandBufferBeginInfo bi;
     memset(&bi, 0, sizeof bi);
@@ -2431,6 +2636,8 @@ bool begin_frame()
 
     g_scissor_set = false; // a frame starts with no scissor, which is a different thing from a 1x1 one
     g_pipeline_bound = false; // and with no pipeline, which a new frame has to be told about again
+    g_stage_offset = 0;       // and the loose-vertex ring starts over, see g_stage_offset
+    g_uniform_offset = 0;     // and so does the constants ring
     // Deliberately no pass here. A pass is opened by the first thing that draws -- see ensure_pass -- because
     // a buffer copy or a layout barrier recorded between here and there is legal, and recorded after it is
     // not. Opening the pass eagerly is what put every upload inside one.
@@ -2438,6 +2645,25 @@ bool begin_frame()
 }
 
 bool pipeline_is_bound() { return g_pipeline_bound; }
+
+namespace {
+
+// gfx::Topology is deliberately not a VkPrimitiveTopology -- see the header -- so this is the one place
+// the translation happens. The numeric values agree today; a table keeps that from being the reason the
+// port works.
+VkPrimitiveTopology vk_topology(Topology t)
+{
+    switch (t) {
+    case TopologyPoints: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case TopologyLines: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case TopologyLineStrip: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case TopologyTriangles: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case TopologyTriangleStrip: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    }
+    return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+} // namespace
 
 bool set_pipeline(const Pipeline *p)
 {
@@ -2515,7 +2741,28 @@ bool bind_index_buffer_upload(const void *indices, VkDeviceSize bytes)
 bool draw(Topology topology, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex)
 {
     if (!ensure_pass()) return false;
-    vkCmdDraw(g_cmd, vertex_count, instance_count, first_vertex, (VkPrimitiveTopology)topology);
+    // A draw with nothing bound used to reach the driver, and the Intel driver does not reject it: it
+    // dereferences the missing pipeline and takes the process with it. The honest answer is to refuse the
+    // draw here, where the caller can log it, and leave the frame as it was.
+    if (!g_pipeline_bound) {
+        g_error = "no pipeline is bound, so the draw was not recorded";
+        return false;
+    }
+    // Vulkan's restricted dynamic-topology rule keeps a draw inside the pipeline's topology class. A point
+    // or line draw needs a pipeline created for that class; until the cache can make one, refusing is
+    // better than recording a draw the driver is required to reject.
+    if (vk_topology(topology) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+        vk_topology(topology) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+        g_error = "this draw is not a triangle topology and no point/line pipeline exists yet";
+        return false;
+    }
+    // The topology is dynamic state (VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, core in 1.3), because a D3D
+    // primitive type travels with the draw and not with the pipeline: pipelining on it would rebuild a
+    // pipeline every time the game switched from a strip to a list. vkCmdDraw's last argument is
+    // firstInstance, not a topology -- passing the topology there was how the Intel driver was asked to
+    // start at instance 4 and died inside genX_cmd_draw.
+    vkCmdSetPrimitiveTopology(g_cmd, vk_topology(topology));
+    vkCmdDraw(g_cmd, vertex_count, instance_count, first_vertex, 0);
     return true;
 }
 
@@ -2523,8 +2770,17 @@ bool draw_indexed(Topology topology, uint32_t index_count, uint32_t instance_cou
                   int32_t vertex_offset)
 {
     if (!ensure_pass()) return false;
-    vkCmdDrawIndexed(g_cmd, index_count, instance_count, first_index, vertex_offset,
-                     (VkPrimitiveTopology)topology);
+    if (!g_pipeline_bound) {
+        g_error = "no pipeline is bound, so the draw was not recorded";
+        return false;
+    }
+    if (vk_topology(topology) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+        vk_topology(topology) != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+        g_error = "this draw is not a triangle topology and no point/line pipeline exists yet";
+        return false;
+    }
+    vkCmdSetPrimitiveTopology(g_cmd, vk_topology(topology));
+    vkCmdDrawIndexed(g_cmd, index_count, instance_count, first_index, vertex_offset, 0);
     return true;
 }
 

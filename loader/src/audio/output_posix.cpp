@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <ctime>
 
 namespace audio_out {
 namespace {
@@ -20,10 +21,24 @@ constexpr uint32_t RING = QUEUED + 1; // 7 blocks = 70 ms buffer
 
 SDL_AudioDeviceID g_device = 0;
 float g_ring[RING][BLOCK * 2];
-uint32_t g_next = 0;
-uint32_t g_submitted = 0;
+// Monotonic block counts, wrapped for indexing only. The audio callback is the only reader and the mixer
+// thread the only writer, so two counters and a memcpy are all the synchronisation the ring needs. 32 bits
+// of 10 ms blocks is more than a year of audio.
+std::atomic<uint32_t> g_written{0};
+std::atomic<uint32_t> g_read{0};
+// The wall-clock side of the mixer. Only the worker thread touches these, which is why they need no atomics.
+bool g_clock_started = false;
+uint64_t g_clock_start_us = 0;
+uint64_t g_clock_blocks = 0;
 FILE *g_wav = nullptr;
 uint32_t g_wav_frames = 0;
+
+uint64_t now_us()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
 
 void wav_header()
 {
@@ -48,17 +63,19 @@ void sdl_audio_callback(void *userdata, Uint8 *stream, int len)
 
     for (int f = 0; f < frames; f += BLOCK) {
         int block_frames = std::min(frames - f, static_cast<int>(BLOCK));
-        float *src = g_ring[g_submitted % RING];
+        const uint32_t r = g_read.load(std::memory_order_relaxed);
+        if (r == g_written.load(std::memory_order_acquire)) {
+            // Nothing was mixed for this block. Silence is the correct output here, and the read pointer
+            // stays put so the next block the mixer does write is not skipped.
+            memset(dst + f * 2, 0, (size_t)block_frames * 4);
+            continue;
+        }
+        float *src = g_ring[r % RING];
         for (int i = 0; i < block_frames * 2; i++) {
             float v = src[i];
             dst[f * 2 + i] = static_cast<int16_t>(std::max(-1.0f, std::min(1.0f, v)) * 32767.0f);
         }
-        g_submitted++;
-    }
-    // Fill remaining with silence if we underrun
-    for (int f = (frames / BLOCK) * BLOCK; f < frames; f++) {
-        dst[f * 2] = 0;
-        dst[f * 2 + 1] = 0;
+        g_read.store(r + 1, std::memory_order_release);
     }
 }
 
@@ -105,12 +122,14 @@ bool open()
         logf("[audio] got %u Hz %d ch (wanted %u Hz stereo)", have.freq, have.channels, RATE);
     }
 
-    // Pre-fill ring buffer with silence
+    // The callback writes silence for blocks the mixer has not produced, so the ring starts empty rather
+    // than pre-filled with stale blocks that would be played as if they were mixed audio.
     for (uint32_t i = 0; i < RING; i++) {
         memset(g_ring[i], 0, sizeof g_ring[i]);
     }
-    g_next = 0;
-    g_submitted = 0;
+    g_written.store(0, std::memory_order_relaxed);
+    g_read.store(0, std::memory_order_relaxed);
+    g_clock_started = false;
 
     SDL_PauseAudioDevice(g_device, 0);
     logf("[audio] SDL2 output: %u Hz stereo, %u ms blocks, %u queued", RATE, BLOCK * 1000 / RATE, QUEUED);
@@ -119,16 +138,26 @@ bool open()
 
 uint32_t blocks_wanted()
 {
-    if (g_device == 0) return 0;
-
-    // Estimate how many blocks the device can accept
-    // SDL doesn't expose queued buffer count directly, so we estimate from the callback rate
-    // A simple heuristic: if we've submitted less than RING blocks, we can submit more
-    uint32_t pending = g_next > g_submitted ? g_next - g_submitted : g_next + RING - g_submitted;
-    if (pending < QUEUED) {
-        return QUEUED - pending;
+    // The mixer's clock is the wall clock, not the sound device. A stream's packet completion is what the
+    // game waits on to decode the next one, so a device that is open but not pulling -- a suspended
+    // PulseAudio sink, a session with no sound card, a debugger stop -- must not stop the game's audio
+    // thread: the intro movie stalled on its first packets for exactly that reason. With a working device
+    // the two clocks run at the same rate and the ring only absorbs the difference.
+    const uint64_t block_us = (uint64_t)BLOCK * 1000000ull / RATE;
+    const uint64_t now = now_us();
+    if (!g_clock_started) {
+        g_clock_started = true;
+        g_clock_start_us = now;
+        g_clock_blocks = 0;
     }
-    return 0;
+    const uint64_t due = (now - g_clock_start_us) / block_us;
+    if (due <= g_clock_blocks) return 0;
+    uint64_t want = due - g_clock_blocks;
+    // A stalled process (a breakpoint, a suspended laptop) has a lot of blocks due at once. Catching up in
+    // full would burst a minute of audio into a 70 ms ring, so the backlog is dropped, not replayed.
+    g_clock_blocks = due;
+    if (want > QUEUED) want = QUEUED;
+    return (uint32_t)want;
 }
 
 void submit(const float *lr)
@@ -145,9 +174,9 @@ void submit(const float *lr)
 
     if (g_device == 0) return;
 
-    // Copy to ring buffer
-    memcpy(g_ring[g_next % RING], lr, sizeof g_ring[0]);
-    g_next = (g_next + 1) % RING;
+    const uint32_t w = g_written.load(std::memory_order_relaxed);
+    memcpy(g_ring[w % RING], lr, sizeof g_ring[0]);
+    g_written.store(w + 1, std::memory_order_release);
 }
 
 void simulate_lost()

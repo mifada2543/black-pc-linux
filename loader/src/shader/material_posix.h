@@ -39,8 +39,11 @@ struct MaterialDesc {
     uint32_t vertex_element_count = 0;
     const uint32_t *stream_stride = nullptr; // may be null; the declaration's own stride is used then
 
-    // The pixel side. `pixel_shader` may be null for a shader the game draws with no fragment stage.
+    // The pixel side. `pixel_shader` may be null for a shader the game draws with no fragment stage. In
+    // that case `fragment_glsl` may supply the console's fixed-function stages; with neither, the colour
+    // comes straight from the vertex stage and a pass-through fragment shader is used.
     const PixelShaderDef *pixel_shader = nullptr;
+    const char *fragment_glsl = nullptr;
     uint32_t tex_cube = 0; // one bit per stage: the console's stage samples a cube map
 
     // The render state that reaches the pipeline rather than the shader. The PipelineFlag bits are the

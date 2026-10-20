@@ -90,6 +90,8 @@ if(UNIX)
     src/d3d/pipeline_cache_posix.cpp
     src/d3d/draw_posix.cpp
     src/d3d/vertex_posix.cpp
+    src/d3d/texture_posix.cpp
+    src/d3d/draw_material_posix.cpp
     src/input/xinput_posix.cpp
     src/input/bindings_posix.cpp
     src/input/mouselook_posix.cpp
@@ -104,6 +106,7 @@ if(UNIX)
     src/shader/nv2a_vsh_posix.cpp
     src/shader/nv2a_psh_posix.cpp
     src/shader/material_posix.cpp
+    src/shader/ffp_posix.cpp
     src/sha1.cpp)
   target_include_directories(blackcore PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
   # Large-file support: the emulated Xbox disk is up to 8 GB and a 32-bit off_t wraps past 2 GB.
